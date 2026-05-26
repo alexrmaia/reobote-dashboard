@@ -135,14 +135,16 @@ def get_orders(user_id: str, token: str, date_from: str, date_to: str) -> list:
             "offset": offset,
             "limit":  limit,
         }
-        resp = requests.get(f"{ML_API_BASE}/orders/search", headers=headers, params=params)
+        resp = requests.get(f"{ML_API_BASE}/orders/search", headers=headers, params=params, timeout=30)
         if resp.status_code != 200:
+            st.caption(f"API error: {resp.status_code} — {resp.text[:200]}")
             break
         data = resp.json()
         results = data.get("results", [])
         orders.extend(results)
         paging = data.get("paging", {})
         total  = paging.get("total", 0)
+        st.caption(f"API: total={total} offset={offset} results={len(results)}")
         offset += limit
         if offset >= total or not results:
             break
@@ -290,7 +292,7 @@ with col_f3:
         st.cache_data.clear()
         st.rerun()
 
-hoje = datetime.now()
+hoje = datetime.utcnow()
 if periodo == "Hoje":
     date_from = hoje.replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
 elif periodo == "7 dias":
@@ -303,8 +305,6 @@ date_to = hoje.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
 
 with st.spinner("Buscando vendas..."):
     orders = get_orders(str(user_id), token, date_from, date_to)
-
-st.caption(f"Debug: user_id={user_id} | date_from={date_from} | orders={len(orders)}")
 
 if not orders:
     st.info("Nenhuma venda encontrada no período.")
