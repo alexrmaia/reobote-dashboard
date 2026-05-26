@@ -18,8 +18,20 @@ CLIENT_ID     = st.secrets["ML_CLIENT_ID"]
 CLIENT_SECRET = st.secrets["ML_CLIENT_SECRET"]
 REDIRECT_URI  = st.secrets["ML_REDIRECT_URI"]
 ML_AUTH_URL   = "https://auth.mercadolivre.com.br/authorization"
-ML_TOKEN_URL  = "https://api.mercadolivre.com/oauth/token"
-ML_API_BASE   = "https://api.mercadolivre.com"
+ML_TOKEN_URL  = "https://api.mercadolibre.com/oauth/token"
+ML_API_BASE   = "https://api.mercadolibre.com"
+
+# Session com retry para conexões instáveis
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def make_session():
+    s = requests.Session()
+    retry = Retry(connect=3, backoff_factor=1)
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
 
 # =========================
 # OAUTH HELPERS
@@ -33,19 +45,23 @@ def get_auth_url():
     return f"{ML_AUTH_URL}?{urllib.parse.urlencode(params)}"
 
 def exchange_code_for_token(code: str) -> dict:
-    resp = requests.post(
-        ML_TOKEN_URL,
-        data={
-            "grant_type":    "authorization_code",
-            "client_id":     CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "code":          code,
-            "redirect_uri":  REDIRECT_URI,
-        },
-        headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
-        timeout=30,
-    )
-    return resp.json()
+    try:
+        session = make_session()
+        resp = session.post(
+            ML_TOKEN_URL,
+            data={
+                "grant_type":    "authorization_code",
+                "client_id":     CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "code":          code,
+                "redirect_uri":  REDIRECT_URI,
+            },
+            headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+            timeout=30,
+        )
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
 
 def refresh_access_token(refresh_token: str) -> dict:
     resp = requests.post(
@@ -231,7 +247,11 @@ if code and "access_token" not in st.session_state:
             st.query_params.clear()
             st.rerun()
         else:
-            st.error(f"Erro na autenticação: {token_data.get('message', 'Tente novamente.')}")
+            st.error(f"Erro na autenticação: {token_data}")
+            st.info("Tente conectar novamente.")
+            if st.button("Tentar novamente"):
+                st.query_params.clear()
+                st.rerun()
             st.stop()
 
 # Não autenticado — tela de login
