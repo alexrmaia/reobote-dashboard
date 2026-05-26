@@ -264,13 +264,13 @@ if "access_token" not in st.session_state:
         <div style="font-size:48px;margin-bottom:16px;">🛒</div>
         <h2 style="font-weight:900;color:#1E1040;margin-bottom:8px;">Reobote Imports</h2>
         <p style="color:#64748B;margin-bottom:32px;">Conecte sua conta do Mercado Livre para acessar o dashboard.</p>
-        <a href="{auth_url}" target="_self">
-            <button style="background:linear-gradient(135deg,#7C3AED,#6D28D9);color:white;border:none;
-                           border-radius:12px;padding:14px 32px;font-size:16px;font-weight:800;
-                           cursor:pointer;width:100%;">
-                🔗 Conectar com Mercado Livre
-            </button>
+        <a href="{auth_url}" target="_self" style="display:block;background:linear-gradient(135deg,#7C3AED,#6D28D9);
+                color:white;border-radius:12px;padding:14px 32px;font-size:16px;font-weight:800;
+                text-decoration:none;text-align:center;margin-bottom:16px;">
+            🔗 Conectar com Mercado Livre
         </a>
+        <p style="color:#94A3B8;font-size:12px;margin-top:16px;">Se o botão não funcionar, copie e cole esta URL no navegador:</p>
+        <p style="color:#7C3AED;font-size:11px;word-break:break-all;">{auth_url}</p>
     </div>
     """, unsafe_allow_html=True)
     st.stop()
