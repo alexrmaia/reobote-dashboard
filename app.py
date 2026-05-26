@@ -4,6 +4,7 @@ import pandas as pd
 import altair as alt
 from datetime import datetime, timedelta
 import urllib.parse
+from supabase import create_client, Client
 
 # =========================
 # CONFIG
@@ -17,9 +18,88 @@ st.set_page_config(
 CLIENT_ID     = st.secrets["ML_CLIENT_ID"]
 CLIENT_SECRET = st.secrets["ML_CLIENT_SECRET"]
 REDIRECT_URI  = st.secrets["ML_REDIRECT_URI"]
+SUPABASE_URL  = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY  = st.secrets["SUPABASE_KEY"]
+
 ML_AUTH_URL   = "https://auth.mercadolivre.com.br/authorization"
 ML_TOKEN_URL  = "https://api.mercadolibre.com/oauth/token"
 ML_API_BASE   = "https://api.mercadolibre.com"
+
+# Cliente Supabase
+@st.cache_resource
+def get_supabase() -> Client:
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# =========================
+# SUPABASE — CUSTOS
+# =========================
+def load_custos(user_id: str) -> pd.DataFrame:
+    sb = get_supabase()
+    resp = sb.table("custos_sku").select("*").eq("user_id", user_id).order("vigencia", desc=False, nullsfirst=True).execute()
+    if not resp.data:
+        return pd.DataFrame(columns=["id","sku","produto","vigencia","qtd_comprada","qtd_disponivel",
+                                      "custo_produto","frete_fornecedor","embalagem","outros_custos","margem_alvo","observacao"])
+    df = pd.DataFrame(resp.data)
+    df["vigencia"] = pd.to_datetime(df["vigencia"], errors="coerce")
+    return df
+
+def save_custo(user_id: str, row: dict):
+    sb = get_supabase()
+    row["user_id"] = user_id
+    row["updated_at"] = datetime.now().isoformat()
+    if row.get("id"):
+        sb.table("custos_sku").update(row).eq("id", row["id"]).execute()
+    else:
+        sb.table("custos_sku").insert(row).execute()
+
+def load_regime(user_id: str) -> pd.DataFrame:
+    sb = get_supabase()
+    resp = sb.table("regime_tributario").select("*").eq("user_id", user_id).order("vigencia").execute()
+    if not resp.data:
+        return pd.DataFrame(columns=["id","vigencia","regime","aliquota"])
+    df = pd.DataFrame(resp.data)
+    df["vigencia"] = pd.to_datetime(df["vigencia"], errors="coerce")
+    return df
+
+def load_fifo_consumo(user_id: str) -> dict:
+    sb = get_supabase()
+    resp = sb.table("fifo_consumo").select("*").eq("user_id", user_id).execute()
+    if not resp.data:
+        return {}
+    return {r["venda_id"]: r for r in resp.data}
+
+def save_fifo_venda(user_id: str, venda_id: str, sku: str, qtd: int, custo: float, fifo: bool):
+    sb = get_supabase()
+    sb.table("fifo_consumo").upsert({
+        "user_id": user_id, "venda_id": venda_id,
+        "sku": sku, "qtd": qtd, "custo_unitario": custo, "fifo": fifo
+    }, on_conflict="user_id,venda_id").execute()
+
+def save_custos_batch(user_id: str, df: pd.DataFrame):
+    """Salva todos os custos de uma vez (upsert por id)."""
+    sb = get_supabase()
+    records = []
+    for _, row in df.iterrows():
+        rec = {
+            "user_id": user_id,
+            "sku": str(row.get("sku","")),
+            "produto": str(row.get("produto","")),
+            "vigencia": row["vigencia"].strftime("%Y-%m-%d") if pd.notna(row.get("vigencia")) else None,
+            "qtd_comprada": int(row.get("qtd_comprada", 0) or 0),
+            "qtd_disponivel": float(row.get("qtd_disponivel", 0) or 0),
+            "custo_produto": float(row.get("custo_produto", 0) or 0),
+            "frete_fornecedor": float(row.get("frete_fornecedor", 0) or 0),
+            "embalagem": float(row.get("embalagem", 0) or 0),
+            "outros_custos": float(row.get("outros_custos", 0) or 0),
+            "margem_alvo": float(row.get("margem_alvo", 0) or 0),
+            "observacao": str(row.get("observacao","") or ""),
+            "updated_at": datetime.now().isoformat(),
+        }
+        if row.get("id"):
+            rec["id"] = int(row["id"])
+        records.append(rec)
+    if records:
+        sb.table("custos_sku").upsert(records, on_conflict="id").execute()
 
 # Session com retry para conexões instáveis
 from requests.adapters import HTTPAdapter
@@ -259,20 +339,14 @@ if code and "access_token" not in st.session_state:
 # Não autenticado — tela de login
 if "access_token" not in st.session_state:
     auth_url = get_auth_url()
-    st.markdown(f"""
+    st.markdown("""
     <div class="login-card">
         <div style="font-size:48px;margin-bottom:16px;">🛒</div>
         <h2 style="font-weight:900;color:#1E1040;margin-bottom:8px;">Reobote Imports</h2>
-        <p style="color:#64748B;margin-bottom:32px;">Conecte sua conta do Mercado Livre para acessar o dashboard.</p>
-        <a href="{auth_url}" target="_self" style="display:block;background:linear-gradient(135deg,#7C3AED,#6D28D9);
-                color:white;border-radius:12px;padding:14px 32px;font-size:16px;font-weight:800;
-                text-decoration:none;text-align:center;margin-bottom:16px;">
-            🔗 Conectar com Mercado Livre
-        </a>
-        <p style="color:#94A3B8;font-size:12px;margin-top:16px;">Se o botão não funcionar, copie e cole esta URL no navegador:</p>
-        <p style="color:#7C3AED;font-size:11px;word-break:break-all;">{auth_url}</p>
+        <p style="color:#64748B;margin-bottom:24px;">Conecte sua conta do Mercado Livre para acessar o dashboard.</p>
     </div>
     """, unsafe_allow_html=True)
+    st.link_button("🔗 Conectar com Mercado Livre", auth_url, use_container_width=True, type="primary")
     st.stop()
 
 # =========================
