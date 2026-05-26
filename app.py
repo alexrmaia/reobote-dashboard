@@ -33,22 +33,32 @@ def get_auth_url():
     return f"{ML_AUTH_URL}?{urllib.parse.urlencode(params)}"
 
 def exchange_code_for_token(code: str) -> dict:
-    resp = requests.post(ML_TOKEN_URL, data={
-        "grant_type":    "authorization_code",
-        "client_id":     CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "code":          code,
-        "redirect_uri":  REDIRECT_URI,
-    })
+    resp = requests.post(
+        ML_TOKEN_URL,
+        data={
+            "grant_type":    "authorization_code",
+            "client_id":     CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "code":          code,
+            "redirect_uri":  REDIRECT_URI,
+        },
+        headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+    )
     return resp.json()
 
 def refresh_access_token(refresh_token: str) -> dict:
-    resp = requests.post(ML_TOKEN_URL, data={
-        "grant_type":    "refresh_token",
-        "client_id":     CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "refresh_token": refresh_token,
-    })
+    resp = requests.post(
+        ML_TOKEN_URL,
+        data={
+            "grant_type":    "refresh_token",
+            "client_id":     CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "refresh_token": refresh_token,
+        },
+        headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+    )
     return resp.json()
 
 def get_token() -> str | None:
@@ -81,7 +91,7 @@ def api_get(path: str, params: dict = None) -> dict | list:
     if not token:
         return {}
     headers = {"Authorization": f"Bearer {token}"}
-    resp = requests.get(f"{ML_API_BASE}{path}", headers=headers, params=params or {})
+    resp = requests.get(f"{ML_API_BASE}{path}", headers=headers, params=params or {}, timeout=30)
     if resp.status_code == 200:
         return resp.json()
     return {}
