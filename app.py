@@ -292,17 +292,19 @@ with col_f3:
 
 hoje = datetime.now()
 if periodo == "Hoje":
-    date_from = hoje.replace(hour=0, minute=0, second=0).isoformat() + ".000-03:00"
+    date_from = hoje.replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
 elif periodo == "7 dias":
-    date_from = (hoje - timedelta(days=7)).isoformat() + ".000-03:00"
+    date_from = (hoje - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
 elif periodo == "15 dias":
-    date_from = (hoje - timedelta(days=15)).isoformat() + ".000-03:00"
+    date_from = (hoje - timedelta(days=15)).strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
 else:
-    date_from = (hoje - timedelta(days=30)).isoformat() + ".000-03:00"
-date_to = hoje.isoformat() + ".000-03:00"
+    date_from = (hoje - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+date_to = hoje.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
 
 with st.spinner("Buscando vendas..."):
     orders = get_orders(str(user_id), token, date_from, date_to)
+
+st.caption(f"Debug: user_id={user_id} | date_from={date_from} | orders={len(orders)}")
 
 if not orders:
     st.info("Nenhuma venda encontrada no período.")
