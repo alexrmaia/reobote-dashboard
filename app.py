@@ -292,16 +292,28 @@ with col_f3:
         st.cache_data.clear()
         st.rerun()
 
-hoje = datetime.utcnow()
+from datetime import timezone, timezone
+import zoneinfo
+
+tz_br = zoneinfo.ZoneInfo("America/Sao_Paulo")
+agora_br = datetime.now(tz_br)
+hoje_str = agora_br.strftime("%Y-%m-%d")
+
 if periodo == "Hoje":
-    date_from = hoje.replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+    date_from = f"{hoje_str}T00:00:00.000-03:00"
+    date_to   = f"{hoje_str}T23:59:59.000-03:00"
 elif periodo == "7 dias":
-    date_from = (hoje - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+    d = agora_br - timedelta(days=7)
+    date_from = d.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+    date_to   = agora_br.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
 elif periodo == "15 dias":
-    date_from = (hoje - timedelta(days=15)).strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+    d = agora_br - timedelta(days=15)
+    date_from = d.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+    date_to   = agora_br.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
 else:
-    date_from = (hoje - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
-date_to = hoje.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+    d = agora_br - timedelta(days=30)
+    date_from = d.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+    date_to   = agora_br.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
 
 with st.spinner("Buscando vendas..."):
     orders = get_orders(str(user_id), token, date_from, date_to)
