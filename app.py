@@ -292,7 +292,6 @@ with col_f3:
         st.cache_data.clear()
         st.rerun()
 
-from datetime import timezone, timezone
 import zoneinfo
 
 tz_br = zoneinfo.ZoneInfo("America/Sao_Paulo")
@@ -344,7 +343,7 @@ st.markdown(f"""
             <h1 class="hero-title">Dashboard</h1>
             <div style="background:rgba(255,255,255,.15);border-radius:999px;padding:8px 16px;
                         width:fit-content;margin-top:12px;font-size:13px;font-weight:800;">
-                {periodo} • {hoje.strftime('%d/%m/%Y')}
+                {periodo} • {agora_br.strftime('%d/%m/%Y')}
             </div>
         </div>
         <div style="text-align:right;">
