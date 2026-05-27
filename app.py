@@ -229,54 +229,44 @@ def get_orders(user_id: str, token: str, date_from: str, date_to: str) -> list:
 
     return orders
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_shipping_cost_cached(shipping_id: int, token_hash: str, token: str) -> float:
-    """
-    Busca custo de frete pelo shipping_id.
-    token_hash é usado como chave de cache (evita incluir o token completo).
-    """
-    if not shipping_id:
-        return 0.0
-    headers = {"Authorization": f"Bearer {token}"}
-    resp = requests.get(f"{ML_API_BASE}/shipments/{shipping_id}", headers=headers, timeout=15)
-    if resp.status_code != 200:
-        return 0.0
-    data = resp.json()
-    # Custo para o vendedor: base_cost (cobrado pelo ML ao vendedor no Full)
-    shipping_option = data.get("shipping_option", {})
-    # Tenta base_cost primeiro (custo real ao vendedor), depois cost
-    cost = shipping_option.get("base_cost") or shipping_option.get("cost") or 0
-    return float(cost)
 
-def fetch_fretes_batch(orders: list, token: str) -> dict:
+
+def extrair_frete_order(order: dict) -> float:
     """
-    Busca fretes de todos os pedidos com shipping_id.
-    Retorna dict {shipping_id: custo_frete}.
-    Usa cache por shipping_id para não repetir chamadas.
+    Extrai o custo de frete cobrado ao vendedor diretamente da order.
+    No ML Full, o frete ao vendedor aparece em:
+      1. order_items[].fees[] com type "fulfillment" ou "shipping"
+      2. order.shipping_cost (campo legado)
+      3. paid_amount - total_amount (diferença indica frete pago pelo comprador,
+         mas o custo ao vendedor Full vem nas fees do item)
+    Soma todas as fees de frete de todos os itens da order.
     """
-    # Hash leve do token para chave de cache (apenas 8 chars)
-    token_hash = token[-8:] if token else ""
-    fretes = {}
-    shipping_ids = set()
-    for o in orders:
-        sid = o.get("shipping", {}).get("id")
-        if sid:
-            shipping_ids.add(sid)
-    for sid in shipping_ids:
-        fretes[sid] = get_shipping_cost_cached(sid, token_hash, token)
-    return fretes
+    frete_total = 0.0
+    fee_types_frete = {"fulfillment", "shipping", "self_service_cost",
+                       "shipping_discount", "zip_extra_fee"}
+    for item in order.get("order_items", []):
+        for fee in item.get("fees", []) or []:
+            fee_type = (fee.get("type") or "").lower()
+            if any(t in fee_type for t in fee_types_frete):
+                frete_total += abs(float(fee.get("amount") or 0))
+    # Fallback: campo shipping_cost na raiz da order (algumas versões da API)
+    if frete_total == 0.0:
+        frete_total = abs(float(order.get("shipping_cost") or 0))
+    return frete_total
 
 def parse_orders(orders: list, fretes: dict = None) -> pd.DataFrame:
-    """Converte lista de ordens da API em DataFrame."""
-    fretes = fretes or {}
+    """
+    Converte lista de ordens da API em DataFrame.
+    O frete ao vendedor é extraído diretamente das fees da order (sem chamadas extras).
+    O parâmetro fretes é mantido para compatibilidade mas ignorado.
+    """
     rows = []
     for order in orders:
         order_id    = order.get("id", "")
         status      = order.get("status", "")
         date_str    = order.get("date_created", "")
         date        = pd.to_datetime(date_str, errors="coerce")
-        shipping_id = order.get("shipping", {}).get("id", 0)
-        frete       = float(fretes.get(shipping_id, 0) or 0)
+        frete       = extrair_frete_order(order)
 
         for item in order.get("order_items", []):
             sku        = item.get("item", {}).get("seller_sku", "") or ""
@@ -286,7 +276,7 @@ def parse_orders(orders: list, fretes: dict = None) -> pd.DataFrame:
             sale_fee   = float(item.get("sale_fee", 0) or 0)
 
             receita  = unit_price * qty
-            total_ml = receita - abs(sale_fee) - abs(frete)
+            total_ml = receita - abs(sale_fee) - frete
 
             rows.append({
                 "Venda":         str(order_id),
@@ -567,10 +557,7 @@ if st.session_state["aba_ativa"] == "financeiro":
         st.info("Nenhuma venda encontrada no período.")
         st.stop()
 
-    with st.spinner("Buscando fretes..."):
-        fretes = fetch_fretes_batch(orders, token)
-
-    df_raw = parse_orders(orders, fretes)
+    df_raw = parse_orders(orders)
     if df_raw.empty:
         st.info("Nenhuma venda encontrada no período.")
         st.stop()
