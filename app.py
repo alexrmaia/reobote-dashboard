@@ -342,28 +342,59 @@ def apply_costs_online(df, user_id):
 # =========================
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
 html,body,[class*="css"]{font-family:'Inter',sans-serif;}
 .main{background:#F5F7FB;}
-.block-container{padding-top:0!important;max-width:1380px!important;margin:0 auto;}
+.block-container{padding-top:0!important;padding-bottom:2rem;max-width:1380px!important;margin:0 auto;}
 header[data-testid="stHeader"]{display:none!important;}
 #MainMenu,footer{display:none!important;}
 .navbar{background:linear-gradient(90deg,#1E1040 0%,#2D1B69 50%,#1E1040 100%);
         padding:0 32px;height:52px;display:flex;align-items:center;
         box-shadow:0 3px 16px rgba(109,40,217,.25);margin-bottom:20px;border-radius:0 0 12px 12px;}
 .navbar-name{color:white;font-size:15px;font-weight:900;letter-spacing:1px;margin-left:10px;}
-.card{background:white;border-radius:20px;padding:28px 32px;margin-bottom:20px;
-      box-shadow:0 2px 12px rgba(15,23,42,.06);border:1px solid #E7ECF5;}
+.card{background:white;border-radius:24px;padding:28px;
+      box-shadow:0 8px 28px rgba(15,23,42,.08);border:1px solid #E7ECF5;margin-bottom:18px;}
 .hero{background:linear-gradient(135deg,#7C3AED 0%,#8B5CF6 45%,#6D28D9 100%);
       border-radius:24px;padding:34px 38px;color:white;
-      box-shadow:0 18px 45px rgba(124,58,237,.22);margin-bottom:20px;}
-.hero-title{font-size:48px;font-weight:900;line-height:1;margin:0;letter-spacing:-1.6px;}
-.metric-card{background:white;border-radius:16px;padding:20px 24px;
-             border:1px solid #E7ECF5;box-shadow:0 2px 8px rgba(15,23,42,.05);}
-.metric-label{font-size:12px;font-weight:800;color:#64748B;text-transform:uppercase;letter-spacing:.5px;}
-.metric-value{font-size:28px;font-weight:900;color:#0F172A;margin-top:4px;}
+      box-shadow:0 18px 45px rgba(109,40,217,.22);margin-bottom:18px;min-height:230px;}
+.hero-title{font-size:48px;font-weight:900;line-height:1;margin:0 0 22px 0;letter-spacing:-1.6px;}
+.hero-small{font-size:14px;font-weight:700;opacity:.95;margin-bottom:0;}
+.hero-value-label{font-size:18px;font-weight:800;opacity:.98;text-align:right;}
+.hero-value{font-size:60px;font-weight:900;line-height:1.05;text-align:right;letter-spacing:-2px;}
+.hero-growth{color:#22C55E;font-weight:900;font-size:16px;}
+.metric-card{background:#FFFFFF;border:1px dashed #D9E2F0;border-radius:16px;
+             padding:24px 22px 20px 22px;min-height:155px;position:relative;overflow:hidden;}
+.metric-card:after{content:"";position:absolute;height:8px;left:0;bottom:0;right:0;background:var(--accent);}
+.metric-title{font-size:22px;font-weight:800;color:var(--accent);margin-bottom:12px;text-align:center;}
+.metric-value{font-size:30px;font-weight:900;color:#020617;text-align:center;letter-spacing:-1px;}
+.metric-pill{margin:12px auto 0 auto;width:fit-content;border-radius:999px;padding:5px 16px;
+             border:1px solid #E2E8F0;color:#94A3B8;font-weight:800;font-size:14px;background:#FAFBFF;}
+.kpi-card{background:#F4F1EA;border-radius:14px;padding:18px 14px;text-align:center;
+          min-height:112px;display:flex;flex-direction:column;justify-content:center;overflow:hidden;}
+.kpi-title{font-size:13px;font-weight:800;color:#44403C;text-transform:uppercase;
+           letter-spacing:.25px;margin-bottom:10px;white-space:nowrap;}
+.kpi-value{font-size:clamp(20px,2.05vw,28px);font-weight:900;color:#1F2937;
+           letter-spacing:-.8px;white-space:nowrap;line-height:1.05;}
+.green-box{background:linear-gradient(135deg,#22C55E 0%,#16A34A 100%);color:white;
+           border-radius:16px;padding:26px;box-shadow:0 18px 35px rgba(34,197,94,.22);
+           min-height:138px;text-align:center;}
+.red-box{background:linear-gradient(135deg,#EF4444 0%,#B91C1C 100%);color:white;
+         border-radius:16px;padding:26px;box-shadow:0 18px 35px rgba(239,68,68,.18);
+         min-height:138px;text-align:center;}
+.green-title{font-size:24px;font-weight:900;margin-bottom:8px;}
+.green-value{font-size:36px;font-weight:900;line-height:1;}
+.green-sub{font-size:17px;font-weight:900;margin-top:6px;}
+.small-title{font-size:26px;font-weight:900;color:#020617;margin-bottom:2px;letter-spacing:-.7px;}
+.muted{color:#64748B;font-size:16px;}
+.alert{background:#FFF7ED;border:1px solid #FED7AA;color:#9A3412;
+       padding:14px 18px;border-radius:14px;font-weight:700;margin-bottom:16px;}
+.success-box{background:#ECFDF5;border:1px solid #BBF7D0;color:#166534;
+             padding:14px 18px;border-radius:14px;font-weight:700;margin-bottom:16px;}
 .login-card{background:white;border-radius:24px;padding:48px;max-width:480px;
             margin:80px auto;text-align:center;box-shadow:0 8px 32px rgba(15,23,42,.1);}
+div[data-baseweb="select"]>div{border-radius:12px!important;border-color:#D8E0EC!important;
+    background:white!important;min-height:46px!important;
+    box-shadow:0 8px 20px rgba(15,23,42,.06);font-weight:800;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -500,62 +531,83 @@ if st.session_state["aba_ativa"] == "financeiro":
     # HERO
     st.markdown(f"""
     <div class="hero">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:24px;">
+      <div style="display:flex;justify-content:space-between;gap:30px;align-items:flex-start;">
         <div>
-          <p style="opacity:.85;font-size:14px;font-weight:700;margin:0;">Olá, {nickname} 👋</p>
+          <p class="hero-small">Resumo</p>
           <h1 class="hero-title">Financeiro</h1>
-          <div style="background:rgba(255,255,255,.15);border-radius:999px;padding:8px 16px;
-                      width:fit-content;margin-top:12px;font-size:13px;font-weight:800;">{label_periodo}</div>
+          <div style="background:rgba(255,255,255,.18);color:white;border:1px solid rgba(255,255,255,.35);
+                      border-radius:999px;padding:10px 16px;font-weight:900;width:fit-content;">
+              Período selecionado: {label_periodo}
+          </div>
         </div>
-        <div style="text-align:right;">
-          <div style="font-size:14px;font-weight:700;opacity:.85;">Faturamento</div>
-          <div style="font-size:52px;font-weight:900;letter-spacing:-2px;line-height:1;">R$ {faturamento:,.2f}</div>
+        <div style="min-width:320px;">
+          <div class="hero-value-label">Faturamento</div>
+          <div class="hero-value">R$ {faturamento:,.2f}</div>
         </div>
       </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # KPIs
-    def card(col, label, value, sub="", color="#64748B"):
-        col.markdown(f"""<div class="metric-card">
-            <div class="metric-label" style="color:{color};">{label}</div>
+    # KPIs — metric-card estilo local (dashed border + barra colorida)
+    def metric_card(col, title, value, sub, color):
+        col.markdown(f"""<div class="metric-card" style="--accent:{color};">
+            <div class="metric-title">{title}</div>
             <div class="metric-value">{value}</div>
-            {f'<div style="color:#94A3B8;font-size:13px;margin-top:4px;">{sub}</div>' if sub else ''}
+            <div class="metric-pill">{sub}</div>
+        </div>""", unsafe_allow_html=True)
+
+    def kpi_card(col, title, value, color="#1F2937"):
+        col.markdown(f"""<div class="kpi-card">
+            <div class="kpi-title">{title}</div>
+            <div class="kpi-value" style="color:{color};">{value}</div>
         </div>""", unsafe_allow_html=True)
 
     pct = lambda v: f"{v/faturamento*100:.1f}%" if faturamento else "0%"
+    fat_cancel   = canceladas["Receita Bruta"].sum()
+    ticket       = faturamento / len(aprovadas) if len(aprovadas) > 0 else 0
+    lucro_venda  = lucro_total / len(aprovadas) if len(aprovadas) > 0 else 0
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns(4)
-    card(c1, "Tarifas ML",  f"R$ {tarifas:,.2f}",   pct(tarifas),   "#F59E0B")
-    card(c2, "Frete ML",    f"R$ {fretes_sum:,.2f}", pct(fretes_sum),"#0EA5E9")
-    card(c3, "Custos",      f"R$ {custos:,.2f}",     pct(custos),    "#8B5CF6")
-    card(c4, "Impostos",    f"R$ {impostos:,.2f}",   pct(impostos))
+    metric_card(c1, "Tarifas",    f"R$ {tarifas:,.2f}",   pct(tarifas),    "#FBBF24")
+    metric_card(c2, "Custos",     f"R$ {custos:,.2f}",    pct(custos),     "#8B5CF6")
+    metric_card(c3, "Impostos",   f"R$ {impostos:,.2f}",  pct(impostos),   "#64748B")
+    metric_card(c4, "Canceladas", f"R$ {fat_cancel:,.2f}", f"{len(canceladas)} vendas", "#EF4444")
 
     st.markdown("<br>", unsafe_allow_html=True)
+    left, right = st.columns([1,1])
+    with left:
+        st.markdown(f"""<div class="metric-card" style="--accent:#E5E7EB;min-height:138px;">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                <div>
+                    <div style="font-size:22px;font-weight:900;color:#020617;margin-bottom:12px;">Ticket Médio</div>
+                    <div class="muted">De vendas</div>
+                    <div style="font-size:24px;font-weight:900;color:#020617;">R$ {ticket:,.2f}</div>
+                </div>
+                <div>
+                    <div class="muted">Lucro por venda</div>
+                    <div style="font-size:24px;font-weight:900;color:#020617;">R$ {lucro_venda:,.2f}</div>
+                </div>
+            </div>
+        </div>""", unsafe_allow_html=True)
+    with right:
+        box_cls = "green-box" if lucro_total >= 0 else "red-box"
+        st.markdown(f"""<div class="{box_cls}">
+            <div class="green-title">Lucro Líquido Real</div>
+            <div class="green-value">R$ {lucro_total:,.2f}</div>
+            <div class="green-sub">Margem real: {margem_real:.2f}%</div>
+        </div>""", unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    lc1, lc2, lc3 = st.columns([1,1,2])
-    with lc1:
-        fat_cancel = canceladas["Receita Bruta"].sum()
-        st.markdown(f"""<div class="metric-card">
-            <div class="metric-label">Canceladas</div>
-            <div class="metric-value" style="color:#EF4444;">R$ {fat_cancel:,.2f}</div>
-            <div style="color:#94A3B8;font-size:13px;margin-top:4px;">{len(canceladas)} pedidos</div>
-        </div>""", unsafe_allow_html=True)
-    with lc2:
-        ticket = faturamento / len(aprovadas) if len(aprovadas) > 0 else 0
-        lucro_venda = lucro_total / len(aprovadas) if len(aprovadas) > 0 else 0
-        st.markdown(f"""<div class="metric-card">
-            <div class="metric-label">Ticket Médio</div>
-            <div class="metric-value">R$ {ticket:.2f}</div>
-            <div style="color:#94A3B8;font-size:13px;margin-top:4px;">{len(aprovadas)} pedidos • lucro/venda R$ {lucro_venda:.2f}</div>
-        </div>""", unsafe_allow_html=True)
-    with lc3:
-        cor = "#16A34A" if lucro_total >= 0 else "#DC2626"
-        st.markdown(f"""<div style="background:linear-gradient(135deg,{cor},{cor}CC);border-radius:20px;
-                    padding:24px 32px;color:white;text-align:center;">
-            <div style="font-size:16px;font-weight:800;margin-bottom:8px;">Lucro Líquido Real</div>
-            <div style="font-size:48px;font-weight:900;letter-spacing:-2px;">R$ {lucro_total:,.2f}</div>
-            <div style="font-size:14px;font-weight:700;opacity:.9;margin-top:4px;">Margem real: {margem_real:.2f}%</div>
-        </div>""", unsafe_allow_html=True)
+    # 6 KPI-cards bege (Receita, Taxas, Frete, Custo, Lucro, Margem)
+    k1, k2, k3 = st.columns(3)
+    kpi_card(k1, "Receita Bruta",  f"R$ {faturamento:,.2f}")
+    kpi_card(k2, "Taxas ML",       f"R$ {tarifas:,.2f}",    "#EF4444")
+    kpi_card(k3, "Frete ML",       f"R$ {fretes_sum:,.2f}", "#EF4444")
+    k4, k5, k6 = st.columns(3)
+    kpi_card(k4, "Custo Produto",  f"R$ {custos:,.2f}",     "#EF4444")
+    kpi_card(k5, "Lucro Real",     f"R$ {lucro_total:,.2f}", "#059669" if lucro_total >= 0 else "#DC2626")
+    kpi_card(k6, "Margem",         f"{margem_real:.2f}%",   "#B45309")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -625,15 +677,21 @@ if st.session_state["aba_ativa"] == "financeiro":
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # Mini gráfico de receita por dia
+        # Mini gráfico de receita por dia — gradiente roxo estilo local
         if len(daily_agg) > 1:
             mini = alt.Chart(daily_agg).mark_area(
-                interpolate="monotone", color="#7C3AED", opacity=0.15, line={"color":"#7C3AED","strokeWidth":2}
+                interpolate="monotone",
+                color=alt.Gradient(gradient="linear",
+                    stops=[alt.GradientStop(color="#8B5CF666",offset=0),
+                           alt.GradientStop(color="#FFFFFF00",offset=1)],
+                    x1=1,x2=1,y1=1,y2=0),
+                line={"color":"#7C3AED","strokeWidth":3}
             ).encode(
-                x=alt.X("Dia:T", title=None, axis=alt.Axis(format="%d/%m", labelFontSize=10)),
-                y=alt.Y("Receita:Q", title=None, axis=alt.Axis(format=",.0f", labelFontSize=10)),
-                tooltip=[alt.Tooltip("Dia:T",format="%d/%m/%Y"), alt.Tooltip("Receita:Q",format=",.2f",title="Receita")]
-            ).properties(height=160)
+                x=alt.X("Dia:T", title=None, axis=alt.Axis(labelAngle=0, format="%d/%m", labelFontSize=10)),
+                y=alt.Y("Receita:Q", title=None),
+                tooltip=[alt.Tooltip("Dia:T",format="%d/%m/%Y",title="Data"),
+                         alt.Tooltip("Receita:Q",format=",.2f",title="Receita")]
+            ).properties(height=230)
             st.altair_chart(mini, use_container_width=True)
 
         st.markdown('</div>', unsafe_allow_html=True)
@@ -717,26 +775,103 @@ if st.session_state["aba_ativa"] == "financeiro":
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # GRÁFICO LUCRO POR DIA (largura total)
+    # GRÁFICO LUCRO POR DIA — gradiente verde + label de média
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("**📈 Lucro por dia**")
+    st.markdown('<div class="small-title">Lucro real por dia (R$)</div><br>', unsafe_allow_html=True)
     if len(daily_agg) > 1:
-        base   = alt.Chart(daily_agg)
-        area   = base.mark_area(interpolate="monotone", color="#7C3AED", opacity=0.12).encode(
-            x=alt.X("Dia:T", title=None), y=alt.Y("Lucro:Q", title="Lucro (R$)"))
-        linha  = base.mark_line(interpolate="monotone", color="#7C3AED", strokeWidth=2.5).encode(x="Dia:T", y="Lucro:Q")
-        pontos = base.mark_point(filled=True, size=80).encode(
-            x="Dia:T", y="Lucro:Q",
-            color=alt.Color("Cor:N", scale=alt.Scale(domain=["Acima","Abaixo"], range=["#16A34A","#DC2626"]), legend=None),
+        # Adiciona margem média ao daily_agg para tooltip
+        daily_agg["Margem"] = (daily_agg["Lucro"] / daily_agg["Receita"].replace(0,1) * 100).round(1)
+        area_lucro = alt.Chart(daily_agg).mark_area(
+            interpolate="monotone",
+            color=alt.Gradient(gradient="linear",
+                stops=[alt.GradientStop(color="#16A34A44",offset=0),
+                       alt.GradientStop(color="#16A34A00",offset=1)],
+                x1=1,x2=1,y1=1,y2=0)
+        ).encode(x=alt.X("Dia:T",title=None), y=alt.Y("Lucro:Q",title=None))
+
+        linha_lucro = alt.Chart(daily_agg).mark_line(
+            interpolate="monotone", color="#16A34A", strokeWidth=3
+        ).encode(x="Dia:T", y="Lucro:Q")
+
+        pontos_lucro = alt.Chart(daily_agg).mark_point(filled=True, size=80).encode(
+            x=alt.X("Dia:T",title=None), y=alt.Y("Lucro:Q",title=None),
+            color=alt.Color("Cor:N", scale=alt.Scale(domain=["Acima","Abaixo"],
+                            range=["#16A34A","#EF4444"]),
+                            legend=alt.Legend(title="vs Média",
+                                labelExpr="datum.label === 'Acima' ? '▲ Acima' : '▼ Abaixo'",
+                                orient="top-right")),
             tooltip=[alt.Tooltip("Dia:T",title="Data",format="%d/%m/%Y"),
                      alt.Tooltip("Lucro:Q",title="Lucro R$",format=",.2f"),
                      alt.Tooltip("Receita:Q",title="Receita R$",format=",.2f"),
-                     alt.Tooltip("Quantidade:Q",title="Qtd",format=",.0f")])
-        media_l = alt.Chart(pd.DataFrame({"m":[media_lucro]})).mark_rule(
-            strokeDash=[6,3], color="#94A3B8", strokeWidth=1.5).encode(y="m:Q")
-        st.altair_chart((area+linha+pontos+media_l).properties(height=260), use_container_width=True)
+                     alt.Tooltip("Quantidade:Q",title="Qtd vendida",format=",.0f"),
+                     alt.Tooltip("Margem:Q",title="Margem média %",format=".1f")])
+
+        media_rule = alt.Chart(pd.DataFrame({"media":[media_lucro]})).mark_rule(
+            color="#94A3B8", strokeDash=[6,4], strokeWidth=1.5
+        ).encode(y=alt.Y("media:Q"),
+                 tooltip=[alt.Tooltip("media:Q",title="Média do período R$",format=",.2f")])
+
+        media_text = alt.Chart(pd.DataFrame({
+            "media":[media_lucro], "Dia":[daily_agg["Dia"].max()]
+        })).mark_text(align="right", dy=-8, fontSize=11, fontWeight=700, color="#64748B").encode(
+            x=alt.X("Dia:T"), y=alt.Y("media:Q"),
+            text=alt.value(f"Média: R$ {media_lucro:,.0f}")
+        )
+
+        st.altair_chart(
+            (area_lucro + linha_lucro + pontos_lucro + media_rule + media_text).properties(height=300),
+            use_container_width=True
+        )
     else:
         st.info("Gráfico disponível com 2+ dias de dados.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # MARGEM PONDERADA POR SKU
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="small-title">Margem ponderada por SKU</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="muted">Faturamento, participação e margem ponderada — {label_periodo}</div><br>', unsafe_allow_html=True)
+
+    pond = aprovadas.copy()
+    sku_pond = pond.groupby("SKU").agg(
+        Vendas=("Venda","count"),
+        Unidades=("Quantidade","sum"),
+        Receita=("Receita Bruta","sum"),
+        Lucro=("Lucro","sum"),
+    ).reset_index()
+    sku_pond["Margem %"]      = (sku_pond["Lucro"] / sku_pond["Receita"].replace(0,1) * 100).round(2)
+    sku_pond["Participação %"]= (sku_pond["Receita"] / sku_pond["Receita"].sum() * 100).round(1)
+    sku_pond = sku_pond.sort_values("Receita", ascending=False).reset_index(drop=True)
+
+    for _, sr in sku_pond.iterrows():
+        cor_m = "#16A34A" if sr["Margem %"] >= 15 else "#B45309" if sr["Margem %"] >= 8 else "#DC2626"
+        bar_w = min(int(sr["Participação %"] * 3), 100)
+        st.markdown(f"""
+        <div style="display:flex;align-items:center;gap:16px;padding:12px 0;border-bottom:1px solid #F1F5F9;">
+            <div style="min-width:70px;font-weight:900;color:#7C3AED;font-size:15px;">{sr['SKU']}</div>
+            <div style="flex:1;">
+                <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                    <span style="font-weight:700;color:#0F172A;">R$ {sr['Receita']:,.2f}</span>
+                    <span style="color:#64748B;font-size:13px;">{sr['Participação %']:.1f}% do faturamento</span>
+                </div>
+                <div style="background:#F1F5F9;border-radius:999px;height:6px;">
+                    <div style="background:#7C3AED;width:{bar_w}%;height:6px;border-radius:999px;"></div>
+                </div>
+            </div>
+            <div style="min-width:80px;text-align:center;">
+                <div style="font-size:12px;color:#64748B;font-weight:600;">Vendas / Unid</div>
+                <div style="font-weight:800;color:#0F172A;">{int(sr['Vendas'])} / {int(sr['Unidades'])}</div>
+            </div>
+            <div style="min-width:90px;text-align:right;">
+                <div style="font-size:12px;color:#64748B;font-weight:600;">Lucro</div>
+                <div style="font-weight:800;color:{cor_m};">R$ {sr['Lucro']:,.2f}</div>
+            </div>
+            <div style="min-width:70px;text-align:right;">
+                <span style="background:{'#DCFCE7' if sr['Margem %']>=15 else '#FEF9C3' if sr['Margem %']>=8 else '#FEE2E2'};
+                             color:{cor_m};border-radius:999px;padding:4px 12px;font-size:14px;font-weight:900;">
+                    {sr['Margem %']:.2f}%
+                </span>
+            </div>
+        </div>""", unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
     # TABELA DE PEDIDOS DETALHADOS — dentro de expander
