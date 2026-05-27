@@ -222,14 +222,38 @@ def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
             fretes[sid] = custo
     return fretes
 
-def parse_orders(orders, fretes=None):
-    fretes = fretes or {}
+@st.cache_data(ttl=300, show_spinner=False)
+def get_ads_order_ids(user_id, token, date_from, date_to):
+    """
+    Busca IDs de orders que vieram de Product Ads via /advertising/product_ads/reports/orders.
+    Retorna set de order_ids.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        resp = requests.get(
+            f"{ML_API_BASE}/advertising/product_ads/reports/orders",
+            headers=headers,
+            params={"seller_id": user_id, "date_from": date_from[:10], "date_to": date_to[:10]},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            results = data.get("results", []) or data if isinstance(data, list) else []
+            return {str(r.get("order_id") or r.get("id","")) for r in results if r.get("order_id") or r.get("id")}
+    except:
+        pass
+    return set()
+
+def parse_orders(orders, fretes=None, ads_ids=None):
+    fretes  = fretes or {}
+    ads_ids = ads_ids or set()
     rows = []
     for order in orders:
         order_id    = order.get("id", "")
         status      = order.get("status", "")
         date        = pd.to_datetime(order.get("date_created", ""), errors="coerce")
         shipping_id = order.get("shipping", {}).get("id", 0)
+        via_ads     = str(order_id) in ads_ids
         for item in order.get("order_items", []):
             sku        = (item.get("item", {}).get("seller_sku", "") or "").strip()
             produto    = (item.get("item", {}).get("title", "") or "")[:50]
@@ -245,6 +269,7 @@ def parse_orders(orders, fretes=None):
                 "Receita Bruta": receita, "Taxas ML": sale_fee,
                 "Frete": frete, "Total ML": total_ml,
                 "Cancelada": status in ["cancelled"],
+                "Via Ads": via_ads,
             })
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
@@ -469,33 +494,18 @@ if st.session_state["aba_ativa"] == "financeiro":
     with st.spinner("Buscando vendas..."):
         orders = get_orders(str(user_id), token, date_from, date_to)
 
-    # DEBUG ADS — remove após identificar campo
-    if orders:
-        todas_tags = set()
-        ads_count  = 0
-        for o in orders:
-            tags = o.get("tags") or []
-            todas_tags.update(tags)
-            if any("advert" in t.lower() or "ads" in t.lower() or "sponsor" in t.lower() for t in tags):
-                ads_count += 1
-        with st.expander("🔍 DEBUG — tags encontradas nas orders", expanded=True):
-            st.write(f"**Todas as tags únicas no período:** {sorted(todas_tags)}")
-            st.write(f"**Pedidos com tag de ads:** {ads_count}")
-            # Mostra um exemplo de pedido com cada tag incomum
-            for o in orders[:5]:
-                tags = o.get("tags") or []
-                st.write(f"Order {o.get('id')}: {tags}")
-
     if not orders:
         st.info("Nenhuma venda encontrada no período.")
         st.stop()
 
     shipping_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in orders if o.get("shipping",{}).get("id")}))
     token_hash   = token[-8:] if token else ""
-    with st.spinner(f"Buscando fretes ({len(shipping_ids)} envios)..."):
-        fretes = fetch_fretes_batch(shipping_ids, token_hash, token)
 
-    df_raw = parse_orders(orders, fretes)
+    with st.spinner(f"Buscando fretes e dados de ads..."):
+        fretes  = fetch_fretes_batch(shipping_ids, token_hash, token)
+        ads_ids = get_ads_order_ids(str(user_id), token, date_from, date_to)
+
+    df_raw = parse_orders(orders, fretes, ads_ids)
     if df_raw.empty:
         st.info("Nenhuma venda encontrada.")
         st.stop()
@@ -605,13 +615,12 @@ if st.session_state["aba_ativa"] == "financeiro":
         st.markdown(f'<div style="color:#64748B;font-size:13px;margin-bottom:16px;">{label_periodo}</div>', unsafe_allow_html=True)
 
         # Métricas em grid 2x2
-        qtd_vendas   = int(aprovadas["Quantidade"].sum())
-        qtd_cancel   = len(canceladas)
-        val_cancel   = canceladas["Receita Bruta"].sum()
+        qtd_vendas = int(aprovadas["Quantidade"].sum())
+        qtd_cancel = len(canceladas)
+        val_cancel = canceladas["Receita Bruta"].sum()
 
-        # Vendas por anúncio (status paid)
-        paid_df = aprovadas[aprovadas["Status"] == "paid"]
-        vendas_ads = len(paid_df)
+        via_ads_df = aprovadas[aprovadas["Via Ads"] == True] if "Via Ads" in aprovadas.columns else pd.DataFrame()
+        vendas_ads = len(via_ads_df)
         pct_ads    = vendas_ads / len(aprovadas) * 100 if len(aprovadas) > 0 else 0
 
         m1, m2 = st.columns(2)
