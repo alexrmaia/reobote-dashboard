@@ -299,8 +299,8 @@ def apply_costs_online(df, user_id):
         elif data >= FIFO_CORTE and not cancelada:
             lotes = custos_out[(custos_out["sku"] == sku) & (custos_out["qtd_disponivel"] > 0)].sort_values("vigencia", na_position="first")
             if lotes.empty:
-                todos = custos_out[custos_out["sku"] == sku].sort_values("vigencia", na_position="first")
-                custo_unit = float(todos.iloc[-1]["custo_produto"]) if not todos.empty else 0.0
+                # Sem lote disponível — usa custo por vigência da data da venda
+                custo_unit = custo_por_vigencia(sku, data)
             else:
                 qtd_rest, custo_tot = qty, 0.0
                 for lidx in lotes.index:
