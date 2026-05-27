@@ -552,6 +552,9 @@ if st.session_state["aba_ativa"] == "financeiro":
     impostos    = aprovadas["Imposto"].sum()
     lucro_total = aprovadas["Lucro"].sum()
     margem_real = (lucro_total / faturamento * 100) if faturamento > 0 else 0
+    # Salva lucro no session_state para uso no ROI do Caixa
+    if "lucro_acumulado" not in st.session_state or periodo == "Personalizar":
+        st.session_state["lucro_acumulado"] = lucro_total
 
     # HERO
     st.markdown(f"""
@@ -1384,7 +1387,7 @@ elif st.session_state["aba_ativa"] == "caixa":
 
     # ── Capital Investido ──
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="small-title">Capital Investido</div>', unsafe_allow_html=True)
+    st.markdown('<div class="small-title">Capital Investido & ROI</div>', unsafe_allow_html=True)
 
     with st.expander("➕ Registrar aporte / retirada"):
         with st.form("form_capital", clear_on_submit=True):
@@ -1409,17 +1412,68 @@ elif st.session_state["aba_ativa"] == "caixa":
                     st.rerun()
 
     if not capital_df.empty:
-        total_inv = capital_df[capital_df["valor"] > 0]["valor"].sum()
-        total_ret = capital_df[capital_df["valor"] < 0]["valor"].abs().sum()
-        saldo_cap = capital_df["valor"].sum()
-        ci1, ci2, ci3 = st.columns(3)
-        ci1.markdown(f"""<div class="kpi-card"><div class="kpi-title">Total Investido</div><div class="kpi-value" style="color:#7C3AED;">R$ {total_inv:,.2f}</div></div>""", unsafe_allow_html=True)
-        ci2.markdown(f"""<div class="kpi-card"><div class="kpi-title">Retiradas</div><div class="kpi-value" style="color:#EF4444;">R$ {total_ret:,.2f}</div></div>""", unsafe_allow_html=True)
-        ci3.markdown(f"""<div class="kpi-card"><div class="kpi-title">Saldo Capital</div><div class="kpi-value" style="color:#16A34A;">R$ {saldo_cap:,.2f}</div></div>""", unsafe_allow_html=True)
-        st.markdown("<br>", unsafe_allow_html=True)
-        exibir = capital_df[["data","descricao","categoria","valor"]].copy()
-        exibir["data"]  = exibir["data"].apply(lambda x: x.strftime("%d/%m/%Y") if pd.notna(x) else "–")
-        exibir["valor"] = exibir["valor"].apply(lambda x: f"R$ {x:,.2f}")
-        st.dataframe(exibir.rename(columns={"data":"Data","descricao":"Descrição","categoria":"Categoria","valor":"Valor"}),
-                     use_container_width=True, hide_index=True)
+        total_inv   = capital_df[capital_df["valor"] > 0]["valor"].sum()
+        total_ret   = capital_df[capital_df["valor"] < 0]["valor"].abs().sum()
+        saldo_cap   = capital_df["valor"].sum()
+        # Lucro acumulado — usa session_state se disponível (calculado na aba financeiro)
+        lucro_acum  = st.session_state.get("lucro_acumulado", 0.0)
+        roi         = (lucro_acum / total_inv * 100) if total_inv > 0 else 0.0
+        cor_roi     = "#16A34A" if roi >= 0 else "#DC2626"
+
+        # Cards principais
+        st.markdown(f"""
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:24px;">
+            <div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px;text-align:center;">
+                <div style="font-size:11px;font-weight:800;color:#64748B;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Total Investido</div>
+                <div style="font-size:32px;font-weight:900;color:#0F172A;letter-spacing:-1px;">R$ {total_inv:,.2f}</div>
+            </div>
+            <div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px;text-align:center;">
+                <div style="font-size:11px;font-weight:800;color:#64748B;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Lucro Acumulado</div>
+                <div style="font-size:32px;font-weight:900;color:#0F172A;letter-spacing:-1px;">R$ {lucro_acum:,.2f}</div>
+                {"<div style='font-size:12px;color:#64748B;margin-top:4px;'>Acesse Financeiro para atualizar</div>" if lucro_acum == 0 else ""}
+            </div>
+            <div style="background:linear-gradient(135deg,#F0FDF4,#DCFCE7);border:1px solid #BBF7D0;border-radius:16px;padding:24px;text-align:center;">
+                <div style="font-size:11px;font-weight:800;color:#15803D;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">ROI</div>
+                <div style="font-size:40px;font-weight:900;color:{cor_roi};letter-spacing:-1px;">{roi:.1f}%</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Tabela de lançamentos estilizada
+        linhas_cap = ""
+        for _, row in capital_df.sort_values("data", ascending=False).iterrows():
+            val  = float(row["valor"])
+            cor  = "#16A34A" if val >= 0 else "#DC2626"
+            sinal = "+" if val >= 0 else ""
+            data_fmt = pd.to_datetime(row["data"]).strftime("%d/%m/%Y") if pd.notna(row["data"]) else "–"
+            linhas_cap += f"""
+            <tr style="border-bottom:1px solid #F1F5F9;">
+                <td style="padding:14px 12px;color:#64748B;font-size:13px;">{data_fmt}</td>
+                <td style="padding:14px 12px;font-weight:600;color:#0F172A;">{row.get('descricao','')}</td>
+                <td style="padding:14px 12px;">
+                    <span style="background:#EDE9FE;color:#6D28D9;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:700;">
+                        {row.get('categoria','')}
+                    </span>
+                </td>
+                <td style="padding:14px 12px;text-align:right;font-weight:800;color:{cor};">{sinal}R$ {abs(val):,.2f}</td>
+            </tr>"""
+
+        st.markdown(f"""
+        <div style="border-radius:16px;border:1px solid #E7ECF5;overflow:hidden;">
+            <table style="width:100%;border-collapse:collapse;font-family:'Inter',sans-serif;font-size:14px;">
+                <thead>
+                    <tr style="background:#F8FAFC;border-bottom:2px solid #E2E8F0;">
+                        <th style="padding:12px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Data</th>
+                        <th style="padding:12px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Descrição</th>
+                        <th style="padding:12px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Categoria</th>
+                        <th style="padding:12px;text-align:right;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Valor</th>
+                    </tr>
+                </thead>
+                <tbody>{linhas_cap}</tbody>
+            </table>
+        </div>
+        """, unsafe_allow_html=True)
+
+    else:
+        st.info("Nenhum lançamento registrado ainda. Use o formulário acima para começar.")
     st.markdown('</div>', unsafe_allow_html=True)
