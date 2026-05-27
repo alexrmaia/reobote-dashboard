@@ -1414,21 +1414,43 @@ elif st.session_state["aba_ativa"] == "caixa":
         roi         = (lucro_acum / total_inv * 100) if total_inv > 0 else 0.0
         cor_roi     = "#16A34A" if roi >= 0 else "#DC2626"
 
-        nota_lucro = "<br><small style='color:#64748B;'>Acesse Financeiro para atualizar</small>" if lucro_acum == 0 else ""
+        # Calcula estoque em caixa
+        sb = get_supabase()
+        estoq_resp = sb.table("custos_sku").select("sku,custo_produto,qtd_disponivel").eq("user_id", str(user_id)).gt("qtd_disponivel", 0).execute()
+        estoque_caixa = sum(float(r["qtd_disponivel"]) * float(r["custo_produto"]) for r in (estoq_resp.data or []))
+        qtd_estoque   = sum(float(r["qtd_disponivel"]) for r in (estoq_resp.data or []))
+
+        # Busca média de vendas dos últimos 15 dias
+        import zoneinfo as _tz
+        _agora = datetime.now(_tz.ZoneInfo("America/Sao_Paulo"))
+        _d15   = _agora - timedelta(days=15)
+        _from  = _d15.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+        _to    = _agora.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+        with st.spinner("Calculando média de vendas (15 dias)..."):
+            _orders15 = get_orders(str(user_id), token, _from, _to)
+        qtd_15d = sum(
+            int(item.get("quantity", 1) or 1)
+            for o in _orders15 if o.get("status") != "cancelled"
+            for item in o.get("order_items", [])
+        )
+        media_diaria = qtd_15d / 15
+        dias_estoque = int(qtd_estoque / media_diaria) if media_diaria > 0 else 0
+        cor_dias = "#16A34A" if dias_estoque >= 20 else "#F59E0B" if dias_estoque >= 10 else "#DC2626"
 
         ci1, ci2, ci3 = st.columns(3)
         ci1.markdown(f"""<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px;text-align:center;">
             <div style="font-size:11px;font-weight:800;color:#64748B;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Total Investido</div>
             <div style="font-size:32px;font-weight:900;color:#0F172A;letter-spacing:-1px;">R$ {total_inv:,.2f}</div>
         </div>""", unsafe_allow_html=True)
-        ci2.markdown(f"""<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px;text-align:center;">
-            <div style="font-size:11px;font-weight:800;color:#64748B;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Lucro Acumulado</div>
-            <div style="font-size:32px;font-weight:900;color:#0F172A;letter-spacing:-1px;">R$ {lucro_acum:,.2f}</div>
-            {nota_lucro}
+        ci2.markdown(f"""<div style="background:#FFF7ED;border:1px solid #FED7AA;border-radius:16px;padding:24px;text-align:center;">
+            <div style="font-size:11px;font-weight:800;color:#C2410C;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Estoque em Caixa</div>
+            <div style="font-size:32px;font-weight:900;color:#0F172A;letter-spacing:-1px;">R$ {estoque_caixa:,.2f}</div>
+            <div style="font-size:12px;color:#92400E;margin-top:4px;font-weight:600;">{int(qtd_estoque)} unidades disponíveis</div>
         </div>""", unsafe_allow_html=True)
-        ci3.markdown(f"""<div style="background:linear-gradient(135deg,#F0FDF4,#DCFCE7);border:1px solid #BBF7D0;border-radius:16px;padding:24px;text-align:center;">
-            <div style="font-size:11px;font-weight:800;color:#15803D;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">ROI</div>
-            <div style="font-size:40px;font-weight:900;color:{cor_roi};letter-spacing:-1px;">{roi:.1f}%</div>
+        ci3.markdown(f"""<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px;text-align:center;">
+            <div style="font-size:11px;font-weight:800;color:#64748B;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Dias de Estoque</div>
+            <div style="font-size:40px;font-weight:900;color:{cor_dias};letter-spacing:-1px;">{dias_estoque}</div>
+            <div style="font-size:12px;color:#64748B;margin-top:4px;font-weight:600;">média {media_diaria:.1f} un/dia (15d)</div>
         </div>""", unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
 
