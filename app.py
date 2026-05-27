@@ -471,15 +471,20 @@ if st.session_state["aba_ativa"] == "financeiro":
 
     # DEBUG ADS — remove após identificar campo
     if orders:
-        o = orders[0]
-        with st.expander("🔍 DEBUG — campos de ads na order", expanded=True):
-            st.write("**context:**", o.get("context"))
-            st.write("**tags:**", o.get("tags"))
-            st.write("**application_id:**", o.get("application_id"))
-            st.write("**ad_fee:**", o.get("ad_fee"))
-            for item in o.get("order_items", [])[:1]:
-                st.write("**item.sale_conditions:**", item.get("sale_conditions"))
-                st.write("**item.discounts:**", item.get("discounts"))
+        todas_tags = set()
+        ads_count  = 0
+        for o in orders:
+            tags = o.get("tags") or []
+            todas_tags.update(tags)
+            if any("advert" in t.lower() or "ads" in t.lower() or "sponsor" in t.lower() for t in tags):
+                ads_count += 1
+        with st.expander("🔍 DEBUG — tags encontradas nas orders", expanded=True):
+            st.write(f"**Todas as tags únicas no período:** {sorted(todas_tags)}")
+            st.write(f"**Pedidos com tag de ads:** {ads_count}")
+            # Mostra um exemplo de pedido com cada tag incomum
+            for o in orders[:5]:
+                tags = o.get("tags") or []
+                st.write(f"Order {o.get('id')}: {tags}")
 
     if not orders:
         st.info("Nenhuma venda encontrada no período.")
