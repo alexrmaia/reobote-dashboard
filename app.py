@@ -539,6 +539,16 @@ if st.session_state["aba_ativa"] == "financeiro":
         st.info("Nenhuma venda encontrada no período.")
         st.stop()
 
+    # DEBUG — remove após confirmar
+    if orders:
+        o = orders[0]
+        item0 = o.get("order_items", [{}])[0]
+        paid = o.get("paid_amount")
+        unit = item0.get("unit_price")
+        fee  = item0.get("sale_fee")
+        qty  = item0.get("quantity")
+        st.caption(f"DEBUG paid_amount={paid} | unit_price={unit} | sale_fee={fee} | qty={qty} | frete_calc={float(unit or 0)*int(qty or 1) - abs(float(fee or 0)) - float(paid or 0):.2f}")
+
     df_raw = parse_orders(orders)
     if df_raw.empty:
         st.info("Nenhuma venda encontrada no período.")
