@@ -599,24 +599,6 @@ if st.session_state["aba_ativa"] == "financeiro":
     with st.spinner("Calculando custos e margens..."):
         df = apply_costs_online(df_raw, str(user_id))
 
-    # DEBUG RECONCILIAÇÃO — remove após análise
-    with st.expander("🔍 Debug reconciliação", expanded=True):
-        apr = df[~df["Cancelada"]]
-        st.write(f"**Pedidos aprovados:** {len(apr)} | **Qtd total:** {int(apr['Quantidade'].sum())}")
-        st.write(f"**Faturamento:** R$ {apr['Receita Bruta'].sum():.2f}")
-        st.write(f"**Tarifas:** R$ {apr['Taxas ML'].sum():.2f}")
-        st.write(f"**Fretes:** R$ {apr['Frete'].sum():.2f}")
-        st.write(f"**Total ML:** R$ {apr['Total ML'].sum():.2f}")
-        st.write(f"**Impostos:** R$ {apr['Imposto'].sum():.2f}")
-        st.write(f"**Custo Total:** R$ {apr['Custo Total'].sum():.2f}")
-        st.write(f"**Lucro:** R$ {apr['Lucro'].sum():.2f}")
-        st.write(f"**Margem:** {apr['Lucro'].sum()/apr['Receita Bruta'].sum()*100:.2f}%")
-        st.markdown("---")
-        st.write("**Custo unitário por venda (amostra):**")
-        cols_debug = ["Venda","Data","SKU","Quantidade","Receita Bruta","Taxas ML","Frete","Total ML","Custo Unitário","Custo Total","Imposto","Lucro","Margem %"]
-        cols_ok = [c for c in cols_debug if c in df.columns]
-        st.dataframe(df[cols_ok].head(20), use_container_width=True, hide_index=True)
-
     # Métricas
     aprovadas   = df[~df["Cancelada"]]
     canceladas  = df[df["Cancelada"]]
@@ -767,21 +749,69 @@ if st.session_state["aba_ativa"] == "financeiro":
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("**Pedidos detalhados**")
 
-    tabela = df[[
-        "Venda","Data","Status","SKU","Produto","Quantidade",
-        "Receita Bruta","Taxas ML","Frete","Custo Total","Imposto","Lucro","Margem %"
-    ]].copy()
-    tabela["Data"] = pd.to_datetime(tabela["Data"]).dt.strftime("%d/%m/%Y %H:%M")
+    # Tabela estilizada com badges coloridos (igual ao dashboard local)
+    fat_total = aprovadas["Receita Bruta"].sum() if faturamento > 0 else 1
 
-    for col_r in ["Receita Bruta","Taxas ML","Frete","Custo Total","Imposto","Lucro"]:
-        tabela[col_r] = tabela[col_r].apply(lambda x: f"R$ {x:,.2f}")
-    tabela["Margem %"] = tabela["Margem %"].apply(lambda x: f"{x:.1f}%")
+    def badge(valor, total, cor_bg, cor_txt, prefixo="R$ ", sufixo=""):
+        pct = abs(valor / total * 100) if total else 0
+        return (
+            f'<span style="font-weight:700;">{prefixo}{valor:,.2f}{sufixo}</span> '
+            f'<span style="background:{cor_bg};color:{cor_txt};border-radius:999px;'
+            f'padding:2px 7px;font-size:11px;font-weight:800;">{pct:.0f}%</span>'
+        )
 
-    st.dataframe(tabela.rename(columns={
-        "Venda": "N.º Venda",
-        "Receita Bruta": "Receita",
-        "Custo Total": "Custo",
-    }), use_container_width=True, hide_index=True)
+    def margem_badge(pct):
+        cor = "#DCFCE7" if pct >= 15 else "#FEF9C3" if pct >= 8 else "#FEE2E2"
+        txt = "#15803D" if pct >= 15 else "#854D0E" if pct >= 8 else "#DC2626"
+        return f'<span style="background:{cor};color:{txt};border-radius:999px;padding:2px 9px;font-size:12px;font-weight:800;">{pct:.1f}%</span>'
+
+    def status_icon(status):
+        if status == "paid":      return "🚚"
+        if status == "cancelled": return "❌"
+        return "⏳"
+
+    linhas_html = ""
+    for _, row in df.iterrows():
+        cancelada = row["Cancelada"]
+        bg = "#FFF5F5" if cancelada else "white"
+        receita = row["Receita Bruta"]
+        linhas_html += f"""
+        <tr style="background:{bg};border-bottom:1px solid #F1F5F9;">
+            <td style="padding:10px 8px;font-weight:800;color:#7C3AED;white-space:nowrap;">{row['SKU']}</td>
+            <td style="padding:10px 8px;color:#64748B;font-size:13px;white-space:nowrap;">{pd.to_datetime(row['Data']).strftime('%d/%m/%Y %H:%M')}</td>
+            <td style="padding:10px 8px;font-size:18px;text-align:center;">{status_icon(row['Status'])}</td>
+            <td style="padding:10px 8px;text-align:center;font-weight:700;">{int(row['Quantidade'])}</td>
+            <td style="padding:10px 8px;font-weight:700;color:#0F172A;">{badge(receita, fat_total, '#DCFCE7', '#15803D')}</td>
+            <td style="padding:10px 8px;">{badge(row['Frete'], receita, '#DBEAFE', '#1D4ED8') if not cancelada else '-'}</td>
+            <td style="padding:10px 8px;">{badge(row['Taxas ML'], receita, '#FEF3C7', '#B45309') if not cancelada else '-'}</td>
+            <td style="padding:10px 8px;">{badge(row.get('Custo Total',0), receita, '#EDE9FE', '#6D28D9') if not cancelada else '-'}</td>
+            <td style="padding:10px 8px;">{badge(row.get('Imposto',0), receita, '#F1F5F9', '#475569') if not cancelada else '-'}</td>
+            <td style="padding:10px 8px;text-align:center;">{margem_badge(row.get('Margem %',0)) if not cancelada else '<span style="color:#DC2626;font-weight:700;">Cancelada</span>'}</td>
+            <td style="padding:10px 8px;color:#94A3B8;font-size:12px;white-space:nowrap;">{row['Venda']}</td>
+        </tr>"""
+
+    st.markdown(f"""
+    <div style="overflow-x:auto;">
+    <table style="width:100%;border-collapse:collapse;font-family:'Inter',sans-serif;font-size:13px;">
+        <thead>
+            <tr style="background:#F8FAFC;border-bottom:2px solid #E2E8F0;">
+                <th style="padding:10px 8px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;">SKU</th>
+                <th style="padding:10px 8px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Data</th>
+                <th style="padding:10px 8px;text-align:center;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Transp.</th>
+                <th style="padding:10px 8px;text-align:center;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Qnt.</th>
+                <th style="padding:10px 8px;text-align:left;color:#16A34A;font-size:11px;font-weight:800;text-transform:uppercase;">Receita (=)</th>
+                <th style="padding:10px 8px;text-align:left;color:#1D4ED8;font-size:11px;font-weight:800;text-transform:uppercase;">Frete (-)</th>
+                <th style="padding:10px 8px;text-align:left;color:#B45309;font-size:11px;font-weight:800;text-transform:uppercase;">Tarifa (-)</th>
+                <th style="padding:10px 8px;text-align:left;color:#6D28D9;font-size:11px;font-weight:800;text-transform:uppercase;">Custo (-)</th>
+                <th style="padding:10px 8px;text-align:left;color:#475569;font-size:11px;font-weight:800;text-transform:uppercase;">Imposto (-)</th>
+                <th style="padding:10px 8px;text-align:center;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">M. de Contrib. (=)</th>
+                <th style="padding:10px 8px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">N.º Venda</th>
+            </tr>
+        </thead>
+        <tbody>{linhas_html}</tbody>
+    </table>
+    </div>
+    """, unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ===================================================
