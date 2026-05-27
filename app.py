@@ -1414,27 +1414,23 @@ elif st.session_state["aba_ativa"] == "caixa":
         roi         = (lucro_acum / total_inv * 100) if total_inv > 0 else 0.0
         cor_roi     = "#16A34A" if roi >= 0 else "#DC2626"
 
-        nota_lucro = "<div style='font-size:12px;color:#64748B;margin-top:4px;'>Acesse Financeiro para atualizar</div>" if lucro_acum == 0 else ""
-        roi_card = f"""
-            <div style="background:linear-gradient(135deg,#F0FDF4,#DCFCE7);border:1px solid #BBF7D0;border-radius:16px;padding:24px;text-align:center;">
-                <div style="font-size:11px;font-weight:800;color:#15803D;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">ROI</div>
-                <div style="font-size:40px;font-weight:900;color:{cor_roi};letter-spacing:-1px;">{roi:.1f}%</div>
-            </div>"""
+        nota_lucro = "<br><small style='color:#64748B;'>Acesse Financeiro para atualizar</small>" if lucro_acum == 0 else ""
 
-        st.markdown(f"""
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:24px;">
-            <div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px;text-align:center;">
-                <div style="font-size:11px;font-weight:800;color:#64748B;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Total Investido</div>
-                <div style="font-size:32px;font-weight:900;color:#0F172A;letter-spacing:-1px;">R$ {total_inv:,.2f}</div>
-            </div>
-            <div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px;text-align:center;">
-                <div style="font-size:11px;font-weight:800;color:#64748B;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Lucro Acumulado</div>
-                <div style="font-size:32px;font-weight:900;color:#0F172A;letter-spacing:-1px;">R$ {lucro_acum:,.2f}</div>
-                {nota_lucro}
-            </div>
-            {roi_card}
-        </div>
-        """, unsafe_allow_html=True)
+        ci1, ci2, ci3 = st.columns(3)
+        ci1.markdown(f"""<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px;text-align:center;">
+            <div style="font-size:11px;font-weight:800;color:#64748B;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Total Investido</div>
+            <div style="font-size:32px;font-weight:900;color:#0F172A;letter-spacing:-1px;">R$ {total_inv:,.2f}</div>
+        </div>""", unsafe_allow_html=True)
+        ci2.markdown(f"""<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px;text-align:center;">
+            <div style="font-size:11px;font-weight:800;color:#64748B;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Lucro Acumulado</div>
+            <div style="font-size:32px;font-weight:900;color:#0F172A;letter-spacing:-1px;">R$ {lucro_acum:,.2f}</div>
+            {nota_lucro}
+        </div>""", unsafe_allow_html=True)
+        ci3.markdown(f"""<div style="background:linear-gradient(135deg,#F0FDF4,#DCFCE7);border:1px solid #BBF7D0;border-radius:16px;padding:24px;text-align:center;">
+            <div style="font-size:11px;font-weight:800;color:#15803D;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">ROI</div>
+            <div style="font-size:40px;font-weight:900;color:{cor_roi};letter-spacing:-1px;">{roi:.1f}%</div>
+        </div>""", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
 
         # Tabela de lançamentos estilizada
         linhas_cap = ""
