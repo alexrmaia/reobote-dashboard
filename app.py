@@ -231,34 +231,76 @@ def get_orders(user_id: str, token: str, date_from: str, date_to: str) -> list:
 
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_fretes_batch(shipping_ids_tuple: tuple, token_hash: str, token: str) -> dict:
+    """
+    Busca list_cost de /shipments/{id} em paralelo para pedidos ainda não liquidados.
+    list_cost = custo real do Full ao vendedor (confirmado via XLSX).
+    Cacheado 1h — reruns instantâneos.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not shipping_ids_tuple:
+        return {}
+
+    headers = {"Authorization": f"Bearer {token}"}
+
+    def fetch_one(sid):
+        try:
+            resp = requests.get(
+                f"{ML_API_BASE}/shipments/{sid}",
+                headers=headers,
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                return sid, 0.0
+            data = resp.json()
+            # list_cost é o custo real ao vendedor no Full
+            opt = data.get("shipping_option", {})
+            cost = opt.get("list_cost") or opt.get("base_cost") or opt.get("cost") or 0
+            return sid, float(cost)
+        except Exception:
+            return sid, 0.0
+
+    fretes = {}
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(fetch_one, sid): sid for sid in shipping_ids_tuple}
+        for future in as_completed(futures):
+            sid, custo = future.result()
+            fretes[sid] = custo
+
+    return fretes
+
 def parse_orders(orders: list, fretes: dict = None) -> pd.DataFrame:
     """
     Converte lista de ordens da API em DataFrame.
 
-    Lógica financeira (confirmada pelo XLSX do ML):
-      Receita Bruta = unit_price × qty         (coluna "Receita por produtos")
-      Tarifa ML     = abs(sale_fee)             (coluna "Tarifa de venda e impostos")
-      Total ML      = paid_amount da order      (coluna "Total" — já descontado frete e tarifa)
-      Frete         = Receita - Tarifa - Total  (coluna "Tarifas de envio", ex: R$16,85 Full)
+    Lógica financeira (confirmada via XLSX e inspeção do /shipments/{id}):
+      Receita Bruta = unit_price × qty
+      Tarifa ML     = abs(sale_fee)
+      Frete         = shipping_option.list_cost do /shipments/{id}  ← campo correto
+      Total ML      = Receita - Tarifa - Frete
+      (paid_amount não é confiável para pedidos em processamento)
     """
+    fretes = fretes or {}
     rows = []
     for order in orders:
         order_id    = order.get("id", "")
         status      = order.get("status", "")
         date_str    = order.get("date_created", "")
         date        = pd.to_datetime(date_str, errors="coerce")
-        paid_amount = float(order.get("paid_amount") or 0)
+        shipping_id = order.get("shipping", {}).get("id", 0)
 
         for item in order.get("order_items", []):
-            sku      = item.get("item", {}).get("seller_sku", "") or ""
-            produto  = item.get("item", {}).get("title", "") or ""
-            qty      = int(item.get("quantity", 1) or 1)
+            sku        = item.get("item", {}).get("seller_sku", "") or ""
+            produto    = item.get("item", {}).get("title", "") or ""
+            qty        = int(item.get("quantity", 1) or 1)
             unit_price = float(item.get("unit_price", 0) or 0)
             sale_fee   = abs(float(item.get("sale_fee", 0) or 0))
 
+            frete    = float(fretes.get(shipping_id, 0) or 0)
             receita  = unit_price * qty
-            total_ml = paid_amount
-            frete    = max(receita - sale_fee - total_ml, 0.0)
+            total_ml = receita - sale_fee - frete
 
             rows.append({
                 "Venda":         str(order_id),
@@ -539,26 +581,17 @@ if st.session_state["aba_ativa"] == "financeiro":
         st.info("Nenhuma venda encontrada no período.")
         st.stop()
 
-    # DEBUG — remove após confirmar
-    if orders:
-        o = orders[0]
-        item0 = o.get("order_items", [{}])[0]
-        paid = float(o.get("paid_amount") or 0)
-        unit = float(item0.get("unit_price") or 0)
-        fee  = abs(float(item0.get("sale_fee") or 0))
-        qty  = int(item0.get("quantity") or 1)
-        shipping_id = o.get("shipping", {}).get("id")
-        st.caption(f"DEBUG paid_amount={paid} | unit_price={unit} | sale_fee={fee} | qty={qty} | shipping_id={shipping_id}")
-        # Busca shipment completo para inspecionar campos de custo
-        if shipping_id:
-            hdrs = {"Authorization": f"Bearer {token}"}
-            sr = requests.get(f"{ML_API_BASE}/shipments/{shipping_id}", headers=hdrs, timeout=15)
-            if sr.status_code == 200:
-                sdata = sr.json()
-                with st.expander("🔍 DEBUG Shipment JSON completo", expanded=True):
-                    st.json(sdata)
+    # Busca fretes em paralelo via /shipments (list_cost = custo Full ao vendedor)
+    shipping_ids = tuple(sorted({
+        o.get("shipping", {}).get("id")
+        for o in orders
+        if o.get("shipping", {}).get("id")
+    }))
+    token_hash = token[-8:] if token else ""
+    with st.spinner("Buscando fretes..."):
+        fretes = fetch_fretes_batch(shipping_ids, token_hash, token)
 
-    df_raw = parse_orders(orders)
+    df_raw = parse_orders(orders, fretes)
     if df_raw.empty:
         st.info("Nenhuma venda encontrada no período.")
         st.stop()
