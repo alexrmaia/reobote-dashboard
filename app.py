@@ -506,6 +506,14 @@ with st.spinner("Buscando vendas..."):
 
 st.caption(f"Debug: user_id={user_id} | date_from={date_from} | orders={len(orders)}")
 
+# Debug: mostra estrutura do primeiro pedido
+if orders:
+    o = orders[0]
+    st.caption(f"Debug pedido: total_amount={o.get('total_amount')} paid_amount={o.get('paid_amount')} status={o.get('status')}")
+    item = o.get('order_items', [{}])[0]
+    st.caption(f"Debug item: unit_price={item.get('unit_price')} sale_fee={item.get('sale_fee')} qty={item.get('quantity')}")
+    st.caption(f"Debug shipping: {o.get('shipping', {})}")
+
 if not orders:
     st.info("Nenhuma venda encontrada no período.")
     st.stop()
