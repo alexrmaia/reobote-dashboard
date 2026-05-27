@@ -557,6 +557,24 @@ if st.session_state["aba_ativa"] == "financeiro":
         st.info("Nenhuma venda encontrada no período.")
         st.stop()
 
+    # DEBUG TEMPORÁRIO — remover após identificar campo de frete
+    if orders:
+        o = orders[0]
+        item0 = o.get("order_items", [{}])[0]
+        import json
+        with st.expander("🔍 DEBUG — estrutura do pedido (remover após análise)", expanded=True):
+            st.write("**Keys da order:**", list(o.keys()))
+            st.write("**shipping:**", o.get("shipping"))
+            st.write("**shipping_cost:**", o.get("shipping_cost"))
+            st.write("**paid_amount:**", o.get("paid_amount"))
+            st.write("**total_amount:**", o.get("total_amount"))
+            st.write("**Keys do item:**", list(item0.keys()))
+            st.write("**item fees:**", item0.get("fees"))
+            st.write("**sale_fee:**", item0.get("sale_fee"))
+            st.write("**full_unit_price:**", item0.get("full_unit_price"))
+            st.write("**JSON completo do item:**")
+            st.json(item0)
+
     df_raw = parse_orders(orders)
     if df_raw.empty:
         st.info("Nenhuma venda encontrada no período.")
