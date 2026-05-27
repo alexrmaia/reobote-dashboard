@@ -200,63 +200,51 @@ def get_orders(user_id, token, date_from, date_to):
     return orders
 
 @st.cache_data(ttl=300, show_spinner=False)
-def get_claims(user_id, token, date_from, date_to):
+def get_orders_reembolsados(user_id, token, date_from, date_to):
     """
-    Busca reclamações, mediações e devoluções via API do ML.
-    Retorna set de order_ids que tiveram devolução/mediação com reembolso.
+    Identifica orders com reembolso verificando payments[].transaction_amount_refunded > 0.
+    Retorna dict {order_id: valor_reembolsado}.
+    Essa é a forma mais confiável — o ML sempre registra o reembolso no payment.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     headers = {"Authorization": f"Bearer {token}"}
+    orders_reembolsadas = {}
+    offset = 0
+    limit  = 50
 
-    # 1) Busca claims (reclamações) do período
-    order_ids_com_problema = set()
-
-    try:
-        resp = requests.get(
-            f"{ML_API_BASE}/post-purchase/claims/search",
-            headers=headers,
-            params={
-                "seller_id": user_id,
-                "status": "closed",  # fechadas = resolvidas
-                "limit": 50,
-            },
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            claims = resp.json().get("data", []) or []
-            for c in claims:
-                # Verifica se o resultado foi favorável ao comprador (reembolso)
-                resolution = c.get("resolution", {}) or {}
-                reason = (resolution.get("reason") or "").lower()
-                if any(x in reason for x in ["buyer", "refund", "reembolso"]):
-                    oid = c.get("order_id") or c.get("resource_id")
-                    if oid:
-                        order_ids_com_problema.add(str(oid))
-    except:
-        pass
-
-    # 2) Busca via /orders com status_detail de mediação
-    try:
+    while True:
         resp = requests.get(
             f"{ML_API_BASE}/orders/search",
             headers=headers,
             params={
                 "seller": user_id,
                 "order.date_created.from": date_from,
-                "order.date_created.to": date_to,
-                "order.status": "paid",
-                "order.status_detail": "mediator_return",
-                "limit": 50,
+                "order.date_created.to":   date_to,
+                "sort":   "date_desc",
+                "offset": offset,
+                "limit":  limit,
             },
-            timeout=15,
+            timeout=30,
         )
-        if resp.status_code == 200:
-            for o in resp.json().get("results", []):
-                order_ids_com_problema.add(str(o.get("id", "")))
-    except:
-        pass
+        if resp.status_code != 200:
+            break
+        data    = resp.json()
+        results = data.get("results", [])
 
-    return order_ids_com_problema
+        for order in results:
+            order_id    = str(order.get("id", ""))
+            reembolsado = 0.0
+            for payment in order.get("payments", []):
+                refunded = float(payment.get("transaction_amount_refunded") or 0)
+                reembolsado += refunded
+            if reembolsado > 0:
+                orders_reembolsadas[order_id] = reembolsado
+
+        paging = data.get("paging", {})
+        offset += limit
+        if offset >= paging.get("total", 0) or not results:
+            break
+
+    return orders_reembolsadas
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
@@ -281,14 +269,19 @@ def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
             fretes[sid] = custo
     return fretes
 
-def parse_orders(orders, fretes=None):
-    fretes = fretes or {}
+def parse_orders(orders, fretes=None, reembolsados=None):
+    fretes       = fretes or {}
+    reembolsados = reembolsados or {}
     rows = []
     for order in orders:
         order_id    = order.get("id", "")
         status      = order.get("status", "")
         date        = pd.to_datetime(order.get("date_created", ""), errors="coerce")
         shipping_id = order.get("shipping", {}).get("id", 0)
+        paid_amount = float(order.get("paid_amount") or 0)
+        reemb_val   = float(reembolsados.get(str(order_id), 0) or 0)
+        # Cancelada = status cancelled OU reembolso total (>= 90% do valor pago)
+        cancelada   = status in ["cancelled"] or (reemb_val > 0 and paid_amount > 0 and reemb_val >= paid_amount * 0.9)
         for item in order.get("order_items", []):
             sku        = (item.get("item", {}).get("seller_sku", "") or "").strip()
             produto    = (item.get("item", {}).get("title", "") or "")[:50]
@@ -303,7 +296,8 @@ def parse_orders(orders, fretes=None):
                 "SKU": sku, "Produto": produto, "Quantidade": qty,
                 "Receita Bruta": receita, "Taxas ML": sale_fee,
                 "Frete": frete, "Total ML": total_ml,
-                "Cancelada": status in ["cancelled"],
+                "Cancelada": cancelada,
+                "Reembolsado": reemb_val,
             })
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
@@ -568,31 +562,17 @@ if st.session_state["aba_ativa"] == "financeiro":
 
     with st.spinner("Buscando fretes e verificando devoluções..."):
         fretes  = fetch_fretes_batch(shipping_ids, token_hash, token)
-        claims  = get_claims(str(user_id), token, date_from, date_to)
+        reembolsados = get_orders_reembolsados(str(user_id), token, date_from, date_to)
 
-    # DEBUG temporário — remove após validar
-    with st.expander(f"🔍 DEBUG claims/devoluções ({len(claims)} encontradas)", expanded=True):
-        headers_dbg = {"Authorization": f"Bearer {token}"}
-        # Testa endpoint de claims
-        r1 = requests.get(f"{ML_API_BASE}/post-purchase/claims/search",
-                         headers=headers_dbg,
-                         params={"seller_id": user_id, "limit": 5}, timeout=15)
-        st.write(f"**/post-purchase/claims/search** → status {r1.status_code}")
-        if r1.status_code == 200:
-            st.json(r1.json())
+    # DEBUG reembolsos
+    with st.expander(f"🔍 DEBUG reembolsos ({len(reembolsados)} encontrados)", expanded=True):
+        if reembolsados:
+            for oid, val in list(reembolsados.items())[:10]:
+                st.write(f"  Order {oid}: reembolsado R$ {val:.2f}")
+        else:
+            st.write("Nenhum reembolso encontrado no período.")
 
-        # Testa orders com status_detail
-        r2 = requests.get(f"{ML_API_BASE}/orders/search",
-                         headers=headers_dbg,
-                         params={"seller": user_id, "order.status_detail": "mediator_return", "limit": 5},
-                         timeout=15)
-        st.write(f"**/orders/search?status_detail=mediator_return** → status {r2.status_code}")
-        if r2.status_code == 200:
-            st.json(r2.json())
-
-        st.write(f"Order IDs com problema identificados: {claims}")
-
-    df_raw = parse_orders(orders, fretes)
+    df_raw = parse_orders(orders, fretes, reembolsados)
     if df_raw.empty:
         st.info("Nenhuma venda encontrada.")
         st.stop()
