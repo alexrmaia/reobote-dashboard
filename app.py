@@ -222,38 +222,14 @@ def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
             fretes[sid] = custo
     return fretes
 
-@st.cache_data(ttl=300, show_spinner=False)
-def get_ads_order_ids(user_id, token, date_from, date_to):
-    """
-    Busca IDs de orders que vieram de Product Ads via /advertising/product_ads/reports/orders.
-    Retorna set de order_ids.
-    """
-    headers = {"Authorization": f"Bearer {token}"}
-    try:
-        resp = requests.get(
-            f"{ML_API_BASE}/advertising/product_ads/reports/orders",
-            headers=headers,
-            params={"seller_id": user_id, "date_from": date_from[:10], "date_to": date_to[:10]},
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            results = data.get("results", []) or data if isinstance(data, list) else []
-            return {str(r.get("order_id") or r.get("id","")) for r in results if r.get("order_id") or r.get("id")}
-    except:
-        pass
-    return set()
-
-def parse_orders(orders, fretes=None, ads_ids=None):
-    fretes  = fretes or {}
-    ads_ids = ads_ids or set()
+def parse_orders(orders, fretes=None):
+    fretes = fretes or {}
     rows = []
     for order in orders:
         order_id    = order.get("id", "")
         status      = order.get("status", "")
         date        = pd.to_datetime(order.get("date_created", ""), errors="coerce")
         shipping_id = order.get("shipping", {}).get("id", 0)
-        via_ads     = str(order_id) in ads_ids
         for item in order.get("order_items", []):
             sku        = (item.get("item", {}).get("seller_sku", "") or "").strip()
             produto    = (item.get("item", {}).get("title", "") or "")[:50]
@@ -269,7 +245,6 @@ def parse_orders(orders, fretes=None, ads_ids=None):
                 "Receita Bruta": receita, "Taxas ML": sale_fee,
                 "Frete": frete, "Total ML": total_ml,
                 "Cancelada": status in ["cancelled"],
-                "Via Ads": via_ads,
             })
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
@@ -501,11 +476,10 @@ if st.session_state["aba_ativa"] == "financeiro":
     shipping_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in orders if o.get("shipping",{}).get("id")}))
     token_hash   = token[-8:] if token else ""
 
-    with st.spinner(f"Buscando fretes e dados de ads..."):
-        fretes  = fetch_fretes_batch(shipping_ids, token_hash, token)
-        ads_ids = get_ads_order_ids(str(user_id), token, date_from, date_to)
+    with st.spinner("Buscando fretes..."):
+        fretes = fetch_fretes_batch(shipping_ids, token_hash, token)
 
-    df_raw = parse_orders(orders, fretes, ads_ids)
+    df_raw = parse_orders(orders, fretes)
     if df_raw.empty:
         st.info("Nenhuma venda encontrada.")
         st.stop()
@@ -619,9 +593,7 @@ if st.session_state["aba_ativa"] == "financeiro":
         qtd_cancel = len(canceladas)
         val_cancel = canceladas["Receita Bruta"].sum()
 
-        via_ads_df = aprovadas[aprovadas["Via Ads"] == True] if "Via Ads" in aprovadas.columns else pd.DataFrame()
-        vendas_ads = len(via_ads_df)
-        pct_ads    = vendas_ads / len(aprovadas) * 100 if len(aprovadas) > 0 else 0
+
 
         m1, m2 = st.columns(2)
         with m1:
@@ -632,9 +604,9 @@ if st.session_state["aba_ativa"] == "financeiro":
                 <div style="font-size:12px;color:#64748B;">{qtd_vendas} unidades</div>
             </div>
             <div>
-                <div style="font-size:12px;font-weight:700;color:#7C3AED;">Vendas pagas</div>
-                <div style="font-size:36px;font-weight:900;color:#0F172A;line-height:1.1;">{vendas_ads}</div>
-                <div style="font-size:12px;color:#16A34A;font-weight:700;">{pct_ads:.1f}% do total</div>
+                <div style="font-size:12px;font-weight:700;color:#7C3AED;">Ticket médio</div>
+                <div style="font-size:28px;font-weight:900;color:#0F172A;line-height:1.1;">R$ {faturamento/len(aprovadas):.2f}</div>
+                <div style="font-size:12px;color:#64748B;">lucro/venda R$ {lucro_total/len(aprovadas):.2f}</div>
             </div>
             """, unsafe_allow_html=True)
         with m2:
@@ -647,7 +619,7 @@ if st.session_state["aba_ativa"] == "financeiro":
             <div>
                 <div style="font-size:12px;font-weight:700;color:#16A34A;">Receita</div>
                 <div style="font-size:28px;font-weight:900;color:#0F172A;line-height:1.1;">R$ {faturamento:,.2f}</div>
-                <div style="font-size:12px;color:#7C3AED;font-weight:700;">lucro R$ {lucro_total:,.2f}</div>
+                <div style="font-size:12px;color:#7C3AED;font-weight:700;">margem {margem_real:.2f}%</div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -673,21 +645,46 @@ if st.session_state["aba_ativa"] == "financeiro":
         st.markdown(f'<div style="color:#64748B;font-size:13px;margin-bottom:16px;">Quantidade vendida por dia no período selecionado — {label_periodo}</div>', unsafe_allow_html=True)
 
         if len(qty_agg) > 1:
-            chart_qty = alt.Chart(qty_agg).mark_area(
-                interpolate="monotone", opacity=0.18, line=True
-            ).encode(
+            # Enriquecer qty_agg com receita e lucro por dia/SKU para o tooltip
+            daily_sku = aprovadas.copy()
+            daily_sku["Dia"] = pd.to_datetime(daily_sku["Data"]).dt.date
+            daily_sku_agg = daily_sku.groupby(["Dia","SKU"]).agg(
+                Quantidade=("Quantidade","sum"),
+                Receita=("Receita Bruta","sum"),
+                Lucro=("Lucro","sum"),
+                Frete=("Frete","sum"),
+                Tarifa=("Taxas ML","sum"),
+            ).reset_index()
+            daily_sku_agg["Dia"] = pd.to_datetime(daily_sku_agg["Dia"])
+            daily_sku_agg["Margem"] = (daily_sku_agg["Lucro"] / daily_sku_agg["Receita"] * 100).round(1)
+            daily_sku_agg["Receita_fmt"]   = daily_sku_agg["Receita"].apply(lambda x: f"R$ {x:,.2f}")
+            daily_sku_agg["Lucro_fmt"]     = daily_sku_agg["Lucro"].apply(lambda x: f"R$ {x:,.2f}")
+
+            base_qty = alt.Chart(daily_sku_agg)
+
+            area_qty = base_qty.mark_area(interpolate="monotone", opacity=0.18, line=True).encode(
                 x=alt.X("Dia:T", title=None, axis=alt.Axis(format="%d/%m", labelFontSize=10)),
                 y=alt.Y("Quantidade:Q", title="Quantidade vendida", axis=alt.Axis(labelFontSize=10)),
-                color=alt.Color("SKU:N", scale=alt.Scale(domain=skus, range=[cor_map[s] for s in skus]),
-                                legend=None),
-                tooltip=[alt.Tooltip("Dia:T",title="Data",format="%d/%m/%Y"),
-                         alt.Tooltip("SKU:N"), alt.Tooltip("Quantidade:Q",title="Qtd")]
+                color=alt.Color("SKU:N", scale=alt.Scale(domain=skus, range=[cor_map[s] for s in skus]), legend=None),
+            )
+            pontos_qty = base_qty.mark_point(filled=True, size=70).encode(
+                x="Dia:T",
+                y="Quantidade:Q",
+                color=alt.Color("SKU:N", scale=alt.Scale(domain=skus, range=[cor_map[s] for s in skus]), legend=None),
+                tooltip=[
+                    alt.Tooltip("Dia:T",        title="Data",     format="%d/%m/%Y"),
+                    alt.Tooltip("SKU:N",         title="SKU"),
+                    alt.Tooltip("Quantidade:Q",  title="Qtd vendida"),
+                    alt.Tooltip("Receita_fmt:N", title="Receita"),
+                    alt.Tooltip("Lucro_fmt:N",   title="Lucro"),
+                    alt.Tooltip("Margem:Q",      title="Margem %", format=".1f"),
+                ]
             )
             media_rules = alt.Chart(media_sku).mark_rule(strokeDash=[4,3], strokeWidth=1.5, opacity=0.5).encode(
                 y="Media:Q",
                 color=alt.Color("SKU:N", scale=alt.Scale(domain=skus, range=[cor_map[s] for s in skus]), legend=None)
             )
-            st.altair_chart((chart_qty + media_rules).properties(height=240), use_container_width=True)
+            st.altair_chart((area_qty + pontos_qty + media_rules).properties(height=240), use_container_width=True)
         else:
             st.info("Gráfico disponível com 2+ dias de dados.")
 
@@ -753,10 +750,13 @@ if st.session_state["aba_ativa"] == "financeiro":
                 f'<span style="background:{bg};color:{txt};border-radius:999px;'
                 f'padding:2px 7px;font-size:11px;font-weight:800;">{pct:.0f}%</span>')
 
-    def margem_badge(pct):
+    def margem_badge(pct, lucro=None):
         bg  = "#DCFCE7" if pct>=15 else "#FEF9C3" if pct>=8 else "#FEE2E2"
         txt = "#15803D" if pct>=15 else "#854D0E" if pct>=8 else "#DC2626"
-        return f'<span style="background:{bg};color:{txt};border-radius:999px;padding:2px 9px;font-size:12px;font-weight:800;">{pct:.1f}%</span>'
+        lucro_str = f'<span style="font-weight:700;color:{txt};">R$ {lucro:,.2f}</span> ' if lucro is not None else ""
+        return (f'{lucro_str}'
+                f'<span style="background:{bg};color:{txt};border-radius:999px;'
+                f'padding:2px 9px;font-size:12px;font-weight:800;">{pct:.1f}%</span>')
 
     def status_icon(s):
         return {"paid":"🚚","cancelled":"❌"}.get(s,"⏳")
@@ -787,7 +787,7 @@ if st.session_state["aba_ativa"] == "financeiro":
             <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Taxas ML'], rec,'#FEF3C7','#B45309')}</td>
             <td style="padding:10px 8px;">{'–' if cancelada else f'{tag_custo}{badge(row["Custo Total"], rec, "#EDE9FE","#6D28D9")}'}</td>
             <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Imposto'], rec,'#F1F5F9','#475569')}</td>
-            <td style="padding:10px 8px;text-align:center;">{'<span style="color:#DC2626;font-weight:700;">Cancelada</span>' if cancelada else margem_badge(row.get('Margem %',0))}</td>
+            <td style="padding:10px 8px;text-align:center;">{'<span style="color:#DC2626;font-weight:700;">Cancelada</span>' if cancelada else margem_badge(row.get('Margem %',0), row.get('Lucro',0))}</td>
             <td style="padding:10px 8px;color:#94A3B8;font-size:12px;white-space:nowrap;">{row['Venda']}</td>
         </tr>"""
 
