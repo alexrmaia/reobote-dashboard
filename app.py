@@ -1200,11 +1200,12 @@ elif st.session_state["aba_ativa"] == "caixa":
     agend_df      = load_agendamentos_inter(str(user_id))
 
     # ── Cards de resumo ──
-    entradas  = extrato_df[extrato_df["valor"] > 0]["valor"].sum()
-    saidas    = extrato_df[extrato_df["valor"] < 0]["valor"].abs().sum()
-    saldo     = extrato_df["valor"].sum()
-    pendentes = extrato_df[~extrato_df["conciliado"]]
-    a_pagar   = agend_df[~agend_df["pago"]]["valor"].abs().sum()
+    entradas  = extrato_df["valor"].sum() if not extrato_df.empty and "valor" in extrato_df.columns else 0.0
+    entradas  = extrato_df[extrato_df["valor"] > 0]["valor"].sum() if not extrato_df.empty else 0.0
+    saidas    = extrato_df[extrato_df["valor"] < 0]["valor"].abs().sum() if not extrato_df.empty else 0.0
+    saldo     = extrato_df["valor"].sum() if not extrato_df.empty else 0.0
+    pendentes = extrato_df[~extrato_df["conciliado"]] if not extrato_df.empty and "conciliado" in extrato_df.columns else pd.DataFrame()
+    a_pagar   = agend_df[~agend_df["pago"]]["valor"].abs().sum() if not agend_df.empty and "pago" in agend_df.columns else 0.0
 
     st.markdown(f"""
     <div class="hero" style="min-height:auto;padding:28px 38px;">
