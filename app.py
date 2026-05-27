@@ -543,11 +543,20 @@ if st.session_state["aba_ativa"] == "financeiro":
     if orders:
         o = orders[0]
         item0 = o.get("order_items", [{}])[0]
-        paid = o.get("paid_amount")
-        unit = item0.get("unit_price")
-        fee  = item0.get("sale_fee")
-        qty  = item0.get("quantity")
-        st.caption(f"DEBUG paid_amount={paid} | unit_price={unit} | sale_fee={fee} | qty={qty} | frete_calc={float(unit or 0)*int(qty or 1) - abs(float(fee or 0)) - float(paid or 0):.2f}")
+        paid = float(o.get("paid_amount") or 0)
+        unit = float(item0.get("unit_price") or 0)
+        fee  = abs(float(item0.get("sale_fee") or 0))
+        qty  = int(item0.get("quantity") or 1)
+        shipping_id = o.get("shipping", {}).get("id")
+        st.caption(f"DEBUG paid_amount={paid} | unit_price={unit} | sale_fee={fee} | qty={qty} | shipping_id={shipping_id}")
+        # Busca shipment completo para inspecionar campos de custo
+        if shipping_id:
+            hdrs = {"Authorization": f"Bearer {token}"}
+            sr = requests.get(f"{ML_API_BASE}/shipments/{shipping_id}", headers=hdrs, timeout=15)
+            if sr.status_code == 200:
+                sdata = sr.json()
+                with st.expander("🔍 DEBUG Shipment JSON completo", expanded=True):
+                    st.json(sdata)
 
     df_raw = parse_orders(orders)
     if df_raw.empty:
