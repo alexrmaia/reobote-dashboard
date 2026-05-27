@@ -2,18 +2,14 @@ import streamlit as st
 import requests
 import pandas as pd
 import altair as alt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import urllib.parse
 from supabase import create_client, Client
 
 # =========================
 # CONFIG
 # =========================
-st.set_page_config(
-    page_title="Reobote Imports",
-    page_icon="🛒",
-    layout="wide",
-)
+st.set_page_config(page_title="Reobote Imports", page_icon="🛒", layout="wide")
 
 CLIENT_ID     = st.secrets["ML_CLIENT_ID"]
 CLIENT_SECRET = st.secrets["ML_CLIENT_SECRET"]
@@ -21,30 +17,28 @@ REDIRECT_URI  = st.secrets["ML_REDIRECT_URI"]
 SUPABASE_URL  = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY  = st.secrets["SUPABASE_KEY"]
 
-ML_AUTH_URL   = "https://auth.mercadolivre.com.br/authorization"
-ML_TOKEN_URL  = "https://api.mercadolibre.com/oauth/token"
-ML_API_BASE   = "https://api.mercadolibre.com"
+ML_AUTH_URL  = "https://auth.mercadolivre.com.br/authorization"
+ML_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
+ML_API_BASE  = "https://api.mercadolibre.com"
 
-# Cliente Supabase
 @st.cache_resource
 def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # =========================
-# SUPABASE — CUSTOS
+# SUPABASE HELPERS
 # =========================
-def load_custos(user_id: str) -> pd.DataFrame:
+def load_custos(user_id):
     sb = get_supabase()
     resp = sb.table("custos_sku").select("*").eq("user_id", user_id).execute()
     if not resp.data:
         return pd.DataFrame(columns=["id","sku","produto","vigencia","qtd_comprada","qtd_disponivel",
-                                      "custo_produto","frete_fornecedor","embalagem","outros_custos","margem_alvo","observacao"])
+                                     "custo_produto","frete_fornecedor","embalagem","outros_custos","margem_alvo","observacao"])
     df = pd.DataFrame(resp.data)
     df["vigencia"] = pd.to_datetime(df["vigencia"], errors="coerce")
-    df = df.sort_values("vigencia", na_position="first").reset_index(drop=True)
-    return df
+    return df.sort_values("vigencia", na_position="first").reset_index(drop=True)
 
-def save_custo(user_id: str, row: dict):
+def save_custo(user_id, row):
     sb = get_supabase()
     row["user_id"] = user_id
     row["updated_at"] = datetime.now().isoformat()
@@ -53,31 +47,7 @@ def save_custo(user_id: str, row: dict):
     else:
         sb.table("custos_sku").insert(row).execute()
 
-def load_regime(user_id: str) -> pd.DataFrame:
-    sb = get_supabase()
-    resp = sb.table("regime_tributario").select("*").eq("user_id", user_id).order("vigencia").execute()
-    if not resp.data:
-        return pd.DataFrame(columns=["id","vigencia","regime","aliquota"])
-    df = pd.DataFrame(resp.data)
-    df["vigencia"] = pd.to_datetime(df["vigencia"], errors="coerce")
-    return df
-
-def load_fifo_consumo(user_id: str) -> dict:
-    sb = get_supabase()
-    resp = sb.table("fifo_consumo").select("*").eq("user_id", user_id).execute()
-    if not resp.data:
-        return {}
-    return {r["venda_id"]: r for r in resp.data}
-
-def save_fifo_venda(user_id: str, venda_id: str, sku: str, qtd: int, custo: float, fifo: bool):
-    sb = get_supabase()
-    sb.table("fifo_consumo").upsert({
-        "user_id": user_id, "venda_id": venda_id,
-        "sku": sku, "qtd": qtd, "custo_unitario": custo, "fifo": fifo
-    }, on_conflict="user_id,venda_id").execute()
-
-def save_custos_batch(user_id: str, df: pd.DataFrame):
-    """Salva todos os custos de uma vez (upsert por id)."""
+def save_custos_batch(user_id, df):
     sb = get_supabase()
     records = []
     for _, row in df.iterrows():
@@ -102,272 +72,217 @@ def save_custos_batch(user_id: str, df: pd.DataFrame):
     if records:
         sb.table("custos_sku").upsert(records, on_conflict="id").execute()
 
-# Session com retry para conexões instáveis
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+def load_regime(user_id):
+    sb = get_supabase()
+    resp = sb.table("regime_tributario").select("*").eq("user_id", user_id).order("vigencia").execute()
+    if not resp.data:
+        return pd.DataFrame(columns=["id","vigencia","regime","aliquota"])
+    df = pd.DataFrame(resp.data)
+    df["vigencia"] = pd.to_datetime(df["vigencia"], errors="coerce")
+    return df
 
-def make_session():
-    s = requests.Session()
-    retry = Retry(connect=3, backoff_factor=1)
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    return s
+def save_regime(user_id, row):
+    sb = get_supabase()
+    row["user_id"] = user_id
+    if row.get("id"):
+        sb.table("regime_tributario").update(row).eq("id", row["id"]).execute()
+    else:
+        sb.table("regime_tributario").insert(row).execute()
+
+def load_fifo_consumo(user_id):
+    sb = get_supabase()
+    resp = sb.table("fifo_consumo").select("*").eq("user_id", user_id).execute()
+    if not resp.data:
+        return {}
+    return {r["venda_id"]: r for r in resp.data}
+
+def load_correcoes(user_id):
+    sb = get_supabase()
+    resp = sb.table("correcoes_custo").select("*").eq("user_id", user_id).execute()
+    return {r["venda_id"]: r for r in (resp.data or [])}
+
+def save_correcao(user_id, venda_id, custo, motivo=""):
+    sb = get_supabase()
+    sb.table("correcoes_custo").upsert({
+        "user_id": user_id,
+        "venda_id": str(venda_id),
+        "custo_unitario": float(custo),
+        "motivo": motivo,
+    }, on_conflict="user_id,venda_id").execute()
+
+def delete_correcao(user_id, venda_id):
+    sb = get_supabase()
+    sb.table("correcoes_custo").delete().eq("user_id", user_id).eq("venda_id", str(venda_id)).execute()
+
+def load_capital(user_id):
+    sb = get_supabase()
+    resp = sb.table("capital_investido").select("*").eq("user_id", user_id).order("data").execute()
+    if not resp.data:
+        return pd.DataFrame(columns=["id","data","valor","descricao","categoria"])
+    df = pd.DataFrame(resp.data)
+    df["data"] = pd.to_datetime(df["data"], errors="coerce")
+    df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+    return df
+
+def save_capital(user_id, row):
+    sb = get_supabase()
+    row["user_id"] = user_id
+    if row.get("id"):
+        sb.table("capital_investido").update(row).eq("id", row["id"]).execute()
+    else:
+        sb.table("capital_investido").insert(row).execute()
 
 # =========================
-# OAUTH HELPERS
+# OAUTH
 # =========================
 def get_auth_url():
-    params = {
-        "response_type": "code",
-        "client_id": CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
-    }
+    params = {"response_type": "code", "client_id": CLIENT_ID, "redirect_uri": REDIRECT_URI}
     return f"{ML_AUTH_URL}?{urllib.parse.urlencode(params)}"
 
-def exchange_code_for_token(code: str) -> dict:
-    try:
-        session = make_session()
-        resp = session.post(
-            ML_TOKEN_URL,
-            data={
-                "grant_type":    "authorization_code",
-                "client_id":     CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-                "code":          code,
-                "redirect_uri":  REDIRECT_URI,
-            },
-            headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
-            timeout=30,
-        )
-        return resp.json()
-    except Exception as e:
-        return {"error": str(e)}
-
-def refresh_access_token(refresh_token: str) -> dict:
-    resp = requests.post(
-        ML_TOKEN_URL,
-        data={
-            "grant_type":    "refresh_token",
-            "client_id":     CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "refresh_token": refresh_token,
-        },
-        headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
-        timeout=30,
-    )
+def exchange_code_for_token(code):
+    resp = requests.post(ML_TOKEN_URL, data={
+        "grant_type": "authorization_code", "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET, "code": code, "redirect_uri": REDIRECT_URI,
+    }, headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}, timeout=30)
     return resp.json()
 
-def get_token() -> str | None:
-    """Retorna access_token válido, renovando se necessário."""
+def refresh_access_token(refresh_token):
+    resp = requests.post(ML_TOKEN_URL, data={
+        "grant_type": "refresh_token", "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET, "refresh_token": refresh_token,
+    }, headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}, timeout=30)
+    return resp.json()
+
+def get_token():
     if "access_token" not in st.session_state:
         return None
-    expires_at = st.session_state.get("expires_at", 0)
-    if datetime.now().timestamp() >= expires_at - 60:
-        refresh_token = st.session_state.get("refresh_token")
-        if not refresh_token:
-            return None
-        data = refresh_access_token(refresh_token)
+    if datetime.now().timestamp() >= st.session_state.get("expires_at", 0) - 60:
+        data = refresh_access_token(st.session_state.get("refresh_token", ""))
         if "access_token" not in data:
             return None
         save_token(data)
     return st.session_state["access_token"]
 
-def save_token(data: dict):
+def save_token(data):
     st.session_state["access_token"]  = data["access_token"]
     st.session_state["refresh_token"] = data.get("refresh_token", "")
     st.session_state["user_id"]       = data.get("user_id", "")
     st.session_state["expires_at"]    = datetime.now().timestamp() + data.get("expires_in", 21600)
 
 # =========================
-# API HELPERS
+# API
 # =========================
-def api_get(path: str, params: dict = None) -> dict | list:
-    token = get_token()
-    if not token:
-        return {}
-    headers = {"Authorization": f"Bearer {token}"}
-    resp = requests.get(f"{ML_API_BASE}{path}", headers=headers, params=params or {}, timeout=30)
-    if resp.status_code == 200:
-        return resp.json()
-    return {}
-
 @st.cache_data(ttl=300, show_spinner=False)
-def get_user_info(user_id: str, token: str) -> dict:
-    headers = {"Authorization": f"Bearer {token}"}
-    resp = requests.get(f"{ML_API_BASE}/users/{user_id}", headers=headers)
+def get_user_info(user_id, token):
+    resp = requests.get(f"{ML_API_BASE}/users/{user_id}",
+                        headers={"Authorization": f"Bearer {token}"}, timeout=15)
     return resp.json() if resp.status_code == 200 else {}
 
 @st.cache_data(ttl=300, show_spinner=False)
-def get_orders(user_id: str, token: str, date_from: str, date_to: str) -> list:
-    """Busca todas as ordens do período."""
+def get_orders(user_id, token, date_from, date_to):
     headers = {"Authorization": f"Bearer {token}"}
-    orders = []
-    offset = 0
-    limit  = 50
-
+    orders, offset, limit = [], 0, 50
     while True:
-        params = {
-            "seller": user_id,
-            "order.date_created.from": date_from,
-            "order.date_created.to":   date_to,
-            "sort":   "date_desc",
-            "offset": offset,
-            "limit":  limit,
-        }
-        resp = requests.get(f"{ML_API_BASE}/orders/search", headers=headers, params=params, timeout=30)
+        resp = requests.get(f"{ML_API_BASE}/orders/search", headers=headers, params={
+            "seller": user_id, "order.date_created.from": date_from,
+            "order.date_created.to": date_to, "sort": "date_desc",
+            "offset": offset, "limit": limit,
+        }, timeout=30)
         if resp.status_code != 200:
             break
         data = resp.json()
         results = data.get("results", [])
         orders.extend(results)
         paging = data.get("paging", {})
-        total  = paging.get("total", 0)
         offset += limit
-        if offset >= total or not results:
+        if offset >= paging.get("total", 0) or not results:
             break
-
     return orders
 
-
-
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_fretes_batch(shipping_ids_tuple: tuple, token_hash: str, token: str) -> dict:
-    """
-    Busca list_cost de /shipments/{id} em paralelo para pedidos ainda não liquidados.
-    list_cost = custo real do Full ao vendedor (confirmado via XLSX).
-    Cacheado 1h — reruns instantâneos.
-    """
+def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
     from concurrent.futures import ThreadPoolExecutor, as_completed
-
     if not shipping_ids_tuple:
         return {}
-
     headers = {"Authorization": f"Bearer {token}"}
-
     def fetch_one(sid):
         try:
-            resp = requests.get(
-                f"{ML_API_BASE}/shipments/{sid}",
-                headers=headers,
-                timeout=15,
-            )
+            resp = requests.get(f"{ML_API_BASE}/shipments/{sid}", headers=headers, timeout=15)
             if resp.status_code != 200:
                 return sid, 0.0
-            data = resp.json()
-            # list_cost é o custo real ao vendedor no Full
-            opt = data.get("shipping_option", {})
+            opt = resp.json().get("shipping_option", {})
             cost = opt.get("list_cost") or opt.get("base_cost") or opt.get("cost") or 0
             return sid, float(cost)
-        except Exception:
+        except:
             return sid, 0.0
-
     fretes = {}
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(fetch_one, sid): sid for sid in shipping_ids_tuple}
-        for future in as_completed(futures):
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        for future in as_completed({ex.submit(fetch_one, sid): sid for sid in shipping_ids_tuple}):
             sid, custo = future.result()
             fretes[sid] = custo
-
     return fretes
 
-def parse_orders(orders: list, fretes: dict = None) -> pd.DataFrame:
-    """
-    Converte lista de ordens da API em DataFrame.
-
-    Lógica financeira (confirmada via XLSX e inspeção do /shipments/{id}):
-      Receita Bruta = unit_price × qty
-      Tarifa ML     = abs(sale_fee)
-      Frete         = shipping_option.list_cost do /shipments/{id}  ← campo correto
-      Total ML      = Receita - Tarifa - Frete
-      (paid_amount não é confiável para pedidos em processamento)
-    """
+def parse_orders(orders, fretes=None):
     fretes = fretes or {}
     rows = []
     for order in orders:
         order_id    = order.get("id", "")
         status      = order.get("status", "")
-        date_str    = order.get("date_created", "")
-        date        = pd.to_datetime(date_str, errors="coerce")
+        date        = pd.to_datetime(order.get("date_created", ""), errors="coerce")
         shipping_id = order.get("shipping", {}).get("id", 0)
-
         for item in order.get("order_items", []):
-            sku        = item.get("item", {}).get("seller_sku", "") or ""
-            produto    = item.get("item", {}).get("title", "") or ""
+            sku        = (item.get("item", {}).get("seller_sku", "") or "").strip()
+            produto    = (item.get("item", {}).get("title", "") or "")[:50]
             qty        = int(item.get("quantity", 1) or 1)
             unit_price = float(item.get("unit_price", 0) or 0)
             sale_fee   = abs(float(item.get("sale_fee", 0) or 0))
-
-            frete    = float(fretes.get(shipping_id, 0) or 0)
-            receita  = unit_price * qty
-            total_ml = receita - sale_fee - frete
-
+            frete      = float(fretes.get(shipping_id, 0) or 0)
+            receita    = unit_price * qty
+            total_ml   = receita - sale_fee - frete
             rows.append({
-                "Venda":         str(order_id),
-                "Data":          date,
-                "Status":        status,
-                "SKU":           sku.strip(),
-                "Produto":       produto[:50],
-                "Quantidade":    qty,
-                "Receita Bruta": receita,
-                "Taxas ML":      sale_fee,
-                "Frete":         frete,
-                "Total ML":      total_ml,
-                "Cancelada":     status in ["cancelled"],
+                "Venda": str(order_id), "Data": date, "Status": status,
+                "SKU": sku, "Produto": produto, "Quantidade": qty,
+                "Receita Bruta": receita, "Taxas ML": sale_fee,
+                "Frete": frete, "Total ML": total_ml,
+                "Cancelada": status in ["cancelled"],
             })
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows)
-
-def apply_costs_online(df: pd.DataFrame, user_id: str) -> pd.DataFrame:
-    """Aplica custos, FIFO, correções e impostos nas vendas."""
+def apply_costs_online(df, user_id):
     if df.empty:
         return df
-
     df = df.copy()
     sb = get_supabase()
-
     custos_df  = load_custos(user_id)
     regime_df  = load_regime(user_id)
     fifo_hist  = load_fifo_consumo(user_id)
-
-    corr_resp  = sb.table("correcoes_custo").select("*").eq("user_id", user_id).execute()
-    correcoes  = {r["venda_id"]: r["custo_unitario"] for r in (corr_resp.data or [])}
-
+    correcoes  = {r: v["custo_unitario"] for r, v in load_correcoes(user_id).items()}
     FIFO_CORTE = pd.Timestamp("2026-05-20", tz="UTC")
 
     def aliquota_para_data(data):
-        if regime_df.empty:
-            return 0.0
+        if regime_df.empty: return 0.0
         validos = regime_df[pd.to_datetime(regime_df["vigencia"], utc=True) <= data]
-        if validos.empty:
-            return 0.0
-        return float(validos.iloc[-1]["aliquota"]) / 100
+        return float(validos.iloc[-1]["aliquota"]) / 100 if not validos.empty else 0.0
 
     def custo_por_vigencia(sku, data):
-        if custos_df.empty:
-            return 0.0
-        sku_df = custos_df[custos_df["sku"] == sku].copy()
-        if sku_df.empty:
-            return 0.0
-        sku_df["vigencia"] = pd.to_datetime(sku_df["vigencia"], utc=True, errors="coerce")
-        validos = sku_df[sku_df["vigencia"].isna() | (sku_df["vigencia"] <= data)]
-        if validos.empty:
-            return 0.0
-        return float(validos.iloc[-1]["custo_produto"])
+        if custos_df.empty: return 0.0
+        sk = custos_df[custos_df["sku"] == sku].copy()
+        if sk.empty: return 0.0
+        sk["vigencia"] = pd.to_datetime(sk["vigencia"], utc=True, errors="coerce")
+        validos = sk[sk["vigencia"].isna() | (sk["vigencia"] <= data)]
+        return float(validos.iloc[-1]["custo_produto"]) if not validos.empty else 0.0
 
     custos_out = custos_df.copy()
     novos_fifo = {}
-
     df["Custo Unitário"] = 0.0
     df["Custo Total"]    = 0.0
     df["Imposto"]        = 0.0
     df["Lucro"]          = 0.0
     df["Margem %"]       = 0.0
+    df["FIFO"]           = False
+    df["Corrigido"]      = False
 
     df_sorted = df.sort_values("Data").reset_index(drop=True)
-
     for idx, row in df_sorted.iterrows():
         venda_id  = str(row["Venda"])
         sku       = str(row["SKU"]).strip()
@@ -375,107 +290,90 @@ def apply_costs_online(df: pd.DataFrame, user_id: str) -> pd.DataFrame:
         data      = pd.to_datetime(row["Data"], utc=True)
         cancelada = row["Cancelada"]
 
-        # Custo unitário
         if venda_id in correcoes:
             custo_unit = float(correcoes[venda_id])
+            df_sorted.at[idx, "Corrigido"] = True
         elif venda_id in fifo_hist:
             custo_unit = float(fifo_hist[venda_id].get("custo_unitario", 0))
+            df_sorted.at[idx, "FIFO"] = True
         elif data >= FIFO_CORTE and not cancelada:
-            lotes = custos_out[
-                (custos_out["sku"] == sku) & (custos_out["qtd_disponivel"] > 0)
-            ].sort_values("vigencia", na_position="first")
-
+            lotes = custos_out[(custos_out["sku"] == sku) & (custos_out["qtd_disponivel"] > 0)].sort_values("vigencia", na_position="first")
             if lotes.empty:
                 todos = custos_out[custos_out["sku"] == sku].sort_values("vigencia", na_position="first")
                 custo_unit = float(todos.iloc[-1]["custo_produto"]) if not todos.empty else 0.0
             else:
-                qtd_rest  = qty
-                custo_tot = 0.0
+                qtd_rest, custo_tot = qty, 0.0
                 for lidx in lotes.index:
-                    if qtd_rest <= 0:
-                        break
+                    if qtd_rest <= 0: break
                     qtd_lote  = float(custos_out.at[lidx, "qtd_disponivel"])
                     c_lote    = float(custos_out.at[lidx, "custo_produto"])
                     consumido = min(qtd_rest, qtd_lote)
                     custo_tot += consumido * c_lote
-                    nova_qtd  = qtd_lote - consumido
+                    nova_qtd   = qtd_lote - consumido
                     custos_out.at[lidx, "qtd_disponivel"] = nova_qtd if nova_qtd > 0 else -1
                     qtd_rest  -= consumido
                 custo_unit = custo_tot / qty if qty > 0 else 0.0
                 novos_fifo[venda_id] = {"sku": sku, "qtd": qty, "custo_unitario": custo_unit, "fifo": True}
+                df_sorted.at[idx, "FIFO"] = True
         else:
             custo_unit = custo_por_vigencia(sku, data)
 
         df_sorted.at[idx, "Custo Unitário"] = custo_unit
-
-        aliquota = aliquota_para_data(data)
-        imposto  = row["Receita Bruta"] * aliquota if not cancelada else 0.0
-        df_sorted.at[idx, "Imposto"] = imposto
-
-        custo_total = custo_unit * qty if not cancelada else 0.0
-        lucro = row["Total ML"] - custo_total - imposto
-        df_sorted.at[idx, "Custo Total"] = custo_total
+        aliquota   = aliquota_para_data(data)
+        imposto    = row["Receita Bruta"] * aliquota if not cancelada else 0.0
+        custo_tot  = custo_unit * qty if not cancelada else 0.0
+        lucro      = row["Total ML"] - custo_tot - imposto
+        margem     = (lucro / row["Receita Bruta"] * 100) if row["Receita Bruta"] > 0 and not cancelada else 0.0
+        df_sorted.at[idx, "Imposto"]     = imposto
+        df_sorted.at[idx, "Custo Total"] = custo_tot
         df_sorted.at[idx, "Lucro"]       = lucro
-        df_sorted.at[idx, "Margem %"]    = (lucro / row["Receita Bruta"] * 100) if row["Receita Bruta"] > 0 and not cancelada else 0.0
+        df_sorted.at[idx, "Margem %"]    = margem
 
     if novos_fifo:
-        records = [{"user_id": user_id, "venda_id": vid, **d} for vid, d in novos_fifo.items()]
-        sb.table("fifo_consumo").upsert(records, on_conflict="user_id,venda_id").execute()
+        sb.table("fifo_consumo").upsert(
+            [{"user_id": user_id, "venda_id": vid, **d} for vid, d in novos_fifo.items()],
+            on_conflict="user_id,venda_id").execute()
         save_custos_batch(user_id, custos_out)
 
     return df_sorted.sort_values("Data", ascending=False).reset_index(drop=True)
 
 # =========================
-# ESTILO
+# ESTILOS
 # =========================
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
-html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-.main { background: #F5F7FB; }
-.block-container { padding-top: 0 !important; max-width: 1380px !important; margin: 0 auto; }
-header[data-testid="stHeader"] { display: none !important; }
-#MainMenu { display: none !important; }
-footer { display: none !important; }
-.navbar {
-    background: linear-gradient(90deg, #1E1040 0%, #2D1B69 50%, #1E1040 100%);
-    padding: 0 32px; height: 52px; display: flex; align-items: center;
-    box-shadow: 0 3px 16px rgba(109,40,217,.25); margin-bottom: 20px;
-    border-radius: 0 0 12px 12px;
-}
-.navbar-name { color: white; font-size: 15px; font-weight: 900; letter-spacing: 1px; margin-left: 10px; }
-.card { background: white; border-radius: 20px; padding: 28px 32px; margin-bottom: 20px;
-        box-shadow: 0 2px 12px rgba(15,23,42,.06); border: 1px solid #E7ECF5; }
-.hero { background: linear-gradient(135deg, #7C3AED 0%, #8B5CF6 45%, #6D28D9 100%);
-        border-radius: 24px; padding: 34px 38px; color: white;
-        box-shadow: 0 18px 45px rgba(124,58,237,.22); margin-bottom: 20px; }
-.hero-title { font-size: 48px; font-weight: 900; line-height: 1; margin: 0; letter-spacing: -1.6px; }
-.hero-value { font-size: 56px; font-weight: 900; line-height: 1; letter-spacing: -2px; }
-.hero-label { font-size: 14px; font-weight: 700; opacity: .85; margin-bottom: 4px; }
-.metric-card { background: white; border-radius: 16px; padding: 20px 24px;
-               border: 1px solid #E7ECF5; box-shadow: 0 2px 8px rgba(15,23,42,.05); }
-.metric-label { font-size: 12px; font-weight: 800; color: #64748B; text-transform: uppercase; letter-spacing: .5px; }
-.metric-value { font-size: 28px; font-weight: 900; color: #0F172A; margin-top: 4px; }
-.login-card { background: white; border-radius: 24px; padding: 48px; max-width: 480px;
-              margin: 80px auto; text-align: center; box-shadow: 0 8px 32px rgba(15,23,42,.1); }
-.nav-btn button { border-radius: 999px !important; font-weight: 700 !important; }
-.badge-ok { background:#DCFCE7; color:#15803D; padding:3px 10px; border-radius:999px; font-size:12px; font-weight:700; }
-.badge-cancel { background:#FEE2E2; color:#DC2626; padding:3px 10px; border-radius:999px; font-size:12px; font-weight:700; }
+html,body,[class*="css"]{font-family:'Inter',sans-serif;}
+.main{background:#F5F7FB;}
+.block-container{padding-top:0!important;max-width:1380px!important;margin:0 auto;}
+header[data-testid="stHeader"]{display:none!important;}
+#MainMenu,footer{display:none!important;}
+.navbar{background:linear-gradient(90deg,#1E1040 0%,#2D1B69 50%,#1E1040 100%);
+        padding:0 32px;height:52px;display:flex;align-items:center;
+        box-shadow:0 3px 16px rgba(109,40,217,.25);margin-bottom:20px;border-radius:0 0 12px 12px;}
+.navbar-name{color:white;font-size:15px;font-weight:900;letter-spacing:1px;margin-left:10px;}
+.card{background:white;border-radius:20px;padding:28px 32px;margin-bottom:20px;
+      box-shadow:0 2px 12px rgba(15,23,42,.06);border:1px solid #E7ECF5;}
+.hero{background:linear-gradient(135deg,#7C3AED 0%,#8B5CF6 45%,#6D28D9 100%);
+      border-radius:24px;padding:34px 38px;color:white;
+      box-shadow:0 18px 45px rgba(124,58,237,.22);margin-bottom:20px;}
+.hero-title{font-size:48px;font-weight:900;line-height:1;margin:0;letter-spacing:-1.6px;}
+.metric-card{background:white;border-radius:16px;padding:20px 24px;
+             border:1px solid #E7ECF5;box-shadow:0 2px 8px rgba(15,23,42,.05);}
+.metric-label{font-size:12px;font-weight:800;color:#64748B;text-transform:uppercase;letter-spacing:.5px;}
+.metric-value{font-size:28px;font-weight:900;color:#0F172A;margin-top:4px;}
+.login-card{background:white;border-radius:24px;padding:48px;max-width:480px;
+            margin:80px auto;text-align:center;box-shadow:0 8px 32px rgba(15,23,42,.1);}
 </style>
 """, unsafe_allow_html=True)
 
 # =========================
 # NAVBAR
 # =========================
-st.markdown("""
-<div class="navbar">
-    <span style="font-size:20px;">🛒</span>
-    <span class="navbar-name">REOBOTE IMPORTS</span>
-</div>
-""", unsafe_allow_html=True)
+st.markdown('<div class="navbar"><span style="font-size:20px;">🛒</span><span class="navbar-name">REOBOTE IMPORTS</span></div>', unsafe_allow_html=True)
 
 # =========================
-# AUTENTICAÇÃO
+# AUTH
 # =========================
 query_params = st.query_params
 code = query_params.get("code", None)
@@ -489,90 +387,84 @@ if code and "access_token" not in st.session_state:
             st.rerun()
         else:
             st.error(f"Erro na autenticação: {token_data}")
-            st.info("Tente conectar novamente.")
             if st.button("Tentar novamente"):
                 st.query_params.clear()
                 st.rerun()
             st.stop()
 
-# Não autenticado — tela de login
 if "access_token" not in st.session_state:
-    auth_url = get_auth_url()
-    st.markdown("""
-    <div class="login-card">
+    st.markdown("""<div class="login-card">
         <div style="font-size:48px;margin-bottom:16px;">🛒</div>
         <h2 style="font-weight:900;color:#1E1040;margin-bottom:8px;">Reobote Imports</h2>
         <p style="color:#64748B;margin-bottom:24px;">Conecte sua conta do Mercado Livre para acessar o dashboard.</p>
-    </div>
-    """, unsafe_allow_html=True)
-    st.link_button("🔗 Conectar com Mercado Livre", auth_url, use_container_width=True, type="primary")
+    </div>""", unsafe_allow_html=True)
+    st.link_button("🔗 Conectar com Mercado Livre", get_auth_url(), use_container_width=True, type="primary")
     st.stop()
 
 # =========================
-# DASHBOARD AUTENTICADO
+# DASHBOARD
 # =========================
-token   = get_token()
-user_id = st.session_state.get("user_id", "")
-user    = get_user_info(str(user_id), token)
-nickname = user.get("nickname", "Vendedor")
+token    = get_token()
+user_id  = st.session_state.get("user_id", "")
+nickname = get_user_info(str(user_id), token).get("nickname", "Vendedor")
 
-# Navegação por abas via session_state
 if "aba_ativa" not in st.session_state:
     st.session_state["aba_ativa"] = "financeiro"
 
-nav_cols = st.columns([2, 2, 2, 4])
-with nav_cols[0]:
-    if st.button("📊 Financeiro", use_container_width=True,
-                 type="primary" if st.session_state["aba_ativa"] == "financeiro" else "secondary"):
-        st.session_state["aba_ativa"] = "financeiro"
-        st.rerun()
-with nav_cols[1]:
-    if st.button("📦 Custos", use_container_width=True,
-                 type="primary" if st.session_state["aba_ativa"] == "custos" else "secondary"):
-        st.session_state["aba_ativa"] = "custos"
-        st.rerun()
-with nav_cols[2]:
-    if st.button("🔓 Sair", use_container_width=True, type="secondary"):
-        for key in ["access_token","refresh_token","user_id","expires_at","aba_ativa"]:
-            st.session_state.pop(key, None)
-        st.rerun()
+nav_cols = st.columns([2, 2, 2, 2, 4])
+abas = [("financeiro","📊 Financeiro"), ("custos","📦 Custos"), ("regime","🏛️ Regime"), ("caixa","💰 Caixa")]
+for col, (aba_id, aba_label) in zip(nav_cols[:4], abas):
+    with col:
+        if st.button(aba_label, use_container_width=True,
+                     type="primary" if st.session_state["aba_ativa"] == aba_id else "secondary"):
+            st.session_state["aba_ativa"] = aba_id
+            st.rerun()
+with nav_cols[4]:
+    c1, c2 = st.columns([1,1])
+    with c2:
+        if st.button("🔓 Sair", use_container_width=True):
+            for k in ["access_token","refresh_token","user_id","expires_at","aba_ativa"]:
+                st.session_state.pop(k, None)
+            st.rerun()
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# ===================================================
+# ══════════════════════════════════════════
 # ABA: FINANCEIRO
-# ===================================================
+# ══════════════════════════════════════════
 if st.session_state["aba_ativa"] == "financeiro":
-
     import zoneinfo
-    tz_br = zoneinfo.ZoneInfo("America/Sao_Paulo")
+    tz_br    = zoneinfo.ZoneInfo("America/Sao_Paulo")
     agora_br = datetime.now(tz_br)
     hoje_str = agora_br.strftime("%Y-%m-%d")
 
-    col_f1, col_f2, col_f3 = st.columns([3, 3, 1])
+    col_f1, col_f2, col_f3, col_f4 = st.columns([2, 1.5, 1.5, 0.5])
     with col_f1:
-        periodo = st.selectbox("Período", ["Hoje", "7 dias", "15 dias", "30 dias"], index=1,
-                               key="periodo_sel")
-    with col_f3:
-        if st.button("🔄", help="Atualizar dados"):
+        periodo = st.selectbox("Período", ["Hoje","7 dias","15 dias","30 dias","Personalizar"], index=1, key="periodo_sel")
+    with col_f4:
+        if st.button("🔄", help="Limpar cache e atualizar"):
             st.cache_data.clear()
             st.rerun()
 
-    if periodo == "Hoje":
+    # Datas personalizadas
+    if periodo == "Personalizar":
+        with col_f2:
+            data_ini = st.date_input("De", value=agora_br.date() - timedelta(days=7), key="data_ini")
+        with col_f3:
+            data_fim = st.date_input("Até", value=agora_br.date(), key="data_fim")
+        date_from = f"{data_ini}T00:00:00.000-03:00"
+        date_to   = f"{data_fim}T23:59:59.000-03:00"
+        label_periodo = f"{data_ini.strftime('%d/%m')} – {data_fim.strftime('%d/%m/%Y')}"
+    elif periodo == "Hoje":
         date_from = f"{hoje_str}T00:00:00.000-03:00"
         date_to   = f"{hoje_str}T23:59:59.000-03:00"
-    elif periodo == "7 dias":
-        d = agora_br - timedelta(days=7)
-        date_from = d.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
-        date_to   = agora_br.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
-    elif periodo == "15 dias":
-        d = agora_br - timedelta(days=15)
-        date_from = d.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
-        date_to   = agora_br.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+        label_periodo = f"Hoje • {agora_br.strftime('%d/%m/%Y')}"
     else:
-        d = agora_br - timedelta(days=30)
+        dias = {"7 dias": 7, "15 dias": 15, "30 dias": 30}[periodo]
+        d = agora_br - timedelta(days=dias)
         date_from = d.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
         date_to   = agora_br.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+        label_periodo = f"{periodo} • até {agora_br.strftime('%d/%m/%Y')}"
 
     with st.spinner("Buscando vendas..."):
         orders = get_orders(str(user_id), token, date_from, date_to)
@@ -581,68 +473,57 @@ if st.session_state["aba_ativa"] == "financeiro":
         st.info("Nenhuma venda encontrada no período.")
         st.stop()
 
-    # Busca fretes em paralelo via /shipments (list_cost = custo Full ao vendedor)
-    shipping_ids = tuple(sorted({
-        o.get("shipping", {}).get("id")
-        for o in orders
-        if o.get("shipping", {}).get("id")
-    }))
-    token_hash = token[-8:] if token else ""
-    with st.spinner("Buscando fretes..."):
+    shipping_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in orders if o.get("shipping",{}).get("id")}))
+    token_hash   = token[-8:] if token else ""
+    with st.spinner(f"Buscando fretes ({len(shipping_ids)} envios)..."):
         fretes = fetch_fretes_batch(shipping_ids, token_hash, token)
 
     df_raw = parse_orders(orders, fretes)
     if df_raw.empty:
-        st.info("Nenhuma venda encontrada no período.")
+        st.info("Nenhuma venda encontrada.")
         st.stop()
 
     with st.spinner("Calculando custos e margens..."):
         df = apply_costs_online(df_raw, str(user_id))
 
-    # Métricas
     aprovadas   = df[~df["Cancelada"]]
     canceladas  = df[df["Cancelada"]]
     faturamento = aprovadas["Receita Bruta"].sum()
     tarifas     = aprovadas["Taxas ML"].sum()
     fretes_sum  = aprovadas["Frete"].sum()
-    custos      = aprovadas["Custo Total"].sum() if "Custo Total" in aprovadas.columns else 0
+    custos      = aprovadas["Custo Total"].sum()
     impostos    = aprovadas["Imposto"].sum()
-    lucro_total = aprovadas["Lucro"].sum() if "Lucro" in aprovadas.columns else 0
+    lucro_total = aprovadas["Lucro"].sum()
     margem_real = (lucro_total / faturamento * 100) if faturamento > 0 else 0
-    qtd_cancel  = int(canceladas["Quantidade"].sum())
 
-    # Hero
+    # HERO
     st.markdown(f"""
     <div class="hero">
-        <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:24px;">
-            <div>
-                <p style="opacity:.85;font-size:14px;font-weight:700;margin:0;">Olá, {nickname} 👋</p>
-                <h1 class="hero-title">Financeiro</h1>
-                <div style="background:rgba(255,255,255,.15);border-radius:999px;padding:8px 16px;
-                            width:fit-content;margin-top:12px;font-size:13px;font-weight:800;">
-                    {periodo} • {agora_br.strftime('%d/%m/%Y')}
-                </div>
-            </div>
-            <div style="text-align:right;">
-                <div style="font-size:14px;font-weight:700;opacity:.85;">Faturamento</div>
-                <div class="hero-value">R$ {faturamento:,.2f}</div>
-            </div>
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:24px;">
+        <div>
+          <p style="opacity:.85;font-size:14px;font-weight:700;margin:0;">Olá, {nickname} 👋</p>
+          <h1 class="hero-title">Financeiro</h1>
+          <div style="background:rgba(255,255,255,.15);border-radius:999px;padding:8px 16px;
+                      width:fit-content;margin-top:12px;font-size:13px;font-weight:800;">{label_periodo}</div>
         </div>
+        <div style="text-align:right;">
+          <div style="font-size:14px;font-weight:700;opacity:.85;">Faturamento</div>
+          <div style="font-size:52px;font-weight:900;letter-spacing:-2px;line-height:1;">R$ {faturamento:,.2f}</div>
+        </div>
+      </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # Cards KPI
-    c1, c2, c3, c4 = st.columns(4)
-    def card(col, label, value, sub="", color="#1E1040"):
-        col.markdown(f"""
-        <div class="metric-card">
+    # KPIs
+    def card(col, label, value, sub="", color="#64748B"):
+        col.markdown(f"""<div class="metric-card">
             <div class="metric-label" style="color:{color};">{label}</div>
             <div class="metric-value">{value}</div>
-            {f'<div style="color:#64748B;font-size:13px;margin-top:4px;">{sub}</div>' if sub else ''}
-        </div>
-        """, unsafe_allow_html=True)
+            {f'<div style="color:#94A3B8;font-size:13px;margin-top:4px;">{sub}</div>' if sub else ''}
+        </div>""", unsafe_allow_html=True)
 
-    pct = lambda v: f"{v/faturamento*100:.1f}%" if faturamento else ""
+    pct = lambda v: f"{v/faturamento*100:.1f}%" if faturamento else "0%"
+    c1, c2, c3, c4 = st.columns(4)
     card(c1, "Tarifas ML",  f"R$ {tarifas:,.2f}",   pct(tarifas),   "#F59E0B")
     card(c2, "Frete ML",    f"R$ {fretes_sum:,.2f}", pct(fretes_sum),"#0EA5E9")
     card(c3, "Custos",      f"R$ {custos:,.2f}",     pct(custos),    "#8B5CF6")
@@ -650,272 +531,366 @@ if st.session_state["aba_ativa"] == "financeiro":
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    lc1, lc2, lc3 = st.columns([1, 1, 2])
+    lc1, lc2, lc3 = st.columns([1,1,2])
     with lc1:
-        st.markdown(f"""
-        <div class="metric-card">
+        fat_cancel = canceladas["Receita Bruta"].sum()
+        st.markdown(f"""<div class="metric-card">
             <div class="metric-label">Canceladas</div>
-            <div class="metric-value" style="color:#EF4444;">R$ {canceladas['Receita Bruta'].sum():,.2f}</div>
-            <div style="color:#64748B;font-size:13px;margin-top:4px;">{len(canceladas)} pedidos</div>
-        </div>
-        """, unsafe_allow_html=True)
+            <div class="metric-value" style="color:#EF4444;">R$ {fat_cancel:,.2f}</div>
+            <div style="color:#94A3B8;font-size:13px;margin-top:4px;">{len(canceladas)} pedidos</div>
+        </div>""", unsafe_allow_html=True)
     with lc2:
         ticket = faturamento / len(aprovadas) if len(aprovadas) > 0 else 0
-        st.markdown(f"""
-        <div class="metric-card">
+        lucro_venda = lucro_total / len(aprovadas) if len(aprovadas) > 0 else 0
+        st.markdown(f"""<div class="metric-card">
             <div class="metric-label">Ticket Médio</div>
             <div class="metric-value">R$ {ticket:.2f}</div>
-            <div style="color:#64748B;font-size:13px;margin-top:4px;">{len(aprovadas)} pedidos</div>
-        </div>
-        """, unsafe_allow_html=True)
+            <div style="color:#94A3B8;font-size:13px;margin-top:4px;">{len(aprovadas)} pedidos • lucro/venda R$ {lucro_venda:.2f}</div>
+        </div>""", unsafe_allow_html=True)
     with lc3:
-        cor_lucro = "#16A34A" if lucro_total >= 0 else "#DC2626"
-        st.markdown(f"""
-        <div style="background:linear-gradient(135deg,{cor_lucro},{cor_lucro}CC);border-radius:20px;
+        cor = "#16A34A" if lucro_total >= 0 else "#DC2626"
+        st.markdown(f"""<div style="background:linear-gradient(135deg,{cor},{cor}CC);border-radius:20px;
                     padding:24px 32px;color:white;text-align:center;">
             <div style="font-size:16px;font-weight:800;margin-bottom:8px;">Lucro Líquido Real</div>
             <div style="font-size:48px;font-weight:900;letter-spacing:-2px;">R$ {lucro_total:,.2f}</div>
             <div style="font-size:14px;font-weight:700;opacity:.9;margin-top:4px;">Margem real: {margem_real:.2f}%</div>
-        </div>
-        """, unsafe_allow_html=True)
+        </div>""", unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Gráfico lucro por dia (linha + área + média)
+    # GRÁFICO LUCRO POR DIA
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("**Lucro por dia**")
+    st.markdown("**📈 Lucro por dia**")
     daily = aprovadas.copy()
     daily["Dia"] = pd.to_datetime(daily["Data"]).dt.date
-    daily_agg = daily.groupby("Dia").agg(
-        Lucro=("Lucro","sum"),
-        Receita=("Receita Bruta","sum"),
-        Quantidade=("Quantidade","sum")
-    ).reset_index()
+    daily_agg = daily.groupby("Dia").agg(Lucro=("Lucro","sum"), Receita=("Receita Bruta","sum"), Quantidade=("Quantidade","sum")).reset_index()
     daily_agg["Dia"] = pd.to_datetime(daily_agg["Dia"])
     media_lucro = daily_agg["Lucro"].mean()
     daily_agg["Cor"] = daily_agg["Lucro"].apply(lambda x: "Acima" if x >= media_lucro else "Abaixo")
 
-    base = alt.Chart(daily_agg)
-    area = base.mark_area(interpolate="monotone", color="#7C3AED", opacity=0.12).encode(
-        x=alt.X("Dia:T", title=None),
-        y=alt.Y("Lucro:Q", title="Lucro (R$)")
-    )
-    linha = base.mark_line(interpolate="monotone", color="#7C3AED", strokeWidth=2.5).encode(
-        x="Dia:T", y="Lucro:Q"
-    )
-    pontos = base.mark_point(filled=True, size=80).encode(
-        x="Dia:T",
-        y="Lucro:Q",
-        color=alt.Color("Cor:N", scale=alt.Scale(domain=["Acima","Abaixo"], range=["#16A34A","#DC2626"]),
-                        legend=None),
-        tooltip=[
-            alt.Tooltip("Dia:T", title="Data", format="%d/%m/%Y"),
-            alt.Tooltip("Lucro:Q", title="Lucro R$", format=",.2f"),
-            alt.Tooltip("Receita:Q", title="Receita R$", format=",.2f"),
-            alt.Tooltip("Quantidade:Q", title="Qtd", format=",.0f"),
-        ]
-    )
-    media_line = alt.Chart(pd.DataFrame({"media": [media_lucro]})).mark_rule(
-        strokeDash=[6,3], color="#94A3B8", strokeWidth=1.5
-    ).encode(y="media:Q")
-
-    st.altair_chart((area + linha + pontos + media_line).properties(height=300), use_container_width=True)
+    if len(daily_agg) > 1:
+        base    = alt.Chart(daily_agg)
+        area    = base.mark_area(interpolate="monotone", color="#7C3AED", opacity=0.12).encode(x=alt.X("Dia:T",title=None), y=alt.Y("Lucro:Q",title="Lucro (R$)"))
+        linha   = base.mark_line(interpolate="monotone", color="#7C3AED", strokeWidth=2.5).encode(x="Dia:T", y="Lucro:Q")
+        pontos  = base.mark_point(filled=True, size=80).encode(x="Dia:T", y="Lucro:Q",
+                    color=alt.Color("Cor:N", scale=alt.Scale(domain=["Acima","Abaixo"], range=["#16A34A","#DC2626"]), legend=None),
+                    tooltip=[alt.Tooltip("Dia:T",title="Data",format="%d/%m/%Y"),
+                             alt.Tooltip("Lucro:Q",title="Lucro R$",format=",.2f"),
+                             alt.Tooltip("Receita:Q",title="Receita R$",format=",.2f"),
+                             alt.Tooltip("Quantidade:Q",title="Qtd",format=",.0f")])
+        media_l = alt.Chart(pd.DataFrame({"m":[media_lucro]})).mark_rule(strokeDash=[6,3],color="#94A3B8",strokeWidth=1.5).encode(y="m:Q")
+        st.altair_chart((area+linha+pontos+media_l).properties(height=280), use_container_width=True)
+    else:
+        st.info("Gráfico disponível com 2+ dias de dados.")
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Gráfico receita por dia
+    # GRÁFICO QUANTIDADE POR DIA POR SKU
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("**Receita por dia**")
-    receita_line = alt.Chart(daily_agg).mark_area(
-        interpolate="monotone", color="#0EA5E9", opacity=0.13
-    ).encode(
-        x=alt.X("Dia:T", title=None),
-        y=alt.Y("Receita:Q", title="Receita (R$)")
-    ) + alt.Chart(daily_agg).mark_line(
-        interpolate="monotone", color="#0EA5E9", strokeWidth=2.5,
-        point=alt.OverlayMarkDef(filled=True, size=60, color="#0EA5E9")
-    ).encode(
-        x=alt.X("Dia:T", title=None),
-        y=alt.Y("Receita:Q"),
-        tooltip=[
-            alt.Tooltip("Dia:T", title="Data", format="%d/%m/%Y"),
-            alt.Tooltip("Receita:Q", title="Receita R$", format=",.2f"),
-            alt.Tooltip("Quantidade:Q", title="Qtd", format=",.0f"),
-        ]
-    )
-    st.altair_chart(receita_line.properties(height=240), use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown("**📦 Quantidade vendida por dia (por SKU)**")
+    qty_daily = aprovadas.copy()
+    qty_daily["Dia"] = pd.to_datetime(qty_daily["Data"]).dt.date
+    qty_agg = qty_daily.groupby(["Dia","SKU"]).agg(Quantidade=("Quantidade","sum")).reset_index()
+    qty_agg["Dia"] = pd.to_datetime(qty_agg["Dia"])
 
-    # Tabela detalhada
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("**Pedidos detalhados**")
-
-    # Tabela estilizada com badges coloridos (igual ao dashboard local)
-    fat_total = aprovadas["Receita Bruta"].sum() if faturamento > 0 else 1
-
-    def badge(valor, total, cor_bg, cor_txt, prefixo="R$ ", sufixo=""):
-        pct = abs(valor / total * 100) if total else 0
-        return (
-            f'<span style="font-weight:700;">{prefixo}{valor:,.2f}{sufixo}</span> '
-            f'<span style="background:{cor_bg};color:{cor_txt};border-radius:999px;'
-            f'padding:2px 7px;font-size:11px;font-weight:800;">{pct:.0f}%</span>'
+    if len(qty_agg) > 1:
+        cores_sku = ["#7C3AED","#0EA5E9","#F59E0B","#16A34A","#EF4444"]
+        skus = qty_agg["SKU"].unique().tolist()
+        cor_map = {s: cores_sku[i % len(cores_sku)] for i, s in enumerate(skus)}
+        chart_qty = alt.Chart(qty_agg).mark_line(point=True, strokeWidth=2.5).encode(
+            x=alt.X("Dia:T", title=None),
+            y=alt.Y("Quantidade:Q", title="Unidades"),
+            color=alt.Color("SKU:N", scale=alt.Scale(domain=skus, range=[cor_map[s] for s in skus])),
+            tooltip=[alt.Tooltip("Dia:T",title="Data",format="%d/%m/%Y"),
+                     alt.Tooltip("SKU:N"), alt.Tooltip("Quantidade:Q",title="Qtd")]
         )
+        # Média por SKU como linha tracejada
+        media_sku = qty_agg.groupby("SKU")["Quantidade"].mean().reset_index().rename(columns={"Quantidade":"Media"})
+        media_rules = alt.Chart(media_sku).mark_rule(strokeDash=[4,3], strokeWidth=1.5, opacity=0.6).encode(
+            y="Media:Q", color=alt.Color("SKU:N", scale=alt.Scale(domain=skus, range=[cor_map[s] for s in skus]), legend=None)
+        )
+        st.altair_chart((chart_qty + media_rules).properties(height=240), use_container_width=True)
+    else:
+        st.info("Gráfico disponível com 2+ dias de dados.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # TABELA DE PEDIDOS DETALHADOS
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("**🧾 Ver vendas detalhadas**")
+
+    fat_total = aprovadas["Receita Bruta"].sum() or 1
+
+    def badge(valor, total, bg, txt):
+        pct = abs(valor/total*100) if total else 0
+        return (f'<span style="font-weight:700;">R$ {valor:,.2f}</span> '
+                f'<span style="background:{bg};color:{txt};border-radius:999px;'
+                f'padding:2px 7px;font-size:11px;font-weight:800;">{pct:.0f}%</span>')
 
     def margem_badge(pct):
-        cor = "#DCFCE7" if pct >= 15 else "#FEF9C3" if pct >= 8 else "#FEE2E2"
-        txt = "#15803D" if pct >= 15 else "#854D0E" if pct >= 8 else "#DC2626"
-        return f'<span style="background:{cor};color:{txt};border-radius:999px;padding:2px 9px;font-size:12px;font-weight:800;">{pct:.1f}%</span>'
+        bg  = "#DCFCE7" if pct>=15 else "#FEF9C3" if pct>=8 else "#FEE2E2"
+        txt = "#15803D" if pct>=15 else "#854D0E" if pct>=8 else "#DC2626"
+        return f'<span style="background:{bg};color:{txt};border-radius:999px;padding:2px 9px;font-size:12px;font-weight:800;">{pct:.1f}%</span>'
 
-    def status_icon(status):
-        if status == "paid":      return "🚚"
-        if status == "cancelled": return "❌"
-        return "⏳"
+    def status_icon(s):
+        return {"paid":"🚚","cancelled":"❌"}.get(s,"⏳")
 
-    linhas_html = ""
+    corr_map = {r: v for r, v in load_correcoes(str(user_id)).items()}
+
+    linhas = ""
     for _, row in df.iterrows():
         cancelada = row["Cancelada"]
-        bg = "#FFF5F5" if cancelada else "white"
-        receita = row["Receita Bruta"]
-        linhas_html += f"""
-        <tr style="background:{bg};border-bottom:1px solid #F1F5F9;">
+        bg_row    = "#FFF5F5" if cancelada else "white"
+        rec       = row["Receita Bruta"]
+        corrigido = row.get("Corrigido", False)
+        fifo_flag = row.get("FIFO", False)
+
+        tag_custo = ""
+        if corrigido:
+            tag_custo = '<span style="background:#FEF3C7;color:#92400E;border-radius:4px;padding:1px 5px;font-size:10px;font-weight:700;">CORRIGIDO</span> '
+        elif fifo_flag:
+            tag_custo = '<span style="background:#EDE9FE;color:#5B21B6;border-radius:4px;padding:1px 5px;font-size:10px;font-weight:700;">FIFO</span> '
+
+        linhas += f"""<tr style="background:{bg_row};border-bottom:1px solid #F1F5F9;">
             <td style="padding:10px 8px;font-weight:800;color:#7C3AED;white-space:nowrap;">{row['SKU']}</td>
             <td style="padding:10px 8px;color:#64748B;font-size:13px;white-space:nowrap;">{pd.to_datetime(row['Data']).strftime('%d/%m/%Y %H:%M')}</td>
             <td style="padding:10px 8px;font-size:18px;text-align:center;">{status_icon(row['Status'])}</td>
             <td style="padding:10px 8px;text-align:center;font-weight:700;">{int(row['Quantidade'])}</td>
-            <td style="padding:10px 8px;font-weight:700;color:#0F172A;">{badge(receita, fat_total, '#DCFCE7', '#15803D')}</td>
-            <td style="padding:10px 8px;">{badge(row['Frete'], receita, '#DBEAFE', '#1D4ED8') if not cancelada else '-'}</td>
-            <td style="padding:10px 8px;">{badge(row['Taxas ML'], receita, '#FEF3C7', '#B45309') if not cancelada else '-'}</td>
-            <td style="padding:10px 8px;">{badge(row.get('Custo Total',0), receita, '#EDE9FE', '#6D28D9') if not cancelada else '-'}</td>
-            <td style="padding:10px 8px;">{badge(row.get('Imposto',0), receita, '#F1F5F9', '#475569') if not cancelada else '-'}</td>
-            <td style="padding:10px 8px;text-align:center;">{margem_badge(row.get('Margem %',0)) if not cancelada else '<span style="color:#DC2626;font-weight:700;">Cancelada</span>'}</td>
+            <td style="padding:10px 8px;font-weight:700;">{badge(rec, fat_total,'#DCFCE7','#15803D')}</td>
+            <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Frete'], rec,'#DBEAFE','#1D4ED8')}</td>
+            <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Taxas ML'], rec,'#FEF3C7','#B45309')}</td>
+            <td style="padding:10px 8px;">{'–' if cancelada else f'{tag_custo}{badge(row["Custo Total"], rec, "#EDE9FE","#6D28D9")}'}</td>
+            <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Imposto'], rec,'#F1F5F9','#475569')}</td>
+            <td style="padding:10px 8px;text-align:center;">{'<span style="color:#DC2626;font-weight:700;">Cancelada</span>' if cancelada else margem_badge(row.get('Margem %',0))}</td>
             <td style="padding:10px 8px;color:#94A3B8;font-size:12px;white-space:nowrap;">{row['Venda']}</td>
         </tr>"""
 
-    st.markdown(f"""
-    <div style="overflow-x:auto;">
+    st.markdown(f"""<div style="overflow-x:auto;">
     <table style="width:100%;border-collapse:collapse;font-family:'Inter',sans-serif;font-size:13px;">
-        <thead>
-            <tr style="background:#F8FAFC;border-bottom:2px solid #E2E8F0;">
-                <th style="padding:10px 8px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;">SKU</th>
-                <th style="padding:10px 8px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Data</th>
-                <th style="padding:10px 8px;text-align:center;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Transp.</th>
-                <th style="padding:10px 8px;text-align:center;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Qnt.</th>
-                <th style="padding:10px 8px;text-align:left;color:#16A34A;font-size:11px;font-weight:800;text-transform:uppercase;">Receita (=)</th>
-                <th style="padding:10px 8px;text-align:left;color:#1D4ED8;font-size:11px;font-weight:800;text-transform:uppercase;">Frete (-)</th>
-                <th style="padding:10px 8px;text-align:left;color:#B45309;font-size:11px;font-weight:800;text-transform:uppercase;">Tarifa (-)</th>
-                <th style="padding:10px 8px;text-align:left;color:#6D28D9;font-size:11px;font-weight:800;text-transform:uppercase;">Custo (-)</th>
-                <th style="padding:10px 8px;text-align:left;color:#475569;font-size:11px;font-weight:800;text-transform:uppercase;">Imposto (-)</th>
-                <th style="padding:10px 8px;text-align:center;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">M. de Contrib. (=)</th>
-                <th style="padding:10px 8px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">N.º Venda</th>
-            </tr>
-        </thead>
-        <tbody>{linhas_html}</tbody>
-    </table>
-    </div>
-    """, unsafe_allow_html=True)
+        <thead><tr style="background:#F8FAFC;border-bottom:2px solid #E2E8F0;">
+            <th style="padding:10px 8px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">SKU</th>
+            <th style="padding:10px 8px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Data</th>
+            <th style="padding:10px 8px;text-align:center;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Transp.</th>
+            <th style="padding:10px 8px;text-align:center;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Qnt.</th>
+            <th style="padding:10px 8px;text-align:left;color:#16A34A;font-size:11px;font-weight:800;text-transform:uppercase;">Receita (=)</th>
+            <th style="padding:10px 8px;text-align:left;color:#1D4ED8;font-size:11px;font-weight:800;text-transform:uppercase;">Frete (-)</th>
+            <th style="padding:10px 8px;text-align:left;color:#B45309;font-size:11px;font-weight:800;text-transform:uppercase;">Tarifa (-)</th>
+            <th style="padding:10px 8px;text-align:left;color:#6D28D9;font-size:11px;font-weight:800;text-transform:uppercase;">Custo (-)</th>
+            <th style="padding:10px 8px;text-align:left;color:#475569;font-size:11px;font-weight:800;text-transform:uppercase;">Imposto (-)</th>
+            <th style="padding:10px 8px;text-align:center;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">M. de Contrib. (=)</th>
+            <th style="padding:10px 8px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">N.º Venda</th>
+        </tr></thead>
+        <tbody>{linhas}</tbody>
+    </table></div>""", unsafe_allow_html=True)
+
+    # CORREÇÕES MANUAIS
+    st.markdown("<br>", unsafe_allow_html=True)
+    with st.expander("✏️ Corrigir custo de vendas manualmente"):
+        vendas_opts = {f"{row['Venda']} — {row['SKU']} {pd.to_datetime(row['Data']).strftime('%d/%m %H:%M')} R${row['Receita Bruta']:.2f}": str(row['Venda'])
+                       for _, row in df[~df["Cancelada"]].iterrows()}
+        venda_sel = st.selectbox("Selecione a venda", list(vendas_opts.keys()), key="corr_venda")
+        venda_id_sel = vendas_opts[venda_sel]
+        row_sel    = df[df["Venda"] == venda_id_sel].iloc[0]
+        custo_atual = corr_map.get(venda_id_sel, {}).get("custo_unitario", row_sel["Custo Unitário"])
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            novo_custo = st.number_input("Custo unitário correto (R$)", value=float(custo_atual), step=0.01, format="%.4f", key="corr_custo")
+        with cc2:
+            motivo = st.text_input("Motivo (opcional)", key="corr_motivo")
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            if st.button("💾 Salvar correção", type="primary", use_container_width=True):
+                save_correcao(str(user_id), venda_id_sel, novo_custo, motivo)
+                st.success(f"Custo da venda {venda_id_sel} corrigido para R$ {novo_custo:.4f}")
+                st.cache_data.clear()
+                st.rerun()
+        with bc2:
+            if venda_id_sel in corr_map:
+                if st.button("🗑️ Remover correção", use_container_width=True):
+                    delete_correcao(str(user_id), venda_id_sel)
+                    st.success("Correção removida.")
+                    st.cache_data.clear()
+                    st.rerun()
+
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ===================================================
+# ══════════════════════════════════════════
 # ABA: CADASTRO DE CUSTOS
-# ===================================================
+# ══════════════════════════════════════════
 elif st.session_state["aba_ativa"] == "custos":
-
-    st.markdown(f"""
-    <div class="hero">
+    st.markdown("""<div class="hero">
         <h1 class="hero-title">Cadastro de Custos</h1>
-        <div style="opacity:.85;font-size:15px;margin-top:8px;">
-            Gerencie custos por SKU e vigência — FIFO ativo a partir de 20/05/2026
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+        <div style="opacity:.85;font-size:15px;margin-top:8px;">Custos por SKU e vigência — FIFO ativo a partir de 20/05/2026</div>
+    </div>""", unsafe_allow_html=True)
 
     custos_df = load_custos(str(user_id))
 
-    # Formulário para novo custo
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("**➕ Novo lote / vigência**")
-
     with st.form("form_custo", clear_on_submit=True):
         fc1, fc2, fc3 = st.columns(3)
         with fc1:
-            sku_novo    = st.text_input("SKU", placeholder="ex: S_001")
+            sku_novo     = st.text_input("SKU", placeholder="ex: S_001")
             produto_novo = st.text_input("Produto", placeholder="ex: Seladora Térmica")
         with fc2:
-            vigencia_nova = st.date_input("Vigência (início)", value=None, help="Deixe em branco para custo sem data")
-            custo_produto = st.number_input("Custo unitário (R$)", min_value=0.0, step=0.01, format="%.2f")
+            vigencia_nova = st.date_input("Vigência (início)", value=None)
+            custo_produto = st.number_input("Custo unitário (R$)", min_value=0.0, step=0.01, format="%.4f")
         with fc3:
-            qtd_comprada  = st.number_input("Qtd comprada", min_value=0, step=1)
-            frete_forn    = st.number_input("Frete fornecedor (R$)", min_value=0.0, step=0.01, format="%.2f")
-
+            qtd_comprada = st.number_input("Qtd comprada", min_value=0, step=1)
+            frete_forn   = st.number_input("Frete fornecedor (R$)", min_value=0.0, step=0.01, format="%.2f")
         fc4, fc5, fc6 = st.columns(3)
         with fc4:
-            embalagem = st.number_input("Embalagem (R$)", min_value=0.0, step=0.01, format="%.2f")
+            embalagem   = st.number_input("Embalagem (R$)", min_value=0.0, step=0.01, format="%.2f")
         with fc5:
-            outros    = st.number_input("Outros custos (R$)", min_value=0.0, step=0.01, format="%.2f")
+            outros      = st.number_input("Outros custos (R$)", min_value=0.0, step=0.01, format="%.2f")
         with fc6:
             margem_alvo = st.number_input("Margem alvo (%)", min_value=0.0, step=0.1, format="%.1f")
-
         obs = st.text_input("Observação", placeholder="opcional")
-
-        submitted = st.form_submit_button("💾 Salvar lote", type="primary", use_container_width=True)
-        if submitted:
+        if st.form_submit_button("💾 Salvar lote", type="primary", use_container_width=True):
             if not sku_novo:
                 st.error("SKU é obrigatório.")
             else:
-                # Custo por unidade incluindo frete rateado
                 qtd = int(qtd_comprada) if qtd_comprada > 0 else 1
-                custo_total_unit = custo_produto + (frete_forn / qtd) + (embalagem / qtd) + (outros / qtd)
-                row = {
-                    "sku": sku_novo.strip().upper(),
-                    "produto": produto_novo,
+                save_custo(str(user_id), {
+                    "sku": sku_novo.strip().upper(), "produto": produto_novo,
                     "vigencia": vigencia_nova.strftime("%Y-%m-%d") if vigencia_nova else None,
-                    "qtd_comprada": int(qtd_comprada),
-                    "qtd_disponivel": int(qtd_comprada),  # começa igual à comprada
+                    "qtd_comprada": int(qtd_comprada), "qtd_disponivel": int(qtd_comprada),
                     "custo_produto": round(custo_produto, 4),
                     "frete_fornecedor": round(frete_forn, 4),
                     "embalagem": round(embalagem, 4),
                     "outros_custos": round(outros, 4),
                     "margem_alvo": round(margem_alvo, 2),
                     "observacao": obs,
-                }
-                save_custo(str(user_id), row)
-                st.success(f"Lote {sku_novo} salvo! Custo unitário total: R$ {custo_total_unit:.4f}")
+                })
+                st.success(f"Lote {sku_novo} salvo!")
                 st.rerun()
-
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Tabela de custos cadastrados
     if not custos_df.empty:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("**📋 Lotes cadastrados**")
+        exibir = custos_df[["id","sku","produto","vigencia","qtd_comprada","qtd_disponivel",
+                             "custo_produto","frete_fornecedor","embalagem","outros_custos","margem_alvo","observacao"]].copy()
+        exibir["vigencia"]       = exibir["vigencia"].apply(lambda x: x.strftime("%d/%m/%Y") if pd.notna(x) else "Sem data")
+        exibir["qtd_disponivel"] = exibir["qtd_disponivel"].apply(lambda x: "ESGOTADO" if float(x)<0 else str(int(float(x))))
+        for c in ["custo_produto","frete_fornecedor","embalagem","outros_custos"]:
+            exibir[c] = exibir[c].apply(lambda x: f"R$ {float(x):.4f}")
+        exibir["margem_alvo"] = exibir["margem_alvo"].apply(lambda x: f"{float(x):.1f}%")
+        st.dataframe(exibir.rename(columns={"id":"ID","sku":"SKU","produto":"Produto","vigencia":"Vigência",
+            "qtd_comprada":"Qtd Comprada","qtd_disponivel":"Qtd Disponível","custo_produto":"Custo Unit.",
+            "frete_fornecedor":"Frete Forn.","embalagem":"Embalagem","outros_custos":"Outros",
+            "margem_alvo":"Margem Alvo","observacao":"Obs."}), use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-        exibir = custos_df[[
-            "id","sku","produto","vigencia","qtd_comprada","qtd_disponivel",
-            "custo_produto","frete_fornecedor","embalagem","outros_custos","margem_alvo","observacao"
-        ]].copy()
-        exibir["vigencia"] = exibir["vigencia"].apply(
-            lambda x: x.strftime("%d/%m/%Y") if pd.notna(x) else "Sem data"
-        )
-        exibir["qtd_disponivel"] = exibir["qtd_disponivel"].apply(
-            lambda x: "ESGOTADO" if x < 0 else str(int(x))
-        )
-        for col_r in ["custo_produto","frete_fornecedor","embalagem","outros_custos"]:
-            exibir[col_r] = exibir[col_r].apply(lambda x: f"R$ {x:.4f}")
-        exibir["margem_alvo"] = exibir["margem_alvo"].apply(lambda x: f"{x:.1f}%")
+# ══════════════════════════════════════════
+# ABA: REGIME TRIBUTÁRIO
+# ══════════════════════════════════════════
+elif st.session_state["aba_ativa"] == "regime":
+    st.markdown("""<div class="hero">
+        <h1 class="hero-title">Regime Tributário</h1>
+        <div style="opacity:.85;font-size:15px;margin-top:8px;">Alíquotas por período — aplicadas automaticamente por data de venda</div>
+    </div>""", unsafe_allow_html=True)
 
-        st.dataframe(exibir.rename(columns={
-            "id": "ID",
-            "sku": "SKU",
-            "produto": "Produto",
-            "vigencia": "Vigência",
-            "qtd_comprada": "Qtd Comprada",
-            "qtd_disponivel": "Qtd Disponível",
-            "custo_produto": "Custo Unit.",
-            "frete_fornecedor": "Frete Forn.",
-            "embalagem": "Embalagem",
-            "outros_custos": "Outros",
-            "margem_alvo": "Margem Alvo",
-            "observacao": "Obs.",
-        }), use_container_width=True, hide_index=True)
+    regime_df = load_regime(str(user_id))
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("**➕ Novo regime / alíquota**")
+    with st.form("form_regime", clear_on_submit=True):
+        rc1, rc2, rc3 = st.columns(3)
+        with rc1:
+            vig_reg  = st.date_input("Vigência (a partir de)", value=date.today())
+        with rc2:
+            regime   = st.selectbox("Regime", ["Simples Nacional","Lucro Presumido","Lucro Real","MEI","Isento"])
+        with rc3:
+            aliquota = st.number_input("Alíquota (%)", min_value=0.0, max_value=100.0, step=0.01, format="%.2f")
+        if st.form_submit_button("💾 Salvar", type="primary", use_container_width=True):
+            save_regime(str(user_id), {
+                "vigencia": vig_reg.strftime("%Y-%m-%d"),
+                "regime": regime,
+                "aliquota": aliquota,
+            })
+            st.success(f"{regime} {aliquota:.2f}% a partir de {vig_reg.strftime('%d/%m/%Y')}")
+            st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if not regime_df.empty:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("**📋 Regimes cadastrados**")
+        exibir = regime_df[["id","vigencia","regime","aliquota"]].copy()
+        exibir["vigencia"]  = exibir["vigencia"].apply(lambda x: x.strftime("%d/%m/%Y") if pd.notna(x) else "–")
+        exibir["aliquota"]  = exibir["aliquota"].apply(lambda x: f"{float(x):.2f}%")
+        st.dataframe(exibir.rename(columns={"id":"ID","vigencia":"Vigência","regime":"Regime","aliquota":"Alíquota"}),
+                     use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+# ══════════════════════════════════════════
+# ABA: CAIXA / CAPITAL
+# ══════════════════════════════════════════
+elif st.session_state["aba_ativa"] == "caixa":
+    st.markdown("""<div class="hero">
+        <h1 class="hero-title">Caixa & Capital</h1>
+        <div style="opacity:.85;font-size:15px;margin-top:8px;">Controle de capital investido e retorno sobre investimento</div>
+    </div>""", unsafe_allow_html=True)
+
+    capital_df = load_capital(str(user_id))
+
+    # Cards de resumo
+    if not capital_df.empty:
+        total_investido = capital_df[capital_df["valor"] > 0]["valor"].sum()
+        total_retirado  = capital_df[capital_df["valor"] < 0]["valor"].abs().sum()
+        saldo_capital   = capital_df["valor"].sum()
+
+        ck1, ck2, ck3 = st.columns(3)
+        ck1.markdown(f"""<div class="metric-card">
+            <div class="metric-label" style="color:#7C3AED;">Capital Investido</div>
+            <div class="metric-value">R$ {total_investido:,.2f}</div>
+        </div>""", unsafe_allow_html=True)
+        ck2.markdown(f"""<div class="metric-card">
+            <div class="metric-label" style="color:#EF4444;">Retiradas</div>
+            <div class="metric-value">R$ {total_retirado:,.2f}</div>
+        </div>""", unsafe_allow_html=True)
+        ck3.markdown(f"""<div class="metric-card">
+            <div class="metric-label" style="color:#16A34A;">Saldo em Caixa</div>
+            <div class="metric-value">R$ {saldo_capital:,.2f}</div>
+        </div>""", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+
+    # Formulário novo lançamento
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("**➕ Novo lançamento**")
+    with st.form("form_capital", clear_on_submit=True):
+        cap1, cap2, cap3 = st.columns(3)
+        with cap1:
+            cap_data  = st.date_input("Data", value=date.today())
+            cap_valor = st.number_input("Valor (R$) — negativo para retirada", step=0.01, format="%.2f")
+        with cap2:
+            cap_desc  = st.text_input("Descrição", placeholder="ex: Compra lote S_001")
+            cap_cat   = st.selectbox("Categoria", ["Compra de estoque","Taxa/Tarifa","Retirada","Aporte","Outro"])
+        with cap3:
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
+        if st.form_submit_button("💾 Registrar", type="primary", use_container_width=True):
+            if cap_valor == 0:
+                st.error("Valor não pode ser zero.")
+            else:
+                save_capital(str(user_id), {
+                    "data": cap_data.strftime("%Y-%m-%d"),
+                    "valor": cap_valor,
+                    "descricao": cap_desc,
+                    "categoria": cap_cat,
+                })
+                st.success(f"Lançamento de R$ {cap_valor:.2f} registrado.")
+                st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # Histórico
+    if not capital_df.empty:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("**📋 Histórico de lançamentos**")
+        exibir = capital_df[["id","data","descricao","categoria","valor"]].copy()
+        exibir["data"]  = exibir["data"].apply(lambda x: x.strftime("%d/%m/%Y") if pd.notna(x) else "–")
+        exibir["valor"] = exibir["valor"].apply(lambda x: f"R$ {x:,.2f}")
+        st.dataframe(exibir.rename(columns={"id":"ID","data":"Data","descricao":"Descrição",
+                                             "categoria":"Categoria","valor":"Valor"}),
+                     use_container_width=True, hide_index=True)
         st.markdown('</div>', unsafe_allow_html=True)
     else:
-        st.info("Nenhum custo cadastrado ainda.")
+        st.info("Nenhum lançamento registrado ainda.")
