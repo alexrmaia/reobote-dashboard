@@ -1115,72 +1115,310 @@ elif st.session_state["aba_ativa"] == "regime":
 # ABA: CAIXA / CAPITAL
 # ══════════════════════════════════════════
 elif st.session_state["aba_ativa"] == "caixa":
+
+    CATEGORIAS_INTER = [
+        "Transferência do ML", "Fornecedor", "Frete / Logística",
+        "Mercado Ads", "Embalagem", "Operacional",
+        "Impostos / Taxas", "Pró-labore / Retirada", "Outros",
+    ]
+
+    # ── Supabase helpers para extrato Inter ──
+    def load_extrato(uid):
+        sb = get_supabase()
+        resp = sb.table("extrato_inter").select("*").eq("user_id", uid).order("data", desc=True).execute()
+        if not resp.data:
+            return pd.DataFrame(columns=["id","data","valor","memo","categoria","conciliado","observacao"])
+        df = pd.DataFrame(resp.data)
+        df["data"]       = pd.to_datetime(df["data"], errors="coerce")
+        df["valor"]      = pd.to_numeric(df["valor"], errors="coerce").fillna(0)
+        df["conciliado"] = df["conciliado"].astype(bool)
+        return df
+
+    def save_lancamento(uid, row):
+        sb = get_supabase()
+        sb.table("extrato_inter").upsert({"user_id": uid, **row}, on_conflict="user_id,id").execute()
+
+    def update_lancamento(uid, lancamento_id, categoria, observacao, conciliado):
+        sb = get_supabase()
+        sb.table("extrato_inter").update({
+            "categoria": categoria,
+            "observacao": observacao,
+            "conciliado": conciliado,
+        }).eq("user_id", uid).eq("id", lancamento_id).execute()
+
+    def load_agendamentos_inter(uid):
+        sb = get_supabase()
+        resp = sb.table("agendamentos_inter").select("*").eq("user_id", uid).order("data").execute()
+        if not resp.data:
+            return pd.DataFrame(columns=["id","data","valor","descricao","categoria","recorrente","pago"])
+        df = pd.DataFrame(resp.data)
+        df["data"]       = pd.to_datetime(df["data"], errors="coerce")
+        df["valor"]      = pd.to_numeric(df["valor"], errors="coerce").fillna(0)
+        df["pago"]       = df["pago"].astype(bool)
+        df["recorrente"] = df["recorrente"].astype(bool)
+        return df
+
+    def save_agendamento(uid, row):
+        sb = get_supabase()
+        sb.table("agendamentos_inter").insert({"user_id": uid, **row}).execute()
+
+    def parse_ofx(content_bytes):
+        """Extrai lançamentos de um arquivo OFX/QFX."""
+        import re
+        text = content_bytes.decode("utf-8", errors="ignore")
+        rows = []
+        txs  = re.findall(r"<STMTTRN>(.*?)</STMTTRN>", text, re.S)
+        for tx in txs:
+            def get(tag):
+                pattern = r"<" + tag + r">([^<\n\r]+)"
+                m = re.search(pattern, tx)
+                return m.group(1).strip() if m else ""
+            dt_raw = get("DTPOSTED")
+            try:
+                dt = pd.to_datetime(dt_raw[:8], format="%Y%m%d")
+            except:
+                dt = None
+            valor = 0.0
+            try:
+                valor = float(get("TRNAMT").replace(",","."))
+            except:
+                pass
+            fitid = get("FITID") or get("REFNUM") or dt_raw
+            memo  = get("MEMO") or get("NAME") or ""
+            rows.append({"id": fitid, "data": dt, "valor": valor, "memo": memo,
+                         "categoria": "", "conciliado": False, "observacao": ""})
+        return pd.DataFrame(rows)
+
+    # ── Hero ──
     st.markdown("""<div class="hero">
-        <h1 class="hero-title">Caixa & Capital</h1>
-        <div style="opacity:.85;font-size:15px;margin-top:8px;">Controle de capital investido e retorno sobre investimento</div>
+        <h1 class="hero-title">Caixa Inter</h1>
+        <div style="opacity:.85;font-size:15px;margin-top:8px;">Banco Inter PJ — extrato, conciliação e agendamentos</div>
     </div>""", unsafe_allow_html=True)
 
-    capital_df = load_capital(str(user_id))
+    extrato_df    = load_extrato(str(user_id))
+    capital_df    = load_capital(str(user_id))
+    agend_df      = load_agendamentos_inter(str(user_id))
 
-    # Cards de resumo
-    if not capital_df.empty:
-        total_investido = capital_df[capital_df["valor"] > 0]["valor"].sum()
-        total_retirado  = capital_df[capital_df["valor"] < 0]["valor"].abs().sum()
-        saldo_capital   = capital_df["valor"].sum()
+    # ── Cards de resumo ──
+    entradas  = extrato_df[extrato_df["valor"] > 0]["valor"].sum()
+    saidas    = extrato_df[extrato_df["valor"] < 0]["valor"].abs().sum()
+    saldo     = extrato_df["valor"].sum()
+    pendentes = extrato_df[~extrato_df["conciliado"]]
+    a_pagar   = agend_df[~agend_df["pago"]]["valor"].abs().sum()
 
-        ck1, ck2, ck3 = st.columns(3)
-        ck1.markdown(f"""<div class="metric-card">
-            <div class="metric-label" style="color:#7C3AED;">Capital Investido</div>
-            <div class="metric-value">R$ {total_investido:,.2f}</div>
-        </div>""", unsafe_allow_html=True)
-        ck2.markdown(f"""<div class="metric-card">
-            <div class="metric-label" style="color:#EF4444;">Retiradas</div>
-            <div class="metric-value">R$ {total_retirado:,.2f}</div>
-        </div>""", unsafe_allow_html=True)
-        ck3.markdown(f"""<div class="metric-card">
-            <div class="metric-label" style="color:#16A34A;">Saldo em Caixa</div>
-            <div class="metric-value">R$ {saldo_capital:,.2f}</div>
-        </div>""", unsafe_allow_html=True)
-        st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class="hero" style="min-height:auto;padding:28px 38px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:24px;">
+            <div>
+                <div style="font-size:13px;font-weight:700;opacity:.85;">Banco Inter PJ</div>
+                <div style="font-size:28px;font-weight:900;">Caixa Inter</div>
+                <div style="margin-top:8px;">
+                    {"<span style=\'background:rgba(255,255,255,.2);border-radius:999px;padding:4px 12px;font-size:12px;font-weight:800;\'>✅ Tudo conciliado</span>" if len(pendentes)==0 else f"<span style=\'background:#F59E0B;color:#1F2937;border-radius:999px;padding:4px 12px;font-size:12px;font-weight:800;\'>⚠️ {len(pendentes)} pendentes</span>"}
+                </div>
+            </div>
+            <div style="display:flex;gap:32px;flex-wrap:wrap;">
+                <div style="text-align:center;">
+                    <div style="font-size:13px;font-weight:700;opacity:.85;">Entradas</div>
+                    <div style="font-size:28px;font-weight:900;">R$ {entradas:,.2f}</div>
+                </div>
+                <div style="text-align:center;">
+                    <div style="font-size:13px;font-weight:700;opacity:.85;">Saídas</div>
+                    <div style="font-size:28px;font-weight:900;">R$ {saidas:,.2f}</div>
+                </div>
+                <div style="text-align:center;">
+                    <div style="font-size:13px;font-weight:700;opacity:.85;">Saldo atual</div>
+                    <div style="font-size:28px;font-weight:900;">R$ {saldo:,.2f}</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    # Formulário novo lançamento
+    k1, k2, k3, k4 = st.columns(4)
+    k1.markdown(f"""<div class="kpi-card"><div class="kpi-title">Entradas</div><div class="kpi-value">R$ {entradas:,.2f}</div></div>""", unsafe_allow_html=True)
+    k2.markdown(f"""<div class="kpi-card"><div class="kpi-title">Saídas</div><div class="kpi-value" style="color:#EF4444;">R$ {saidas:,.2f}</div></div>""", unsafe_allow_html=True)
+    k3.markdown(f"""<div class="kpi-card"><div class="kpi-title">A Pagar</div><div class="kpi-value" style="color:#F59E0B;">R$ {a_pagar:,.2f}</div></div>""", unsafe_allow_html=True)
+    k4.markdown(f"""<div class="kpi-card"><div class="kpi-title">Saldo após pagamentos</div><div class="kpi-value" style="color:#7C3AED;">R$ {saldo - a_pagar:,.2f}</div></div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Upload OFX ──
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("**➕ Novo lançamento**")
-    with st.form("form_capital", clear_on_submit=True):
-        cap1, cap2, cap3 = st.columns(3)
-        with cap1:
-            cap_data  = st.date_input("Data", value=date.today())
-            cap_valor = st.number_input("Valor (R$) — negativo para retirada", step=0.01, format="%.2f")
-        with cap2:
-            cap_desc  = st.text_input("Descrição", placeholder="ex: Compra lote S_001")
-            cap_cat   = st.selectbox("Categoria", ["Compra de estoque","Taxa/Tarifa","Retirada","Aporte","Outro"])
-        with cap3:
-            st.markdown("<br>", unsafe_allow_html=True)
-            st.markdown("<br>", unsafe_allow_html=True)
-        if st.form_submit_button("💾 Registrar", type="primary", use_container_width=True):
-            if cap_valor == 0:
-                st.error("Valor não pode ser zero.")
-            else:
-                save_capital(str(user_id), {
-                    "data": cap_data.strftime("%Y-%m-%d"),
-                    "valor": cap_valor,
-                    "descricao": cap_desc,
-                    "categoria": cap_cat,
-                })
-                st.success(f"Lançamento de R$ {cap_valor:.2f} registrado.")
+    st.markdown("**📂 Importar Extrato Inter (OFX)**")
+    st.caption("Importe o extrato do Banco Inter PJ em formato OFX. Lançamentos novos são adicionados automaticamente sem duplicar.")
+    ofx_file = st.file_uploader("Selecione o arquivo OFX", type=["ofx","qfx"], key="ofx_upload")
+    if ofx_file:
+        novos_df = parse_ofx(ofx_file.read())
+        ids_existentes = set(extrato_df["id"].astype(str)) if not extrato_df.empty else set()
+        novos = novos_df[~novos_df["id"].astype(str).isin(ids_existentes)]
+        if novos.empty:
+            st.info("Nenhum lançamento novo encontrado — extrato já importado.")
+        else:
+            st.success(f"{len(novos)} novos lançamentos encontrados.")
+            if st.button(f"✅ Importar {len(novos)} lançamentos", type="primary"):
+                for _, row in novos.iterrows():
+                    save_lancamento(str(user_id), {
+                        "id":          str(row["id"]),
+                        "data":        row["data"].strftime("%Y-%m-%d") if pd.notna(row["data"]) else None,
+                        "valor":       float(row["valor"]),
+                        "memo":        str(row["memo"]),
+                        "categoria":   "",
+                        "conciliado":  False,
+                        "observacao":  "",
+                    })
+                st.success("Extrato importado!")
                 st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Histórico
+    # ── Conciliação do Extrato ──
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="small-title">Conciliação do Extrato</div>', unsafe_allow_html=True)
+    st.caption("Categorize cada lançamento. Entradas em verde, saídas em vermelho. Marque como conciliado após identificar.")
+
+    if extrato_df.empty:
+        st.info("Nenhum lançamento importado ainda. Faça upload do OFX acima.")
+    else:
+        # Filtros
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            filtro_status = st.radio("Filtrar por:", ["Todos", "Pendentes", "Conciliados"],
+                                     horizontal=True, key="filtro_conciliacao")
+        with fc2:
+            filtro_cat = st.selectbox("Categoria:", ["Todas"] + CATEGORIAS_INTER, key="filtro_cat")
+
+        df_show = extrato_df.copy()
+        if filtro_status == "Pendentes":
+            df_show = df_show[~df_show["conciliado"]]
+        elif filtro_status == "Conciliados":
+            df_show = df_show[df_show["conciliado"]]
+        if filtro_cat != "Todas":
+            df_show = df_show[df_show["categoria"] == filtro_cat]
+
+        st.markdown(f"**{len(df_show)} lançamentos**")
+
+        # Tabela de conciliação
+        for idx, row in df_show.iterrows():
+            cor_val = "#16A34A" if row["valor"] >= 0 else "#DC2626"
+            sinal   = "+" if row["valor"] >= 0 else ""
+            concil  = row["conciliado"]
+            bg      = "#F0FDF4" if concil else "white"
+
+            with st.container():
+                c1, c2, c3, c4, c5 = st.columns([1.2, 1, 3, 2, 1.5])
+                with c1:
+                    st.markdown(f"<div style='padding:8px 0;font-size:13px;color:#64748B;'>{pd.to_datetime(row['data']).strftime('%d/%m/%Y') if pd.notna(row['data']) else '–'}</div>", unsafe_allow_html=True)
+                with c2:
+                    st.markdown(f"<div style='padding:8px 0;font-weight:800;color:{cor_val};'>{sinal}R$ {abs(row['valor']):,.2f}</div>", unsafe_allow_html=True)
+                with c3:
+                    st.markdown(f"<div style='padding:8px 0;font-size:13px;color:#0F172A;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;'>{str(row['memo'])[:60]}</div>", unsafe_allow_html=True)
+                with c4:
+                    cat_sel = st.selectbox("", [""] + CATEGORIAS_INTER,
+                                           index=([""] + CATEGORIAS_INTER).index(row["categoria"]) if row["categoria"] in CATEGORIAS_INTER else 0,
+                                           key=f"cat_{row['id']}", label_visibility="collapsed")
+                with c5:
+                    concil_btn = st.checkbox("✅ Conciliado", value=bool(concil), key=f"conc_{row['id']}")
+
+                obs_key = f"obs_{row['id']}"
+                obs_val = st.text_input("", value=str(row["observacao"] or ""),
+                                        placeholder="Observação (opcional)",
+                                        key=obs_key, label_visibility="collapsed")
+
+                if cat_sel != row["categoria"] or concil_btn != concil or obs_val != str(row["observacao"] or ""):
+                    update_lancamento(str(user_id), str(row["id"]), cat_sel, obs_val, concil_btn)
+                    st.rerun()
+
+                st.markdown("<hr style='margin:4px 0;border:none;border-top:1px solid #F1F5F9;'>", unsafe_allow_html=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Agendamentos ──
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="small-title">Agendamentos</div>', unsafe_allow_html=True)
+
+    with st.expander("➕ Novo agendamento"):
+        with st.form("form_agend", clear_on_submit=True):
+            ag1, ag2, ag3 = st.columns(3)
+            with ag1:
+                ag_data  = st.date_input("Data vencimento", value=date.today())
+                ag_valor = st.number_input("Valor (R$)", step=0.01, format="%.2f")
+            with ag2:
+                ag_desc  = st.text_input("Descrição")
+                ag_cat   = st.selectbox("Categoria", CATEGORIAS_INTER)
+            with ag3:
+                ag_rec   = st.checkbox("Recorrente (mensal)")
+            if st.form_submit_button("💾 Agendar", type="primary", use_container_width=True):
+                if ag_valor == 0 or not ag_desc:
+                    st.error("Informe valor e descrição.")
+                else:
+                    save_agendamento(str(user_id), {
+                        "data": ag_data.strftime("%Y-%m-%d"),
+                        "valor": ag_valor,
+                        "descricao": ag_desc,
+                        "categoria": ag_cat,
+                        "recorrente": ag_rec,
+                        "pago": False,
+                    })
+                    st.success("Agendamento salvo!")
+                    st.rerun()
+
+    if not agend_df.empty:
+        for _, ag in agend_df[~agend_df["pago"]].iterrows():
+            venc = pd.to_datetime(ag["data"])
+            dias = (venc - pd.Timestamp.now()).days
+            cor  = "#EF4444" if dias < 0 else "#F59E0B" if dias <= 3 else "#64748B"
+            ac1, ac2, ac3, ac4 = st.columns([1.5, 3, 1.5, 1])
+            with ac1:
+                st.markdown(f"<div style='color:{cor};font-weight:800;font-size:13px;padding:6px 0;'>{venc.strftime('%d/%m/%Y')}</div>", unsafe_allow_html=True)
+            with ac2:
+                st.markdown(f"<div style='padding:6px 0;font-size:13px;'>{ag['descricao']} <span style='color:#94A3B8;'>{ag['categoria']}</span></div>", unsafe_allow_html=True)
+            with ac3:
+                st.markdown(f"<div style='color:#EF4444;font-weight:800;padding:6px 0;'>R$ {abs(ag['valor']):,.2f}</div>", unsafe_allow_html=True)
+            with ac4:
+                if st.button("✅ Pago", key=f"pago_{ag['id']}"):
+                    get_supabase().table("agendamentos_inter").update({"pago": True}).eq("id", str(ag["id"])).execute()
+                    st.rerun()
+    else:
+        st.info("Nenhum agendamento pendente.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Capital Investido ──
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="small-title">Capital Investido</div>', unsafe_allow_html=True)
+
+    with st.expander("➕ Registrar aporte / retirada"):
+        with st.form("form_capital", clear_on_submit=True):
+            cap1, cap2 = st.columns(2)
+            with cap1:
+                cap_data  = st.date_input("Data", value=date.today())
+                cap_valor = st.number_input("Valor (R$) — negativo para retirada", step=0.01, format="%.2f")
+            with cap2:
+                cap_desc = st.text_input("Descrição", placeholder="ex: Compra lote S_001")
+                cap_cat  = st.selectbox("Categoria", ["Compra de estoque","Taxa/Tarifa","Retirada","Aporte","Outro"])
+            if st.form_submit_button("💾 Registrar", type="primary", use_container_width=True):
+                if cap_valor == 0:
+                    st.error("Valor não pode ser zero.")
+                else:
+                    save_capital(str(user_id), {
+                        "data": cap_data.strftime("%Y-%m-%d"),
+                        "valor": cap_valor,
+                        "descricao": cap_desc,
+                        "categoria": cap_cat,
+                    })
+                    st.success(f"R$ {cap_valor:.2f} registrado.")
+                    st.rerun()
+
     if not capital_df.empty:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("**📋 Histórico de lançamentos**")
-        exibir = capital_df[["id","data","descricao","categoria","valor"]].copy()
+        total_inv = capital_df[capital_df["valor"] > 0]["valor"].sum()
+        total_ret = capital_df[capital_df["valor"] < 0]["valor"].abs().sum()
+        saldo_cap = capital_df["valor"].sum()
+        ci1, ci2, ci3 = st.columns(3)
+        ci1.markdown(f"""<div class="kpi-card"><div class="kpi-title">Total Investido</div><div class="kpi-value" style="color:#7C3AED;">R$ {total_inv:,.2f}</div></div>""", unsafe_allow_html=True)
+        ci2.markdown(f"""<div class="kpi-card"><div class="kpi-title">Retiradas</div><div class="kpi-value" style="color:#EF4444;">R$ {total_ret:,.2f}</div></div>""", unsafe_allow_html=True)
+        ci3.markdown(f"""<div class="kpi-card"><div class="kpi-title">Saldo Capital</div><div class="kpi-value" style="color:#16A34A;">R$ {saldo_cap:,.2f}</div></div>""", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+        exibir = capital_df[["data","descricao","categoria","valor"]].copy()
         exibir["data"]  = exibir["data"].apply(lambda x: x.strftime("%d/%m/%Y") if pd.notna(x) else "–")
         exibir["valor"] = exibir["valor"].apply(lambda x: f"R$ {x:,.2f}")
-        st.dataframe(exibir.rename(columns={"id":"ID","data":"Data","descricao":"Descrição",
-                                             "categoria":"Categoria","valor":"Valor"}),
+        st.dataframe(exibir.rename(columns={"data":"Data","descricao":"Descrição","categoria":"Categoria","valor":"Valor"}),
                      use_container_width=True, hide_index=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-    else:
-        st.info("Nenhum lançamento registrado ainda.")
+    st.markdown('</div>', unsafe_allow_html=True)
