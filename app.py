@@ -234,32 +234,31 @@ def get_orders(user_id: str, token: str, date_from: str, date_to: str) -> list:
 def parse_orders(orders: list, fretes: dict = None) -> pd.DataFrame:
     """
     Converte lista de ordens da API em DataFrame.
-    No ML Full o frete cobrado ao vendedor = (gross_price - unit_price) * qty.
-    gross_price é o preço cheio; unit_price é o que o comprador pagou após
-    o ML absorver o frete e repassar o desconto — a diferença é o custo de envio.
-    Sem chamadas extras à API.
+
+    Lógica financeira (confirmada pelo XLSX do ML):
+      Receita Bruta = unit_price × qty         (coluna "Receita por produtos")
+      Tarifa ML     = abs(sale_fee)             (coluna "Tarifa de venda e impostos")
+      Total ML      = paid_amount da order      (coluna "Total" — já descontado frete e tarifa)
+      Frete         = Receita - Tarifa - Total  (coluna "Tarifas de envio", ex: R$16,85 Full)
     """
     rows = []
     for order in orders:
-        order_id = order.get("id", "")
-        status   = order.get("status", "")
-        date_str = order.get("date_created", "")
-        date     = pd.to_datetime(date_str, errors="coerce")
+        order_id    = order.get("id", "")
+        status      = order.get("status", "")
+        date_str    = order.get("date_created", "")
+        date        = pd.to_datetime(date_str, errors="coerce")
+        paid_amount = float(order.get("paid_amount") or 0)
 
         for item in order.get("order_items", []):
-            sku         = item.get("item", {}).get("seller_sku", "") or ""
-            produto     = item.get("item", {}).get("title", "") or ""
-            qty         = int(item.get("quantity", 1) or 1)
-            unit_price  = float(item.get("unit_price", 0) or 0)
-            gross_price = float(item.get("gross_price") or unit_price)
-            sale_fee    = float(item.get("sale_fee", 0) or 0)
+            sku      = item.get("item", {}).get("seller_sku", "") or ""
+            produto  = item.get("item", {}).get("title", "") or ""
+            qty      = int(item.get("quantity", 1) or 1)
+            unit_price = float(item.get("unit_price", 0) or 0)
+            sale_fee   = abs(float(item.get("sale_fee", 0) or 0))
 
-            # Frete ao vendedor: diferença entre preço cheio e preço cobrado
-            frete_unit  = max(gross_price - unit_price, 0.0)
-            frete       = frete_unit * qty
-
-            receita  = gross_price * qty   # receita real antes do desconto de frete
-            total_ml = receita - abs(sale_fee) - frete
+            receita  = unit_price * qty
+            total_ml = paid_amount
+            frete    = max(receita - sale_fee - total_ml, 0.0)
 
             rows.append({
                 "Venda":         str(order_id),
@@ -269,8 +268,8 @@ def parse_orders(orders: list, fretes: dict = None) -> pd.DataFrame:
                 "Produto":       produto[:50],
                 "Quantidade":    qty,
                 "Receita Bruta": receita,
-                "Taxas ML":      abs(sale_fee),
-                "Frete":         abs(frete),
+                "Taxas ML":      sale_fee,
+                "Frete":         frete,
                 "Total ML":      total_ml,
                 "Cancelada":     status in ["cancelled"],
             })
