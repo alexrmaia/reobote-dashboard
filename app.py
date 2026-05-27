@@ -1192,12 +1192,6 @@ elif st.session_state["aba_ativa"] == "caixa":
                          "categoria": "", "conciliado": False, "observacao": ""})
         return pd.DataFrame(rows)
 
-    # ── Hero ──
-    st.markdown("""<div class="hero">
-        <h1 class="hero-title">Caixa Inter</h1>
-        <div style="opacity:.85;font-size:15px;margin-top:8px;">Banco Inter PJ — extrato, conciliação e agendamentos</div>
-    </div>""", unsafe_allow_html=True)
-
     extrato_df    = load_extrato(str(user_id))
     capital_df    = load_capital(str(user_id))
     agend_df      = load_agendamentos_inter(str(user_id))
@@ -1420,7 +1414,13 @@ elif st.session_state["aba_ativa"] == "caixa":
         roi         = (lucro_acum / total_inv * 100) if total_inv > 0 else 0.0
         cor_roi     = "#16A34A" if roi >= 0 else "#DC2626"
 
-        # Cards principais
+        nota_lucro = "<div style='font-size:12px;color:#64748B;margin-top:4px;'>Acesse Financeiro para atualizar</div>" if lucro_acum == 0 else ""
+        roi_card = f"""
+            <div style="background:linear-gradient(135deg,#F0FDF4,#DCFCE7);border:1px solid #BBF7D0;border-radius:16px;padding:24px;text-align:center;">
+                <div style="font-size:11px;font-weight:800;color:#15803D;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">ROI</div>
+                <div style="font-size:40px;font-weight:900;color:{cor_roi};letter-spacing:-1px;">{roi:.1f}%</div>
+            </div>"""
+
         st.markdown(f"""
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:24px;">
             <div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px;text-align:center;">
@@ -1430,12 +1430,9 @@ elif st.session_state["aba_ativa"] == "caixa":
             <div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px;text-align:center;">
                 <div style="font-size:11px;font-weight:800;color:#64748B;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Lucro Acumulado</div>
                 <div style="font-size:32px;font-weight:900;color:#0F172A;letter-spacing:-1px;">R$ {lucro_acum:,.2f}</div>
-                {"<div style='font-size:12px;color:#64748B;margin-top:4px;'>Acesse Financeiro para atualizar</div>" if lucro_acum == 0 else ""}
+                {nota_lucro}
             </div>
-            <div style="background:linear-gradient(135deg,#F0FDF4,#DCFCE7);border:1px solid #BBF7D0;border-radius:16px;padding:24px;text-align:center;">
-                <div style="font-size:11px;font-weight:800;color:#15803D;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">ROI</div>
-                <div style="font-size:40px;font-weight:900;color:{cor_roi};letter-spacing:-1px;">{roi:.1f}%</div>
-            </div>
+            {roi_card}
         </div>
         """, unsafe_allow_html=True)
 
