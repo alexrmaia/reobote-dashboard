@@ -199,52 +199,22 @@ def get_orders(user_id, token, date_from, date_to):
             break
     return orders
 
-@st.cache_data(ttl=300, show_spinner=False)
-def get_orders_reembolsados(user_id, token, date_from, date_to):
+def get_orders_reembolsados(orders):
     """
     Identifica orders com reembolso verificando payments[].transaction_amount_refunded > 0.
+    Usa a lista de orders já buscada — sem chamadas extras à API.
     Retorna dict {order_id: valor_reembolsado}.
-    Essa é a forma mais confiável — o ML sempre registra o reembolso no payment.
     """
-    headers = {"Authorization": f"Bearer {token}"}
-    orders_reembolsadas = {}
-    offset = 0
-    limit  = 50
-
-    while True:
-        resp = requests.get(
-            f"{ML_API_BASE}/orders/search",
-            headers=headers,
-            params={
-                "seller": user_id,
-                "order.date_created.from": date_from,
-                "order.date_created.to":   date_to,
-                "sort":   "date_desc",
-                "offset": offset,
-                "limit":  limit,
-            },
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            break
-        data    = resp.json()
-        results = data.get("results", [])
-
-        for order in results:
-            order_id    = str(order.get("id", ""))
-            reembolsado = 0.0
-            for payment in order.get("payments", []):
-                refunded = float(payment.get("transaction_amount_refunded") or 0)
-                reembolsado += refunded
-            if reembolsado > 0:
-                orders_reembolsadas[order_id] = reembolsado
-
-        paging = data.get("paging", {})
-        offset += limit
-        if offset >= paging.get("total", 0) or not results:
-            break
-
-    return orders_reembolsadas
+    reembolsadas = {}
+    for order in orders:
+        order_id    = str(order.get("id", ""))
+        reembolsado = 0.0
+        for payment in order.get("payments", []):
+            refunded = float(payment.get("transaction_amount_refunded") or 0)
+            reembolsado += refunded
+        if reembolsado > 0:
+            reembolsadas[order_id] = reembolsado
+    return reembolsadas
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
@@ -560,9 +530,10 @@ if st.session_state["aba_ativa"] == "financeiro":
     shipping_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in orders if o.get("shipping",{}).get("id")}))
     token_hash   = token[-8:] if token else ""
 
-    with st.spinner("Buscando fretes e verificando devoluções..."):
+    with st.spinner("Buscando fretes..."):
         fretes       = fetch_fretes_batch(shipping_ids, token_hash, token)
-        reembolsados = get_orders_reembolsados(str(user_id), token, date_from, date_to)
+    # Detecta reembolsos nas orders já buscadas — sem chamada extra à API
+    reembolsados = get_orders_reembolsados(orders)
 
     df_raw = parse_orders(orders, fretes, reembolsados)
     if df_raw.empty:
