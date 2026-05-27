@@ -561,16 +561,8 @@ if st.session_state["aba_ativa"] == "financeiro":
     token_hash   = token[-8:] if token else ""
 
     with st.spinner("Buscando fretes e verificando devoluções..."):
-        fretes  = fetch_fretes_batch(shipping_ids, token_hash, token)
+        fretes       = fetch_fretes_batch(shipping_ids, token_hash, token)
         reembolsados = get_orders_reembolsados(str(user_id), token, date_from, date_to)
-
-    # DEBUG reembolsos
-    with st.expander(f"🔍 DEBUG reembolsos ({len(reembolsados)} encontrados)", expanded=True):
-        if reembolsados:
-            for oid, val in list(reembolsados.items())[:10]:
-                st.write(f"  Order {oid}: reembolsado R$ {val:.2f}")
-        else:
-            st.write("Nenhum reembolso encontrado no período.")
 
     df_raw = parse_orders(orders, fretes, reembolsados)
     if df_raw.empty:
