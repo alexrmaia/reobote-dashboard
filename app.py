@@ -599,6 +599,24 @@ if st.session_state["aba_ativa"] == "financeiro":
     with st.spinner("Calculando custos e margens..."):
         df = apply_costs_online(df_raw, str(user_id))
 
+    # DEBUG RECONCILIAÇÃO — remove após análise
+    with st.expander("🔍 Debug reconciliação", expanded=True):
+        apr = df[~df["Cancelada"]]
+        st.write(f"**Pedidos aprovados:** {len(apr)} | **Qtd total:** {int(apr['Quantidade'].sum())}")
+        st.write(f"**Faturamento:** R$ {apr['Receita Bruta'].sum():.2f}")
+        st.write(f"**Tarifas:** R$ {apr['Taxas ML'].sum():.2f}")
+        st.write(f"**Fretes:** R$ {apr['Frete'].sum():.2f}")
+        st.write(f"**Total ML:** R$ {apr['Total ML'].sum():.2f}")
+        st.write(f"**Impostos:** R$ {apr['Imposto'].sum():.2f}")
+        st.write(f"**Custo Total:** R$ {apr['Custo Total'].sum():.2f}")
+        st.write(f"**Lucro:** R$ {apr['Lucro'].sum():.2f}")
+        st.write(f"**Margem:** {apr['Lucro'].sum()/apr['Receita Bruta'].sum()*100:.2f}%")
+        st.markdown("---")
+        st.write("**Custo unitário por venda (amostra):**")
+        cols_debug = ["Venda","Data","SKU","Quantidade","Receita Bruta","Taxas ML","Frete","Total ML","Custo Unitário","Custo Total","Imposto","Lucro","Margem %"]
+        cols_ok = [c for c in cols_debug if c in df.columns]
+        st.dataframe(df[cols_ok].head(20), use_container_width=True, hide_index=True)
+
     # Métricas
     aprovadas   = df[~df["Cancelada"]]
     canceladas  = df[df["Cancelada"]]
