@@ -239,15 +239,15 @@ def parse_orders(orders: list) -> pd.DataFrame:
         status      = order.get("status", "")
         date_str    = order.get("date_created", "")
         date        = pd.to_datetime(date_str, errors="coerce")
-        total_amount = float(order.get("total_amount", 0) or 0)
-        paid_amount  = float(order.get("paid_amount", 0) or 0)
+        paid_amount = float(order.get("paid_amount", 0) or 0)
 
         for item in order.get("order_items", []):
-            sku      = item.get("item", {}).get("seller_sku", "") or ""
-            produto  = item.get("item", {}).get("title", "") or ""
-            qty      = int(item.get("quantity", 1) or 1)
+            sku        = item.get("item", {}).get("seller_sku", "") or ""
+            produto    = item.get("item", {}).get("title", "") or ""
+            qty        = int(item.get("quantity", 1) or 1)
             unit_price = float(item.get("unit_price", 0) or 0)
             sale_fee   = float(item.get("sale_fee", 0) or 0)
+            frete      = float(order.get("shipping", {}).get("cost", 0) or 0)
 
             rows.append({
                 "Venda":         str(order_id),
@@ -258,15 +258,127 @@ def parse_orders(orders: list) -> pd.DataFrame:
                 "Quantidade":    qty,
                 "Receita Bruta": unit_price * qty,
                 "Taxas ML":      abs(sale_fee),
+                "Frete":         abs(frete),
                 "Total ML":      paid_amount,
                 "Cancelada":     status in ["cancelled"],
             })
 
     if not rows:
         return pd.DataFrame()
+    return pd.DataFrame(rows)
 
-    df = pd.DataFrame(rows)
-    return df
+def apply_costs_online(df: pd.DataFrame, user_id: str) -> pd.DataFrame:
+    """Aplica custos, FIFO, correções e impostos nas vendas."""
+    if df.empty:
+        return df
+
+    df = df.copy()
+    sb = get_supabase()
+
+    # Carrega dados do Supabase
+    custos_df  = load_custos(user_id)
+    regime_df  = load_regime(user_id)
+    fifo_hist  = load_fifo_consumo(user_id)
+
+    # Correções manuais
+    corr_resp  = sb.table("correcoes_custo").select("*").eq("user_id", user_id).execute()
+    correcoes  = {r["venda_id"]: r["custo_unitario"] for r in (corr_resp.data or [])}
+
+    FIFO_CORTE = pd.Timestamp("2026-05-20", tz="UTC")
+
+    def aliquota_para_data(data):
+        if regime_df.empty:
+            return 0.0
+        validos = regime_df[pd.to_datetime(regime_df["vigencia"], utc=True) <= data]
+        if validos.empty:
+            return 0.0
+        return float(validos.iloc[-1]["aliquota"]) / 100
+
+    def custo_por_vigencia(sku, data):
+        if custos_df.empty:
+            return 0.0
+        sku_df = custos_df[custos_df["sku"] == sku].copy()
+        if sku_df.empty:
+            return 0.0
+        sku_df["vigencia"] = pd.to_datetime(sku_df["vigencia"], utc=True, errors="coerce")
+        validos = sku_df[sku_df["vigencia"].isna() | (sku_df["vigencia"] <= data)]
+        if validos.empty:
+            return 0.0
+        return float(validos.iloc[-1]["custo_produto"])
+
+    # Processa cada venda
+    custos_out = custos_df.copy()
+    novos_fifo = {}
+
+    df["Custo Unitário"] = 0.0
+    df["Imposto"]        = 0.0
+    df["Lucro"]          = 0.0
+    df["Margem %"]       = 0.0
+
+    df_sorted = df.sort_values("Data").reset_index(drop=True)
+
+    for idx, row in df_sorted.iterrows():
+        venda_id = str(row["Venda"])
+        sku      = str(row["SKU"]).strip()
+        qty      = int(row["Quantidade"])
+        data     = pd.to_datetime(row["Data"], utc=True)
+        cancelada = row["Cancelada"]
+
+        # Custo unitário
+        if venda_id in correcoes:
+            custo_unit = float(correcoes[venda_id])
+        elif venda_id in fifo_hist:
+            custo_unit = float(fifo_hist[venda_id].get("custo_unitario", 0))
+        elif data >= FIFO_CORTE and not cancelada:
+            # FIFO — busca lote mais antigo com estoque
+            lotes = custos_out[
+                (custos_out["sku"] == sku) & (custos_out["qtd_disponivel"] > 0)
+            ].sort_values("vigencia", na_position="first")
+
+            if lotes.empty:
+                # Fallback: último custo cadastrado
+                todos = custos_out[custos_out["sku"] == sku].sort_values("vigencia", na_position="first")
+                custo_unit = float(todos.iloc[-1]["custo_produto"]) if not todos.empty else 0.0
+            else:
+                qtd_rest  = qty
+                custo_tot = 0.0
+                for lidx in lotes.index:
+                    if qtd_rest <= 0:
+                        break
+                    qtd_lote = float(custos_out.at[lidx, "qtd_disponivel"])
+                    c_lote   = float(custos_out.at[lidx, "custo_produto"])
+                    consumido = min(qtd_rest, qtd_lote)
+                    custo_tot += consumido * c_lote
+                    nova_qtd  = qtd_lote - consumido
+                    custos_out.at[lidx, "qtd_disponivel"] = nova_qtd if nova_qtd > 0 else -1
+                    qtd_rest  -= consumido
+                custo_unit = custo_tot / qty if qty > 0 else 0.0
+                novos_fifo[venda_id] = {"sku": sku, "qtd": qty, "custo_unitario": custo_unit, "fifo": True}
+        else:
+            custo_unit = custo_por_vigencia(sku, data)
+
+        df_sorted.at[idx, "Custo Unitário"] = custo_unit
+
+        # Imposto
+        aliquota = aliquota_para_data(data)
+        imposto  = row["Receita Bruta"] * aliquota if not cancelada else 0.0
+        df_sorted.at[idx, "Imposto"] = imposto
+
+        # Custo total e lucro
+        custo_total = custo_unit * qty if not cancelada else 0.0
+        lucro = row["Total ML"] - custo_total - imposto
+        df_sorted.at[idx, "Custo Total"] = custo_total
+        df_sorted.at[idx, "Lucro"]       = lucro
+        df_sorted.at[idx, "Margem %"]    = (lucro / row["Receita Bruta"] * 100) if row["Receita Bruta"] > 0 and not cancelada else 0.0
+
+    # Salva novos registros FIFO no Supabase
+    if novos_fifo:
+        records = [{"user_id": user_id, "venda_id": vid, **d} for vid, d in novos_fifo.items()]
+        sb.table("fifo_consumo").upsert(records, on_conflict="user_id,venda_id").execute()
+        # Atualiza qtd_disponivel no banco
+        save_custos_batch(user_id, custos_out)
+
+    return df_sorted.sort_values("Data", ascending=False).reset_index(drop=True)
 
 # =========================
 # ESTILO
@@ -391,20 +503,29 @@ else:
 with st.spinner("Buscando vendas..."):
     orders = get_orders(str(user_id), token, date_from, date_to)
 
+st.caption(f"Debug: user_id={user_id} | date_from={date_from} | orders={len(orders)}")
+
 if not orders:
     st.info("Nenhuma venda encontrada no período.")
     st.stop()
 
-df = parse_orders(orders)
-if df.empty:
+df_raw = parse_orders(orders)
+if df_raw.empty:
     st.info("Nenhuma venda encontrada no período.")
     st.stop()
+
+with st.spinner("Calculando custos e margens..."):
+    df = apply_costs_online(df_raw, str(user_id))
 
 # Métricas
 aprovadas   = df[~df["Cancelada"]]
 canceladas  = df[df["Cancelada"]]
 faturamento = aprovadas["Receita Bruta"].sum()
 tarifas     = aprovadas["Taxas ML"].sum()
+custos      = aprovadas["Custo Total"].sum() if "Custo Total" in aprovadas.columns else 0
+impostos    = aprovadas["Imposto"].sum()
+lucro_total = aprovadas["Lucro"].sum() if "Lucro" in aprovadas.columns else 0
+margem_real = (lucro_total / faturamento * 100) if faturamento > 0 else 0
 qtd_vendas  = int(aprovadas["Quantidade"].sum())
 qtd_cancel  = int(canceladas["Quantidade"].sum())
 
@@ -414,35 +535,55 @@ st.markdown(f"""
     <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:24px;">
         <div>
             <p style="opacity:.85;font-size:14px;font-weight:700;margin:0;">Olá, {nickname} 👋</p>
-            <h1 class="hero-title">Dashboard</h1>
+            <h1 class="hero-title">Financeiro</h1>
             <div style="background:rgba(255,255,255,.15);border-radius:999px;padding:8px 16px;
                         width:fit-content;margin-top:12px;font-size:13px;font-weight:800;">
                 {periodo} • {agora_br.strftime('%d/%m/%Y')}
             </div>
         </div>
         <div style="text-align:right;">
-            <div class="hero-label">Faturamento</div>
+            <div style="font-size:14px;font-weight:700;opacity:.85;">Faturamento</div>
             <div class="hero-value">R$ {faturamento:,.2f}</div>
         </div>
     </div>
 </div>
 """, unsafe_allow_html=True)
 
-# Cards
+# Cards KPI
 c1, c2, c3, c4 = st.columns(4)
-def card(col, label, value, sub=""):
+def card(col, label, value, sub="", color="#1E1040"):
     col.markdown(f"""
     <div class="metric-card">
-        <div class="metric-label">{label}</div>
+        <div class="metric-label" style="color:{color};">{label}</div>
         <div class="metric-value">{value}</div>
         {f'<div style="color:#64748B;font-size:13px;margin-top:4px;">{sub}</div>' if sub else ''}
     </div>
     """, unsafe_allow_html=True)
 
-card(c1, "Tarifas ML",     f"R$ {tarifas:,.2f}",   f"{tarifas/faturamento*100:.1f}%" if faturamento else "")
-card(c2, "Qtd Vendas",     f"{qtd_vendas} unid",    f"{len(aprovadas)} pedidos")
-card(c3, "Ticket Médio",   f"R$ {faturamento/len(aprovadas):.2f}" if len(aprovadas) else "R$ 0", "por pedido")
-card(c4, "Canceladas",     f"{qtd_cancel} unid",    f"{len(canceladas)} pedidos")
+card(c1, "Tarifas ML", f"R$ {tarifas:,.2f}", f"{tarifas/faturamento*100:.1f}%" if faturamento else "", "#F59E0B")
+card(c2, "Custos",     f"R$ {custos:,.2f}",  f"{custos/faturamento*100:.1f}%" if faturamento else "", "#8B5CF6")
+card(c3, "Impostos",   f"R$ {impostos:,.2f}", f"{impostos/faturamento*100:.1f}%" if faturamento else "")
+card(c4, "Canceladas", f"R$ {canceladas['Receita Bruta'].sum():,.2f}", f"{len(canceladas)} vendas", "#EF4444")
+
+st.markdown("<br>", unsafe_allow_html=True)
+lc1, lc2 = st.columns([1, 2])
+with lc1:
+    st.markdown(f"""
+    <div class="metric-card">
+        <div class="metric-label">Ticket Médio</div>
+        <div class="metric-value">R$ {faturamento/len(aprovadas):.2f}</div>
+        <div style="color:#64748B;font-size:13px;margin-top:4px;">{len(aprovadas)} pedidos</div>
+    </div>
+    """, unsafe_allow_html=True)
+with lc2:
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#16A34A,#15803D);border-radius:20px;
+                padding:24px 32px;color:white;text-align:center;">
+        <div style="font-size:16px;font-weight:800;margin-bottom:8px;">Lucro Líquido Real</div>
+        <div style="font-size:48px;font-weight:900;letter-spacing:-2px;">R$ {lucro_total:,.2f}</div>
+        <div style="font-size:14px;font-weight:700;opacity:.9;margin-top:4px;">Margem real: {margem_real:.2f}%</div>
+    </div>
+    """, unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
 
