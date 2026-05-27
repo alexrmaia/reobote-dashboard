@@ -231,51 +231,34 @@ def get_orders(user_id: str, token: str, date_from: str, date_to: str) -> list:
 
 
 
-def extrair_frete_order(order: dict) -> float:
-    """
-    Extrai o custo de frete cobrado ao vendedor diretamente da order.
-    No ML Full, o frete ao vendedor aparece em:
-      1. order_items[].fees[] com type "fulfillment" ou "shipping"
-      2. order.shipping_cost (campo legado)
-      3. paid_amount - total_amount (diferença indica frete pago pelo comprador,
-         mas o custo ao vendedor Full vem nas fees do item)
-    Soma todas as fees de frete de todos os itens da order.
-    """
-    frete_total = 0.0
-    fee_types_frete = {"fulfillment", "shipping", "self_service_cost",
-                       "shipping_discount", "zip_extra_fee"}
-    for item in order.get("order_items", []):
-        for fee in item.get("fees", []) or []:
-            fee_type = (fee.get("type") or "").lower()
-            if any(t in fee_type for t in fee_types_frete):
-                frete_total += abs(float(fee.get("amount") or 0))
-    # Fallback: campo shipping_cost na raiz da order (algumas versões da API)
-    if frete_total == 0.0:
-        frete_total = abs(float(order.get("shipping_cost") or 0))
-    return frete_total
-
 def parse_orders(orders: list, fretes: dict = None) -> pd.DataFrame:
     """
     Converte lista de ordens da API em DataFrame.
-    O frete ao vendedor é extraído diretamente das fees da order (sem chamadas extras).
-    O parâmetro fretes é mantido para compatibilidade mas ignorado.
+    No ML Full o frete cobrado ao vendedor = (gross_price - unit_price) * qty.
+    gross_price é o preço cheio; unit_price é o que o comprador pagou após
+    o ML absorver o frete e repassar o desconto — a diferença é o custo de envio.
+    Sem chamadas extras à API.
     """
     rows = []
     for order in orders:
-        order_id    = order.get("id", "")
-        status      = order.get("status", "")
-        date_str    = order.get("date_created", "")
-        date        = pd.to_datetime(date_str, errors="coerce")
-        frete       = extrair_frete_order(order)
+        order_id = order.get("id", "")
+        status   = order.get("status", "")
+        date_str = order.get("date_created", "")
+        date     = pd.to_datetime(date_str, errors="coerce")
 
         for item in order.get("order_items", []):
-            sku        = item.get("item", {}).get("seller_sku", "") or ""
-            produto    = item.get("item", {}).get("title", "") or ""
-            qty        = int(item.get("quantity", 1) or 1)
-            unit_price = float(item.get("unit_price", 0) or 0)
-            sale_fee   = float(item.get("sale_fee", 0) or 0)
+            sku         = item.get("item", {}).get("seller_sku", "") or ""
+            produto     = item.get("item", {}).get("title", "") or ""
+            qty         = int(item.get("quantity", 1) or 1)
+            unit_price  = float(item.get("unit_price", 0) or 0)
+            gross_price = float(item.get("gross_price") or unit_price)
+            sale_fee    = float(item.get("sale_fee", 0) or 0)
 
-            receita  = unit_price * qty
+            # Frete ao vendedor: diferença entre preço cheio e preço cobrado
+            frete_unit  = max(gross_price - unit_price, 0.0)
+            frete       = frete_unit * qty
+
+            receita  = gross_price * qty   # receita real antes do desconto de frete
             total_ml = receita - abs(sale_fee) - frete
 
             rows.append({
@@ -556,24 +539,6 @@ if st.session_state["aba_ativa"] == "financeiro":
     if not orders:
         st.info("Nenhuma venda encontrada no período.")
         st.stop()
-
-    # DEBUG TEMPORÁRIO — remover após identificar campo de frete
-    if orders:
-        o = orders[0]
-        item0 = o.get("order_items", [{}])[0]
-        import json
-        with st.expander("🔍 DEBUG — estrutura do pedido (remover após análise)", expanded=True):
-            st.write("**Keys da order:**", list(o.keys()))
-            st.write("**shipping:**", o.get("shipping"))
-            st.write("**shipping_cost:**", o.get("shipping_cost"))
-            st.write("**paid_amount:**", o.get("paid_amount"))
-            st.write("**total_amount:**", o.get("total_amount"))
-            st.write("**Keys do item:**", list(item0.keys()))
-            st.write("**item fees:**", item0.get("fees"))
-            st.write("**sale_fee:**", item0.get("sale_fee"))
-            st.write("**full_unit_price:**", item0.get("full_unit_price"))
-            st.write("**JSON completo do item:**")
-            st.json(item0)
 
     df_raw = parse_orders(orders)
     if df_raw.empty:
