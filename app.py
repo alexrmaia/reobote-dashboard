@@ -356,7 +356,10 @@ def apply_costs_online(df, user_id):
         sb.table("fifo_consumo").upsert(
             [{"user_id": user_id, "venda_id": vid, **d} for vid, d in novos_fifo.items()],
             on_conflict="user_id,venda_id").execute()
-        save_custos_batch(user_id, custos_out)
+        # Atualiza qtd_disponivel apenas dos lotes que foram efetivamente consumidos agora
+        lotes_alterados = custos_out[custos_out["qtd_disponivel"] != custos_df["qtd_disponivel"]]
+        if not lotes_alterados.empty:
+            save_custos_batch(user_id, lotes_alterados)
 
     return df_sorted.sort_values("Data", ascending=False).reset_index(drop=True)
 
@@ -418,6 +421,31 @@ header[data-testid="stHeader"]{display:none!important;}
 div[data-baseweb="select"]>div{border-radius:12px!important;border-color:#D8E0EC!important;
     background:white!important;min-height:46px!important;
     box-shadow:0 8px 20px rgba(15,23,42,.06);font-weight:800;}
+
+/* ── Mobile responsivo ── */
+@media (max-width: 768px) {
+    .block-container { padding: 0 8px 2rem 8px !important; }
+    .hero { padding: 20px 18px !important; min-height: auto !important; }
+    .hero-title { font-size: 32px !important; }
+    .hero-value { font-size: 36px !important; }
+    .card { padding: 16px !important; border-radius: 16px !important; }
+    .metric-card { min-height: auto !important; padding: 16px !important; }
+    .metric-title { font-size: 16px !important; }
+    .metric-value { font-size: 22px !important; }
+    .kpi-card { min-height: auto !important; padding: 14px 10px !important; }
+    .kpi-value { font-size: 18px !important; }
+    .kpi-title { font-size: 11px !important; }
+    .green-box, .red-box { padding: 18px !important; }
+    .green-value { font-size: 28px !important; }
+    .small-title { font-size: 20px !important; }
+    /* Tabelas HTML — scroll horizontal */
+    div[data-testid="stMarkdownContainer"] table { font-size: 11px !important; }
+    div[data-testid="stMarkdownContainer"] td,
+    div[data-testid="stMarkdownContainer"] th { padding: 6px 4px !important; }
+    /* Navbar */
+    .navbar { padding: 0 12px !important; height: 44px !important; }
+    .navbar-name { font-size: 12px !important; letter-spacing: 0.5px !important; }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1420,7 +1448,7 @@ elif st.session_state["aba_ativa"] == "caixa":
         estoque_caixa = sum(float(r["qtd_disponivel"]) * float(r["custo_produto"]) for r in (estoq_resp.data or []))
         qtd_estoque   = sum(float(r["qtd_disponivel"]) for r in (estoq_resp.data or []))
 
-        # Busca média de vendas dos últimos 15 dias
+        # Média de vendas 15 dias — só conta qtd, NÃO processa FIFO
         import zoneinfo as _tz
         _agora = datetime.now(_tz.ZoneInfo("America/Sao_Paulo"))
         _d15   = _agora - timedelta(days=15)
