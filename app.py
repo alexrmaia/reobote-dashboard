@@ -469,6 +469,18 @@ if st.session_state["aba_ativa"] == "financeiro":
     with st.spinner("Buscando vendas..."):
         orders = get_orders(str(user_id), token, date_from, date_to)
 
+    # DEBUG ADS — remove após identificar campo
+    if orders:
+        o = orders[0]
+        with st.expander("🔍 DEBUG — campos de ads na order", expanded=True):
+            st.write("**context:**", o.get("context"))
+            st.write("**tags:**", o.get("tags"))
+            st.write("**application_id:**", o.get("application_id"))
+            st.write("**ad_fee:**", o.get("ad_fee"))
+            for item in o.get("order_items", [])[:1]:
+                st.write("**item.sale_conditions:**", item.get("sale_conditions"))
+                st.write("**item.discounts:**", item.get("discounts"))
+
     if not orders:
         st.info("Nenhuma venda encontrada no período.")
         st.stop()
