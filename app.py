@@ -35,12 +35,13 @@ def get_supabase() -> Client:
 # =========================
 def load_custos(user_id: str) -> pd.DataFrame:
     sb = get_supabase()
-    resp = sb.table("custos_sku").select("*").eq("user_id", user_id).order("vigencia", desc=False, nullsfirst=True).execute()
+    resp = sb.table("custos_sku").select("*").eq("user_id", user_id).execute()
     if not resp.data:
         return pd.DataFrame(columns=["id","sku","produto","vigencia","qtd_comprada","qtd_disponivel",
                                       "custo_produto","frete_fornecedor","embalagem","outros_custos","margem_alvo","observacao"])
     df = pd.DataFrame(resp.data)
     df["vigencia"] = pd.to_datetime(df["vigencia"], errors="coerce")
+    df = df.sort_values("vigencia", na_position="first").reset_index(drop=True)
     return df
 
 def save_custo(user_id: str, row: dict):
