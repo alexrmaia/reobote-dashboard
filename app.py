@@ -199,6 +199,65 @@ def get_orders(user_id, token, date_from, date_to):
             break
     return orders
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_claims(user_id, token, date_from, date_to):
+    """
+    Busca reclamações, mediações e devoluções via API do ML.
+    Retorna set de order_ids que tiveram devolução/mediação com reembolso.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 1) Busca claims (reclamações) do período
+    order_ids_com_problema = set()
+
+    try:
+        resp = requests.get(
+            f"{ML_API_BASE}/post-purchase/claims/search",
+            headers=headers,
+            params={
+                "seller_id": user_id,
+                "status": "closed",  # fechadas = resolvidas
+                "limit": 50,
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            claims = resp.json().get("data", []) or []
+            for c in claims:
+                # Verifica se o resultado foi favorável ao comprador (reembolso)
+                resolution = c.get("resolution", {}) or {}
+                reason = (resolution.get("reason") or "").lower()
+                if any(x in reason for x in ["buyer", "refund", "reembolso"]):
+                    oid = c.get("order_id") or c.get("resource_id")
+                    if oid:
+                        order_ids_com_problema.add(str(oid))
+    except:
+        pass
+
+    # 2) Busca via /orders com status_detail de mediação
+    try:
+        resp = requests.get(
+            f"{ML_API_BASE}/orders/search",
+            headers=headers,
+            params={
+                "seller": user_id,
+                "order.date_created.from": date_from,
+                "order.date_created.to": date_to,
+                "order.status": "paid",
+                "order.status_detail": "mediator_return",
+                "limit": 50,
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            for o in resp.json().get("results", []):
+                order_ids_com_problema.add(str(o.get("id", "")))
+    except:
+        pass
+
+    return order_ids_com_problema
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -507,8 +566,31 @@ if st.session_state["aba_ativa"] == "financeiro":
     shipping_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in orders if o.get("shipping",{}).get("id")}))
     token_hash   = token[-8:] if token else ""
 
-    with st.spinner("Buscando fretes..."):
-        fretes = fetch_fretes_batch(shipping_ids, token_hash, token)
+    with st.spinner("Buscando fretes e verificando devoluções..."):
+        fretes  = fetch_fretes_batch(shipping_ids, token_hash, token)
+        claims  = get_claims(str(user_id), token, date_from, date_to)
+
+    # DEBUG temporário — remove após validar
+    with st.expander(f"🔍 DEBUG claims/devoluções ({len(claims)} encontradas)", expanded=True):
+        headers_dbg = {"Authorization": f"Bearer {token}"}
+        # Testa endpoint de claims
+        r1 = requests.get(f"{ML_API_BASE}/post-purchase/claims/search",
+                         headers=headers_dbg,
+                         params={"seller_id": user_id, "limit": 5}, timeout=15)
+        st.write(f"**/post-purchase/claims/search** → status {r1.status_code}")
+        if r1.status_code == 200:
+            st.json(r1.json())
+
+        # Testa orders com status_detail
+        r2 = requests.get(f"{ML_API_BASE}/orders/search",
+                         headers=headers_dbg,
+                         params={"seller": user_id, "order.status_detail": "mediator_return", "limit": 5},
+                         timeout=15)
+        st.write(f"**/orders/search?status_detail=mediator_return** → status {r2.status_code}")
+        if r2.status_code == 200:
+            st.json(r2.json())
+
+        st.write(f"Order IDs com problema identificados: {claims}")
 
     df_raw = parse_orders(orders, fretes)
     if df_raw.empty:
