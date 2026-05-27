@@ -558,64 +558,166 @@ if st.session_state["aba_ativa"] == "financeiro":
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # GRÁFICO LUCRO POR DIA
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("**📈 Lucro por dia**")
+    # Preparar dados dos gráficos
     daily = aprovadas.copy()
     daily["Dia"] = pd.to_datetime(daily["Data"]).dt.date
-    daily_agg = daily.groupby("Dia").agg(Lucro=("Lucro","sum"), Receita=("Receita Bruta","sum"), Quantidade=("Quantidade","sum")).reset_index()
+    daily_agg = daily.groupby("Dia").agg(
+        Lucro=("Lucro","sum"), Receita=("Receita Bruta","sum"), Quantidade=("Quantidade","sum")
+    ).reset_index()
     daily_agg["Dia"] = pd.to_datetime(daily_agg["Dia"])
     media_lucro = daily_agg["Lucro"].mean()
     daily_agg["Cor"] = daily_agg["Lucro"].apply(lambda x: "Acima" if x >= media_lucro else "Abaixo")
 
-    if len(daily_agg) > 1:
-        base    = alt.Chart(daily_agg)
-        area    = base.mark_area(interpolate="monotone", color="#7C3AED", opacity=0.12).encode(x=alt.X("Dia:T",title=None), y=alt.Y("Lucro:Q",title="Lucro (R$)"))
-        linha   = base.mark_line(interpolate="monotone", color="#7C3AED", strokeWidth=2.5).encode(x="Dia:T", y="Lucro:Q")
-        pontos  = base.mark_point(filled=True, size=80).encode(x="Dia:T", y="Lucro:Q",
-                    color=alt.Color("Cor:N", scale=alt.Scale(domain=["Acima","Abaixo"], range=["#16A34A","#DC2626"]), legend=None),
-                    tooltip=[alt.Tooltip("Dia:T",title="Data",format="%d/%m/%Y"),
-                             alt.Tooltip("Lucro:Q",title="Lucro R$",format=",.2f"),
-                             alt.Tooltip("Receita:Q",title="Receita R$",format=",.2f"),
-                             alt.Tooltip("Quantidade:Q",title="Qtd",format=",.0f")])
-        media_l = alt.Chart(pd.DataFrame({"m":[media_lucro]})).mark_rule(strokeDash=[6,3],color="#94A3B8",strokeWidth=1.5).encode(y="m:Q")
-        st.altair_chart((area+linha+pontos+media_l).properties(height=280), use_container_width=True)
-    else:
-        st.info("Gráfico disponível com 2+ dias de dados.")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # GRÁFICO QUANTIDADE POR DIA POR SKU
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("**📦 Quantidade vendida por dia (por SKU)**")
     qty_daily = aprovadas.copy()
     qty_daily["Dia"] = pd.to_datetime(qty_daily["Data"]).dt.date
     qty_agg = qty_daily.groupby(["Dia","SKU"]).agg(Quantidade=("Quantidade","sum")).reset_index()
     qty_agg["Dia"] = pd.to_datetime(qty_agg["Dia"])
 
-    if len(qty_agg) > 1:
-        cores_sku = ["#7C3AED","#0EA5E9","#F59E0B","#16A34A","#EF4444"]
-        skus = qty_agg["SKU"].unique().tolist()
-        cor_map = {s: cores_sku[i % len(cores_sku)] for i, s in enumerate(skus)}
-        chart_qty = alt.Chart(qty_agg).mark_line(point=True, strokeWidth=2.5).encode(
-            x=alt.X("Dia:T", title=None),
-            y=alt.Y("Quantidade:Q", title="Unidades"),
-            color=alt.Color("SKU:N", scale=alt.Scale(domain=skus, range=[cor_map[s] for s in skus])),
+    cores_sku = ["#7C3AED","#0EA5E9","#F59E0B","#16A34A","#EF4444"]
+    skus      = qty_agg["SKU"].unique().tolist() if not qty_agg.empty else []
+    cor_map   = {s: cores_sku[i % len(cores_sku)] for i, s in enumerate(skus)}
+    media_sku = qty_agg.groupby("SKU")["Quantidade"].mean().reset_index().rename(columns={"Quantidade":"Media"}) if not qty_agg.empty else pd.DataFrame()
+
+    # Layout duas colunas
+    gc1, gc2 = st.columns(2)
+
+    # ── Coluna esquerda: Resumo de Vendas ──
+    with gc1:
+        st.markdown('<div class="card" style="height:100%;">', unsafe_allow_html=True)
+        st.markdown("**Resumo de Vendas**")
+        st.markdown(f'<div style="color:#64748B;font-size:13px;margin-bottom:16px;">{label_periodo}</div>', unsafe_allow_html=True)
+
+        # Métricas em grid 2x2
+        qtd_vendas   = int(aprovadas["Quantidade"].sum())
+        qtd_cancel   = len(canceladas)
+        val_cancel   = canceladas["Receita Bruta"].sum()
+
+        # Vendas por anúncio (status paid)
+        paid_df = aprovadas[aprovadas["Status"] == "paid"]
+        vendas_ads = len(paid_df)
+        pct_ads    = vendas_ads / len(aprovadas) * 100 if len(aprovadas) > 0 else 0
+
+        m1, m2 = st.columns(2)
+        with m1:
+            st.markdown(f"""
+            <div style="margin-bottom:20px;">
+                <div style="font-size:12px;font-weight:700;color:#7C3AED;">Vendas</div>
+                <div style="font-size:36px;font-weight:900;color:#0F172A;line-height:1.1;">{len(aprovadas)}</div>
+                <div style="font-size:12px;color:#64748B;">{qtd_vendas} unidades</div>
+            </div>
+            <div>
+                <div style="font-size:12px;font-weight:700;color:#7C3AED;">Vendas pagas</div>
+                <div style="font-size:36px;font-weight:900;color:#0F172A;line-height:1.1;">{vendas_ads}</div>
+                <div style="font-size:12px;color:#16A34A;font-weight:700;">{pct_ads:.1f}% do total</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with m2:
+            st.markdown(f"""
+            <div style="margin-bottom:20px;">
+                <div style="font-size:12px;font-weight:700;color:#EF4444;">Cancelamentos</div>
+                <div style="font-size:36px;font-weight:900;color:#0F172A;line-height:1.1;">{qtd_cancel}</div>
+                <div style="font-size:12px;color:#64748B;">R$ {val_cancel:,.2f}</div>
+            </div>
+            <div>
+                <div style="font-size:12px;font-weight:700;color:#16A34A;">Receita</div>
+                <div style="font-size:28px;font-weight:900;color:#0F172A;line-height:1.1;">R$ {faturamento:,.2f}</div>
+                <div style="font-size:12px;color:#7C3AED;font-weight:700;">lucro R$ {lucro_total:,.2f}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Mini gráfico de receita por dia
+        if len(daily_agg) > 1:
+            mini = alt.Chart(daily_agg).mark_area(
+                interpolate="monotone", color="#7C3AED", opacity=0.15, line={"color":"#7C3AED","strokeWidth":2}
+            ).encode(
+                x=alt.X("Dia:T", title=None, axis=alt.Axis(format="%d/%m", labelFontSize=10)),
+                y=alt.Y("Receita:Q", title=None, axis=alt.Axis(format=",.0f", labelFontSize=10)),
+                tooltip=[alt.Tooltip("Dia:T",format="%d/%m/%Y"), alt.Tooltip("Receita:Q",format=",.2f",title="Receita")]
+            ).properties(height=160)
+            st.altair_chart(mini, use_container_width=True)
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Coluna direita: Resumo do Período (quantidade por SKU) ──
+    with gc2:
+        st.markdown('<div class="card" style="height:100%;">', unsafe_allow_html=True)
+        st.markdown("**Resumo do Período**")
+        st.markdown(f'<div style="color:#64748B;font-size:13px;margin-bottom:16px;">Quantidade vendida por dia no período selecionado — {label_periodo}</div>', unsafe_allow_html=True)
+
+        if len(qty_agg) > 1:
+            chart_qty = alt.Chart(qty_agg).mark_area(
+                interpolate="monotone", opacity=0.18, line=True
+            ).encode(
+                x=alt.X("Dia:T", title=None, axis=alt.Axis(format="%d/%m", labelFontSize=10)),
+                y=alt.Y("Quantidade:Q", title="Quantidade vendida", axis=alt.Axis(labelFontSize=10)),
+                color=alt.Color("SKU:N", scale=alt.Scale(domain=skus, range=[cor_map[s] for s in skus]),
+                                legend=None),
+                tooltip=[alt.Tooltip("Dia:T",title="Data",format="%d/%m/%Y"),
+                         alt.Tooltip("SKU:N"), alt.Tooltip("Quantidade:Q",title="Qtd")]
+            )
+            media_rules = alt.Chart(media_sku).mark_rule(strokeDash=[4,3], strokeWidth=1.5, opacity=0.5).encode(
+                y="Media:Q",
+                color=alt.Color("SKU:N", scale=alt.Scale(domain=skus, range=[cor_map[s] for s in skus]), legend=None)
+            )
+            st.altair_chart((chart_qty + media_rules).properties(height=240), use_container_width=True)
+        else:
+            st.info("Gráfico disponível com 2+ dias de dados.")
+
+        # Legenda com média por SKU
+        legenda_html = '<div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:4px;">'
+        for _, ms in media_sku.iterrows():
+            cor = cor_map.get(ms["SKU"], "#666")
+            legenda_html += (f'<div style="display:flex;align-items:center;gap:6px;">'
+                             f'<div style="width:10px;height:10px;border-radius:50%;background:{cor};opacity:.5;"></div>'
+                             f'<span style="font-size:12px;color:#64748B;font-weight:600;">'
+                             f'{ms["SKU"]} (média: {ms["Media"]:.1f}/dia)</span></div>')
+        legenda_html += '</div>'
+        st.markdown(legenda_html, unsafe_allow_html=True)
+
+        # Período selecionado
+        data_ini_str = pd.to_datetime(daily_agg["Dia"].min()).strftime("%d/%m/%Y")
+        data_fim_str = pd.to_datetime(daily_agg["Dia"].max()).strftime("%d/%m/%Y")
+        n_dias = (daily_agg["Dia"].max() - daily_agg["Dia"].min()).days + 1
+        st.markdown(f"""
+        <div style="margin-top:16px;display:flex;align-items:center;gap:12px;">
+            <span style="font-size:13px;font-weight:700;color:#64748B;">Período selecionado:</span>
+            <span style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:8px;
+                         padding:8px 16px;font-size:13px;font-weight:800;color:#1E1040;">
+                📅 {n_dias} dias — {data_ini_str} - {data_fim_str}
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # GRÁFICO LUCRO POR DIA (largura total)
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("**📈 Lucro por dia**")
+    if len(daily_agg) > 1:
+        base   = alt.Chart(daily_agg)
+        area   = base.mark_area(interpolate="monotone", color="#7C3AED", opacity=0.12).encode(
+            x=alt.X("Dia:T", title=None), y=alt.Y("Lucro:Q", title="Lucro (R$)"))
+        linha  = base.mark_line(interpolate="monotone", color="#7C3AED", strokeWidth=2.5).encode(x="Dia:T", y="Lucro:Q")
+        pontos = base.mark_point(filled=True, size=80).encode(
+            x="Dia:T", y="Lucro:Q",
+            color=alt.Color("Cor:N", scale=alt.Scale(domain=["Acima","Abaixo"], range=["#16A34A","#DC2626"]), legend=None),
             tooltip=[alt.Tooltip("Dia:T",title="Data",format="%d/%m/%Y"),
-                     alt.Tooltip("SKU:N"), alt.Tooltip("Quantidade:Q",title="Qtd")]
-        )
-        # Média por SKU como linha tracejada
-        media_sku = qty_agg.groupby("SKU")["Quantidade"].mean().reset_index().rename(columns={"Quantidade":"Media"})
-        media_rules = alt.Chart(media_sku).mark_rule(strokeDash=[4,3], strokeWidth=1.5, opacity=0.6).encode(
-            y="Media:Q", color=alt.Color("SKU:N", scale=alt.Scale(domain=skus, range=[cor_map[s] for s in skus]), legend=None)
-        )
-        st.altair_chart((chart_qty + media_rules).properties(height=240), use_container_width=True)
+                     alt.Tooltip("Lucro:Q",title="Lucro R$",format=",.2f"),
+                     alt.Tooltip("Receita:Q",title="Receita R$",format=",.2f"),
+                     alt.Tooltip("Quantidade:Q",title="Qtd",format=",.0f")])
+        media_l = alt.Chart(pd.DataFrame({"m":[media_lucro]})).mark_rule(
+            strokeDash=[6,3], color="#94A3B8", strokeWidth=1.5).encode(y="m:Q")
+        st.altair_chart((area+linha+pontos+media_l).properties(height=260), use_container_width=True)
     else:
         st.info("Gráfico disponível com 2+ dias de dados.")
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # TABELA DE PEDIDOS DETALHADOS
+    # TABELA DE PEDIDOS DETALHADOS — dentro de expander
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("**🧾 Ver vendas detalhadas**")
 
     fat_total = aprovadas["Receita Bruta"].sum() or 1
 
@@ -663,7 +765,7 @@ if st.session_state["aba_ativa"] == "financeiro":
             <td style="padding:10px 8px;color:#94A3B8;font-size:12px;white-space:nowrap;">{row['Venda']}</td>
         </tr>"""
 
-    st.markdown(f"""<div style="overflow-x:auto;">
+    tabela_html = f"""<div style="overflow-x:auto;">
     <table style="width:100%;border-collapse:collapse;font-family:'Inter',sans-serif;font-size:13px;">
         <thead><tr style="background:#F8FAFC;border-bottom:2px solid #E2E8F0;">
             <th style="padding:10px 8px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">SKU</th>
@@ -679,36 +781,38 @@ if st.session_state["aba_ativa"] == "financeiro":
             <th style="padding:10px 8px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">N.º Venda</th>
         </tr></thead>
         <tbody>{linhas}</tbody>
-    </table></div>""", unsafe_allow_html=True)
+    </table></div>"""
 
-    # CORREÇÕES MANUAIS
-    st.markdown("<br>", unsafe_allow_html=True)
-    with st.expander("✏️ Corrigir custo de vendas manualmente"):
-        vendas_opts = {f"{row['Venda']} — {row['SKU']} {pd.to_datetime(row['Data']).strftime('%d/%m %H:%M')} R${row['Receita Bruta']:.2f}": str(row['Venda'])
-                       for _, row in df[~df["Cancelada"]].iterrows()}
-        venda_sel = st.selectbox("Selecione a venda", list(vendas_opts.keys()), key="corr_venda")
-        venda_id_sel = vendas_opts[venda_sel]
-        row_sel    = df[df["Venda"] == venda_id_sel].iloc[0]
-        custo_atual = corr_map.get(venda_id_sel, {}).get("custo_unitario", row_sel["Custo Unitário"])
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            novo_custo = st.number_input("Custo unitário correto (R$)", value=float(custo_atual), step=0.01, format="%.4f", key="corr_custo")
-        with cc2:
-            motivo = st.text_input("Motivo (opcional)", key="corr_motivo")
-        bc1, bc2 = st.columns(2)
-        with bc1:
-            if st.button("💾 Salvar correção", type="primary", use_container_width=True):
-                save_correcao(str(user_id), venda_id_sel, novo_custo, motivo)
-                st.success(f"Custo da venda {venda_id_sel} corrigido para R$ {novo_custo:.4f}")
-                st.cache_data.clear()
-                st.rerun()
-        with bc2:
-            if venda_id_sel in corr_map:
-                if st.button("🗑️ Remover correção", use_container_width=True):
-                    delete_correcao(str(user_id), venda_id_sel)
-                    st.success("Correção removida.")
+    with st.expander(f"🧾 Ver vendas detalhadas ({len(df)} pedidos)", expanded=False):
+        st.markdown(tabela_html, unsafe_allow_html=True)
+        # CORREÇÕES MANUAIS dentro do mesmo expander
+        st.markdown("<br>", unsafe_allow_html=True)
+        with st.expander("✏️ Corrigir custo de vendas manualmente"):
+            vendas_opts = {f"{row['Venda']} — {row['SKU']} {pd.to_datetime(row['Data']).strftime('%d/%m %H:%M')} R${row['Receita Bruta']:.2f}": str(row['Venda'])
+                           for _, row in df[~df["Cancelada"]].iterrows()}
+            venda_sel    = st.selectbox("Selecione a venda", list(vendas_opts.keys()), key="corr_venda")
+            venda_id_sel = vendas_opts[venda_sel]
+            row_sel      = df[df["Venda"] == venda_id_sel].iloc[0]
+            custo_atual  = corr_map.get(venda_id_sel, {}).get("custo_unitario", row_sel["Custo Unitário"])
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                novo_custo = st.number_input("Custo unitário correto (R$)", value=float(custo_atual), step=0.01, format="%.4f", key="corr_custo")
+            with cc2:
+                motivo = st.text_input("Motivo (opcional)", key="corr_motivo")
+            bc1, bc2 = st.columns(2)
+            with bc1:
+                if st.button("💾 Salvar correção", type="primary", use_container_width=True):
+                    save_correcao(str(user_id), venda_id_sel, novo_custo, motivo)
+                    st.success(f"Custo da venda {venda_id_sel} corrigido para R$ {novo_custo:.4f}")
                     st.cache_data.clear()
                     st.rerun()
+            with bc2:
+                if venda_id_sel in corr_map:
+                    if st.button("🗑️ Remover correção", use_container_width=True):
+                        delete_correcao(str(user_id), venda_id_sel)
+                        st.success("Correção removida.")
+                        st.cache_data.clear()
+                        st.rerun()
 
     st.markdown('</div>', unsafe_allow_html=True)
 
