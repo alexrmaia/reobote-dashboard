@@ -232,7 +232,22 @@ def get_orders(user_id: str, token: str, date_from: str, date_to: str) -> list:
 
     return orders
 
-def parse_orders(orders: list) -> pd.DataFrame:
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_shipping_cost(shipping_id: int, token: str) -> float:
+    """Busca custo de frete pelo shipping_id."""
+    if not shipping_id:
+        return 0.0
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.get(f"{ML_API_BASE}/shipments/{shipping_id}", headers=headers, timeout=15)
+    if resp.status_code != 200:
+        return 0.0
+    data = resp.json()
+    # Custo do frete para o vendedor
+    shipping_option = data.get("shipping_option", {})
+    cost = shipping_option.get("cost", 0) or 0
+    return float(cost)
+
+def parse_orders(orders: list, token: str = "") -> pd.DataFrame:
     """Converte lista de ordens da API em DataFrame."""
     rows = []
     for order in orders:
@@ -241,6 +256,10 @@ def parse_orders(orders: list) -> pd.DataFrame:
         date_str    = order.get("date_created", "")
         date        = pd.to_datetime(date_str, errors="coerce")
         paid_amount = float(order.get("paid_amount", 0) or 0)
+        shipping_id = order.get("shipping", {}).get("id", 0)
+
+        # Busca frete do vendedor
+        frete = get_shipping_cost(shipping_id, token) if shipping_id and token else 0.0
 
         for item in order.get("order_items", []):
             sku        = item.get("item", {}).get("seller_sku", "") or ""
@@ -248,7 +267,10 @@ def parse_orders(orders: list) -> pd.DataFrame:
             qty        = int(item.get("quantity", 1) or 1)
             unit_price = float(item.get("unit_price", 0) or 0)
             sale_fee   = float(item.get("sale_fee", 0) or 0)
-            frete      = float(order.get("shipping", {}).get("cost", 0) or 0)
+
+            receita = unit_price * qty
+            # Total ML = receita - tarifa - frete (o que realmente entra no bolso antes do custo e imposto)
+            total_ml = receita - abs(sale_fee) - abs(frete)
 
             rows.append({
                 "Venda":         str(order_id),
@@ -257,10 +279,10 @@ def parse_orders(orders: list) -> pd.DataFrame:
                 "SKU":           sku.strip(),
                 "Produto":       produto[:50],
                 "Quantidade":    qty,
-                "Receita Bruta": unit_price * qty,
+                "Receita Bruta": receita,
                 "Taxas ML":      abs(sale_fee),
                 "Frete":         abs(frete),
-                "Total ML":      paid_amount,
+                "Total ML":      total_ml,
                 "Cancelada":     status in ["cancelled"],
             })
 
@@ -518,7 +540,7 @@ if not orders:
     st.info("Nenhuma venda encontrada no período.")
     st.stop()
 
-df_raw = parse_orders(orders)
+df_raw = parse_orders(orders, token)
 if df_raw.empty:
     st.info("Nenhuma venda encontrada no período.")
     st.stop()
