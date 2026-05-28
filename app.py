@@ -450,10 +450,6 @@ div[data-baseweb="select"]>div{border-radius:12px!important;border-color:#D8E0EC
 """, unsafe_allow_html=True)
 
 # =========================
-# NAVBAR
-# =========================
-st.markdown('<div class="navbar"><span style="font-size:20px;">🛒</span><span class="navbar-name">REOBOTE IMPORTS</span></div>', unsafe_allow_html=True)
-
 # =========================
 # AUTH
 # =========================
@@ -482,14 +478,16 @@ if "access_token" not in st.session_state:
     .block-container {{ padding: 0 !important; max-width: 100% !important; }}
     .login-wrapper {{
         min-height: 100vh;
-        background: radial-gradient(ellipse at 60% 0%, #0D1B4B 0%, #070B1A 60%);
+        background: radial-gradient(ellipse at 60% 0%, rgba(13,27,75,0.85) 0%, rgba(7,11,26,0.9) 60%);
         display: flex; align-items: center; justify-content: center; padding: 40px 20px;
+        position: relative; z-index: 1;
     }}
     .login-box {{ width: 100%; max-width: 460px; text-align: center; }}
     .login-logo {{
-        width: 200px; height: 200px; object-fit: contain;
-        margin: 0 auto 8px auto; display: block;
-        filter: drop-shadow(0 0 40px rgba(99,102,241,.4));
+        position: fixed; top: 0; left: 0;
+        width: 100vw; height: 100vh;
+        object-fit: cover; z-index: 0;
+        opacity: 0.35;
     }}
     .login-tagline {{
         font-size: 13px; font-weight: 700; letter-spacing: 3px;
@@ -500,12 +498,12 @@ if "access_token" not in st.session_state:
         font-weight: 500; line-height: 1.6;
     }}
     .ml-btn {{
-        display: inline-flex; align-items: center; justify-content: center; gap: 12px;
+        display: inline-flex; align-items: center; justify-content: center; gap: 10px;
         background: linear-gradient(135deg, #2563EB 0%, #7C3AED 100%);
         color: white !important; text-decoration: none !important;
-        font-size: 16px; font-weight: 800; padding: 18px 40px; border-radius: 999px;
-        width: 100%; box-shadow: 0 8px 32px rgba(37,99,235,.4), 0 0 0 1px rgba(255,255,255,.1);
-        letter-spacing: .3px; box-sizing: border-box;
+        font-size: 14px; font-weight: 700; padding: 12px 32px; border-radius: 999px;
+        box-shadow: 0 6px 24px rgba(37,99,235,.4), 0 0 0 1px rgba(255,255,255,.1);
+        letter-spacing: .3px;
     }}
     .login-footer {{ margin-top: 32px; font-size: 12px; color: rgba(255,255,255,.25); letter-spacing: .5px; }}
     .login-divider {{
@@ -534,6 +532,11 @@ if "access_token" not in st.session_state:
     </div>
     """, unsafe_allow_html=True)
     st.stop()
+
+# =========================
+# NAVBAR (só aparece após login)
+# =========================
+st.markdown('<div class="navbar"><span style="font-size:20px;">🛒</span><span class="navbar-name">REOBOTE IMPORTS</span></div>', unsafe_allow_html=True)
 
 # =========================
 # DASHBOARD
