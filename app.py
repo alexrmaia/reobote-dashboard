@@ -475,38 +475,44 @@ if "access_token" not in st.session_state:
     st.markdown("""<style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
-    html, body, [data-testid="stAppViewContainer"], [data-testid="stApp"], .stApp {
+    html, body {
+        height: 100%;
         background-color: #060d1f !important;
-        background-image: none !important;
     }
 
-    [data-testid="stVerticalBlock"] > div {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        min-height: 100vh;
+    /* Remove padding/margin do Streamlit */
+    [data-testid="stAppViewContainer"] {
+        padding: 0 !important;
+        background-color: #060d1f !important;
     }
-
-    header, footer, [data-testid="stToolbar"], [data-testid="stDecoration"],
-    [data-testid="stStatusWidget"], .viewerBadge_container__1QSob {
+    [data-testid="stAppViewBlockContainer"] {
+        padding: 0 !important;
+        max-width: 100% !important;
+    }
+    [data-testid="stVerticalBlock"] {
+        gap: 0 !important;
+        padding: 0 !important;
+    }
+    header, footer, [data-testid="stToolbar"],
+    [data-testid="stDecoration"], [data-testid="stStatusWidget"] {
         display: none !important;
     }
 
     .login-wrap {
+        position: fixed;
+        inset: 0;
         display: flex;
         flex-direction: column;
         align-items: center;
         justify-content: center;
-        min-height: 100vh;
-        background: radial-gradient(ellipse at 50% 30%, #0a1a4a 0%, #060d1f 70%);
+        background: radial-gradient(ellipse at 50% 40%, #0a1a4a 0%, #060d1f 70%);
+        gap: 36px;
     }
 
     .logo-img {
-        width: 340px;
-        max-width: 90vw;
+        width: 320px;
+        max-width: 88vw;
         border-radius: 24px;
-        margin-bottom: 40px;
         filter: drop-shadow(0 0 40px rgba(59,130,246,0.4));
     }
 
@@ -526,17 +532,12 @@ if "access_token" not in st.session_state:
         box-shadow: 0 8px 32px rgba(37,99,235,0.45), 0 0 0 1px rgba(255,255,255,0.1) inset;
         letter-spacing: 0.3px;
         transition: all .2s ease;
-        cursor: pointer;
         min-width: 260px;
     }
 
     .ml-btn:hover {
         transform: translateY(-2px);
         box-shadow: 0 14px 40px rgba(37,99,235,0.6), 0 0 0 1px rgba(255,255,255,0.15) inset;
-    }
-
-    .ml-btn svg {
-        flex-shrink: 0;
     }
     </style>""", unsafe_allow_html=True)
 
