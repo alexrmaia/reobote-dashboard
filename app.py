@@ -555,6 +555,28 @@ if "access_token" not in st.session_state:
     st.stop()
 
 # =========================
+# =========================
+# DEBUG TEMPORÁRIO — sale_fee
+# =========================
+import requests as _req
+_token = st.session_state.get("access_token", "")
+_order_id = "2000016545066984"
+_r = _req.get(f"https://api.mercadolibre.com/orders/{_order_id}",
+               headers={"Authorization": f"Bearer {_token}"}, timeout=10)
+if _r.status_code == 200:
+    _data = _r.json()
+    st.subheader("🔍 DEBUG — order_items do pedido QNT=4")
+    for _item in _data.get("order_items", []):
+        st.json({
+            "quantity": _item.get("quantity"),
+            "unit_price": _item.get("unit_price"),
+            "sale_fee": _item.get("sale_fee"),
+            "full_unit_price": _item.get("full_unit_price"),
+        })
+else:
+    st.error(f"Erro ao buscar pedido: {_r.status_code} — {_r.text}")
+st.stop()
+# =========================
 # NAVBAR (só aparece após login)
 # =========================
 st.markdown('<div class="navbar"><span style="font-size:20px;">🛒</span><span class="navbar-name">REOBOTE IMPORTS</span></div>', unsafe_allow_html=True)
