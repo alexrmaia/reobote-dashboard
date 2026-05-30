@@ -257,7 +257,7 @@ def parse_orders(orders, fretes=None, reembolsados=None):
             produto    = (item.get("item", {}).get("title", "") or "")[:50]
             qty        = int(item.get("quantity", 1) or 1)
             unit_price = float(item.get("unit_price", 0) or 0)
-            sale_fee   = abs(float(item.get("sale_fee", 0) or 0))
+            sale_fee   = abs(float(item.get("sale_fee", 0) or 0)) * qty  # ML retorna sale_fee por unidade
             frete      = float(fretes.get(shipping_id, 0) or 0)
             receita    = unit_price * qty
             total_ml   = receita - sale_fee - frete
@@ -554,28 +554,6 @@ if "access_token" not in st.session_state:
     """, unsafe_allow_html=True)
     st.stop()
 
-# =========================
-# =========================
-# DEBUG TEMPORÁRIO — sale_fee
-# =========================
-import requests as _req
-_token = st.session_state.get("access_token", "")
-_order_id = "2000016545066984"
-_r = _req.get(f"https://api.mercadolibre.com/orders/{_order_id}",
-               headers={"Authorization": f"Bearer {_token}"}, timeout=10)
-if _r.status_code == 200:
-    _data = _r.json()
-    st.subheader("🔍 DEBUG — order_items do pedido QNT=4")
-    for _item in _data.get("order_items", []):
-        st.json({
-            "quantity": _item.get("quantity"),
-            "unit_price": _item.get("unit_price"),
-            "sale_fee": _item.get("sale_fee"),
-            "full_unit_price": _item.get("full_unit_price"),
-        })
-else:
-    st.error(f"Erro ao buscar pedido: {_r.status_code} — {_r.text}")
-st.stop()
 # =========================
 # NAVBAR (só aparece após login)
 # =========================
