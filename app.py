@@ -556,6 +556,36 @@ if "access_token" not in st.session_state:
     st.stop()
 
 # =========================
+# =========================
+# DEBUG TEMPORÁRIO — shipment frete
+# =========================
+import requests as _req
+_token = st.session_state.get("access_token", "")
+for _order_id in ["2000016594446884", "2000016695631024"]:
+    _r = _req.get(f"https://api.mercadolibre.com/orders/{_order_id}",
+                  headers={"Authorization": f"Bearer {_token}"}, timeout=10)
+    if _r.status_code == 200:
+        _order = _r.json()
+        _sid = _order.get("shipping", {}).get("id")
+        st.subheader(f"🔍 Pedido {_order_id} — shipment_id: {_sid}")
+        if _sid:
+            _rs = _req.get(f"https://api.mercadolibre.com/shipments/{_sid}",
+                           headers={"Authorization": f"Bearer {_token}"}, timeout=10)
+            if _rs.status_code == 200:
+                _ship = _rs.json()
+                _opt = _ship.get("shipping_option", {})
+                st.json({
+                    "base_cost": _opt.get("base_cost"),
+                    "cost": _opt.get("cost"),
+                    "list_cost": _opt.get("list_cost"),
+                    "cost_components": _ship.get("cost_components", {}),
+                })
+            else:
+                st.error(f"Erro shipment: {_rs.status_code}")
+    else:
+        st.error(f"Erro pedido {_order_id}: {_r.status_code}")
+st.stop()
+# =========================
 # NAVBAR (só aparece após login)
 # =========================
 st.markdown('<div class="navbar"><span style="font-size:20px;">🛒</span><span class="navbar-name">REOBOTE IMPORTS</span></div>', unsafe_allow_html=True)
