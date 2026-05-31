@@ -555,6 +555,51 @@ if "access_token" not in st.session_state:
     st.stop()
 
 # =========================
+# =========================
+# DEBUG TEMPORÁRIO — shipment frete
+# =========================
+import requests as _req
+_token = st.session_state.get("access_token", "")
+_order_id = "2000016695631024"
+
+# Buscar o pedido para pegar o shipment_id
+_r = _req.get(f"https://api.mercadolibre.com/orders/{_order_id}",
+              headers={"Authorization": f"Bearer {_token}"}, timeout=10)
+if _r.status_code == 200:
+    _order = _r.json()
+    _sid = _order.get("shipping", {}).get("id")
+    st.subheader(f"🔍 DEBUG — Pedido {_order_id}")
+    st.write("**shipment_id:**", _sid)
+    for _item in _order.get("order_items", []):
+        st.json({
+            "quantity": _item.get("quantity"),
+            "unit_price": _item.get("unit_price"),
+            "sale_fee": _item.get("sale_fee"),
+        })
+    if _sid:
+        _rs = _req.get(f"https://api.mercadolibre.com/shipments/{_sid}",
+                       headers={"Authorization": f"Bearer {_token}"}, timeout=10)
+        if _rs.status_code == 200:
+            _ship = _rs.json()
+            st.subheader("📦 Dados do Shipment")
+            st.json({
+                "status": _ship.get("status"),
+                "base_cost": _ship.get("shipping_option", {}).get("cost"),
+                "cost_components": _ship.get("shipping_option", {}).get("cost_components"),
+                "list_cost": _ship.get("shipping_option", {}).get("list_cost"),
+                "buyer_cost": _ship.get("cost_components", {}).get("buyer_cost"),
+                "seller_cost": _ship.get("cost_components", {}).get("seller_cost"),
+                "compensation": _ship.get("cost_components", {}).get("compensation"),
+                "gap_discount": _ship.get("cost_components", {}).get("gap_discount"),
+            })
+            st.subheader("JSON completo do cost_components")
+            st.json(_ship.get("cost_components", {}))
+        else:
+            st.error(f"Erro shipment: {_rs.status_code} — {_rs.text}")
+else:
+    st.error(f"Erro pedido: {_r.status_code} — {_r.text}")
+st.stop()
+# =========================
 # NAVBAR (só aparece após login)
 # =========================
 st.markdown('<div class="navbar"><span style="font-size:20px;">🛒</span><span class="navbar-name">REOBOTE IMPORTS</span></div>', unsafe_allow_html=True)
