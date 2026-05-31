@@ -228,8 +228,8 @@ def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
             if resp.status_code != 200:
                 return sid, 0.0
             opt = resp.json().get("shipping_option", {})
-            # base_cost = o que o vendedor paga (após subsídio ML); list_cost = preço cheio sem desconto
-            cost = opt.get("base_cost") or opt.get("cost") or opt.get("list_cost") or 0
+            # "cost" = valor real pago pelo vendedor (após subsídio ML); "list_cost" = preço cheio
+            cost = opt.get("cost") or opt.get("base_cost") or opt.get("list_cost") or 0
             return sid, float(cost)
         except:
             return sid, 0.0
@@ -555,36 +555,6 @@ if "access_token" not in st.session_state:
     """, unsafe_allow_html=True)
     st.stop()
 
-# =========================
-# =========================
-# DEBUG TEMPORÁRIO — shipment frete
-# =========================
-import requests as _req
-_token = st.session_state.get("access_token", "")
-for _order_id in ["2000016594446884", "2000016695631024"]:
-    _r = _req.get(f"https://api.mercadolibre.com/orders/{_order_id}",
-                  headers={"Authorization": f"Bearer {_token}"}, timeout=10)
-    if _r.status_code == 200:
-        _order = _r.json()
-        _sid = _order.get("shipping", {}).get("id")
-        st.subheader(f"🔍 Pedido {_order_id} — shipment_id: {_sid}")
-        if _sid:
-            _rs = _req.get(f"https://api.mercadolibre.com/shipments/{_sid}",
-                           headers={"Authorization": f"Bearer {_token}"}, timeout=10)
-            if _rs.status_code == 200:
-                _ship = _rs.json()
-                _opt = _ship.get("shipping_option", {})
-                st.json({
-                    "base_cost": _opt.get("base_cost"),
-                    "cost": _opt.get("cost"),
-                    "list_cost": _opt.get("list_cost"),
-                    "cost_components": _ship.get("cost_components", {}),
-                })
-            else:
-                st.error(f"Erro shipment: {_rs.status_code}")
-    else:
-        st.error(f"Erro pedido {_order_id}: {_r.status_code}")
-st.stop()
 # =========================
 # NAVBAR (só aparece após login)
 # =========================
