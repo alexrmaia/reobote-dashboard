@@ -224,11 +224,17 @@ def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
     headers = {"Authorization": f"Bearer {token}"}
     def fetch_one(sid):
         try:
+            # /shipments/{id}/costs retorna senders[0].cost = custo real do vendedor
+            resp = requests.get(f"{ML_API_BASE}/shipments/{sid}/costs", headers=headers, timeout=15)
+            if resp.status_code == 200:
+                senders = resp.json().get("senders", [])
+                if senders:
+                    return sid, float(senders[0].get("cost", 0) or 0)
+            # Fallback: /shipments/{id} com shipping_option.cost (menos preciso)
             resp = requests.get(f"{ML_API_BASE}/shipments/{sid}", headers=headers, timeout=15)
             if resp.status_code != 200:
                 return sid, 0.0
             opt = resp.json().get("shipping_option", {})
-            # "cost" = valor real pago pelo vendedor (após subsídio ML); "list_cost" = preço cheio
             cost = opt.get("cost") or opt.get("base_cost") or opt.get("list_cost") or 0
             return sid, float(cost)
         except:
@@ -555,27 +561,6 @@ if "access_token" not in st.session_state:
     """, unsafe_allow_html=True)
     st.stop()
 
-# =========================
-# =========================
-# DEBUG TEMPORÁRIO — endpoints financeiros
-# =========================
-import requests as _req
-_token = st.session_state.get("access_token", "")
-_user_id = "3226004642"
-_ship_id = "47206211329"
-
-for _endpoint in [
-    f"https://api.mercadolibre.com/shipments/{_ship_id}/costs",
-    f"https://api.mercadolibre.com/users/{_user_id}/shipping_options",
-    f"https://api.mercadolibre.com/users/{_user_id}/mercadoenvios/shipments/{_ship_id}",
-    f"https://api.mercadolibre.com/shipments/{_ship_id}/tracking",
-    f"https://api.mercadolibre.com/seller-account/billing/documents?order_id=2000016737692892",
-]:
-    _r = _req.get(_endpoint, headers={"Authorization": f"Bearer {_token}"}, timeout=10)
-    st.write(f"**...{_endpoint.split('mercadolibre.com')[1]}** → {_r.status_code}")
-    if _r.status_code == 200:
-        st.json(_r.json())
-st.stop()
 # =========================
 # NAVBAR (só aparece após login)
 # =========================
