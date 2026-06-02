@@ -557,7 +557,7 @@ if "access_token" not in st.session_state:
 
 # =========================
 # =========================
-# DEBUG TEMPORÁRIO — shipment frete
+# DEBUG TEMPORÁRIO — shipment completo
 # =========================
 import requests as _req
 _token = st.session_state.get("access_token", "")
@@ -565,25 +565,12 @@ _order_id = "2000016737692892"
 _r = _req.get(f"https://api.mercadolibre.com/orders/{_order_id}",
               headers={"Authorization": f"Bearer {_token}"}, timeout=10)
 if _r.status_code == 200:
-    _order = _r.json()
-    _sid = _order.get("shipping", {}).get("id")
-    st.subheader(f"🔍 Pedido {_order_id} — shipment_id: {_sid}")
-    if _sid:
-        _rs = _req.get(f"https://api.mercadolibre.com/shipments/{_sid}",
-                       headers={"Authorization": f"Bearer {_token}"}, timeout=10)
-        if _rs.status_code == 200:
-            _ship = _rs.json()
-            _opt = _ship.get("shipping_option", {})
-            st.json({
-                "cost": _opt.get("cost"),
-                "base_cost": _opt.get("base_cost"),
-                "list_cost": _opt.get("list_cost"),
-                "cost_components": _ship.get("cost_components", {}),
-            })
-        else:
-            st.error(f"Erro shipment: {_rs.status_code}")
-else:
-    st.error(f"Erro pedido: {_r.status_code}")
+    _sid = _r.json().get("shipping", {}).get("id")
+    _rs = _req.get(f"https://api.mercadolibre.com/shipments/{_sid}",
+                   headers={"Authorization": f"Bearer {_token}"}, timeout=10)
+    if _rs.status_code == 200:
+        st.subheader("JSON COMPLETO DO SHIPMENT")
+        st.json(_rs.json())
 st.stop()
 # =========================
 # NAVBAR (só aparece após login)
