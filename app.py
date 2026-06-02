@@ -557,7 +557,7 @@ if "access_token" not in st.session_state:
 
 # =========================
 # =========================
-# DEBUG TEMPORÁRIO — shipment completo
+# DEBUG TEMPORÁRIO — payments
 # =========================
 import requests as _req
 _token = st.session_state.get("access_token", "")
@@ -565,12 +565,11 @@ _order_id = "2000016737692892"
 _r = _req.get(f"https://api.mercadolibre.com/orders/{_order_id}",
               headers={"Authorization": f"Bearer {_token}"}, timeout=10)
 if _r.status_code == 200:
-    _sid = _r.json().get("shipping", {}).get("id")
-    _rs = _req.get(f"https://api.mercadolibre.com/shipments/{_sid}",
-                   headers={"Authorization": f"Bearer {_token}"}, timeout=10)
-    if _rs.status_code == 200:
-        st.subheader("JSON COMPLETO DO SHIPMENT")
-        st.json(_rs.json())
+    _order = _r.json()
+    st.subheader("Payments do pedido")
+    st.json(_order.get("payments", []))
+    st.subheader("Shipping summary")
+    st.json(_order.get("shipping", {}))
 st.stop()
 # =========================
 # NAVBAR (só aparece após login)
