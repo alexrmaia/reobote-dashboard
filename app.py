@@ -557,21 +557,22 @@ if "access_token" not in st.session_state:
 
 # =========================
 # =========================
-# DEBUG TEMPORÁRIO — statement financeiro
+# DEBUG TEMPORÁRIO — endpoints financeiros
 # =========================
 import requests as _req
 _token = st.session_state.get("access_token", "")
 _user_id = "3226004642"
+_ship_id = "47206211329"
 
-# Tentar endpoint de billing/statement
 for _endpoint in [
-    f"https://api.mercadolibre.com/users/{_user_id}/mercadopago_account/statement?limit=5",
-    f"https://api.mercadolibre.com/billing/orders/2000016737692892",
-    f"https://api.mercadolibre.com/users/{_user_id}/shipping_costs?order_id=2000016737692892",
-    f"https://api.mercadolibre.com/shipment_labels/2000016737692892",
+    f"https://api.mercadolibre.com/shipments/{_ship_id}/costs",
+    f"https://api.mercadolibre.com/users/{_user_id}/shipping_options",
+    f"https://api.mercadolibre.com/users/{_user_id}/mercadoenvios/shipments/{_ship_id}",
+    f"https://api.mercadolibre.com/shipments/{_ship_id}/tracking",
+    f"https://api.mercadolibre.com/seller-account/billing/documents?order_id=2000016737692892",
 ]:
     _r = _req.get(_endpoint, headers={"Authorization": f"Bearer {_token}"}, timeout=10)
-    st.write(f"**{_endpoint.split('mercadolibre.com')[1]}** → status {_r.status_code}")
+    st.write(f"**...{_endpoint.split('mercadolibre.com')[1]}** → {_r.status_code}")
     if _r.status_code == 200:
         st.json(_r.json())
 st.stop()
