@@ -224,17 +224,11 @@ def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
     headers = {"Authorization": f"Bearer {token}"}
     def fetch_one(sid):
         try:
-            # /shipments/{id}/costs retorna senders[0].cost = custo real do vendedor
-            resp = requests.get(f"{ML_API_BASE}/shipments/{sid}/costs", headers=headers, timeout=15)
-            if resp.status_code == 200:
-                senders = resp.json().get("senders", [])
-                if senders:
-                    return sid, float(senders[0].get("cost", 0) or 0)
-            # Fallback: /shipments/{id} com shipping_option.cost (menos preciso)
             resp = requests.get(f"{ML_API_BASE}/shipments/{sid}", headers=headers, timeout=15)
             if resp.status_code != 200:
                 return sid, 0.0
             opt = resp.json().get("shipping_option", {})
+            # "cost" = valor real pago pelo vendedor (após subsídio ML); "list_cost" = preço cheio
             cost = opt.get("cost") or opt.get("base_cost") or opt.get("list_cost") or 0
             return sid, float(cost)
         except:
@@ -247,6 +241,8 @@ def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
     return fretes
 
 def parse_orders(orders, fretes=None, reembolsados=None):
+    import requests
+    import streamlit as st
     fretes       = fretes or {}
     reembolsados = reembolsados or {}
     rows = []
@@ -257,17 +253,50 @@ def parse_orders(orders, fretes=None, reembolsados=None):
         shipping_id = order.get("shipping", {}).get("id", 0)
         paid_amount = float(order.get("paid_amount") or 0)
         reemb_val   = float(reembolsados.get(str(order_id), 0) or 0)
+        
         # Cancelada = status cancelled OU reembolso total (>= 90% do valor pago)
         cancelada   = status in ["cancelled"] or (reemb_val > 0 and paid_amount > 0 and reemb_val >= paid_amount * 0.9)
+        
         for item in order.get("order_items", []):
             sku        = (item.get("item", {}).get("seller_sku", "") or "").strip()
             produto    = (item.get("item", {}).get("title", "") or "")[:50]
             qty        = int(item.get("quantity", 1) or 1)
             unit_price = float(item.get("unit_price", 0) or 0)
-            sale_fee   = abs(float(item.get("sale_fee", 0) or 0)) * qty  # ML retorna sale_fee por unidade
-            frete      = float(fretes.get(shipping_id, 0) or 0)
-            receita    = unit_price * qty
-            total_ml   = receita - sale_fee - frete
+            
+            # ==========================================
+            # INÍCIO DA NOVA LÓGICA DE CANCELADOS
+            # ==========================================
+            if cancelada:
+                receita = 0.0
+                sale_fee = 0.0
+                frete = 0.0
+                
+                # Busca o frete reverso na API
+                if shipping_id:
+                    try:
+                        token = st.session_state.get("ml_token", "")
+                        headers = {"Authorization": f"Bearer {token}"}
+                        ship_url = f"https://api.mercadolibre.com/shipments/{shipping_id}"
+                        ship_resp = requests.get(ship_url, headers=headers, timeout=10)
+                        
+                        if ship_resp.status_code == 200:
+                            ship_data = ship_resp.json()
+                            frete = float(ship_data.get('return_details', {}).get('reverse_shipping_fee', 0.0))
+                            if frete == 0.0:
+                                frete = float(ship_data.get('shipping_option', {}).get('cost', 0.0))
+                    except Exception:
+                        pass # Em caso de erro, mantém o frete zerado
+            else:
+                # Lógica original para vendas aprovadas
+                sale_fee   = abs(float(item.get("sale_fee", 0) or 0)) * qty
+                frete      = float(fretes.get(shipping_id, 0) or 0)
+                receita    = unit_price * qty
+            
+            total_ml = receita - sale_fee - frete
+            # ==========================================
+            # FIM DA NOVA LÓGICA
+            # ==========================================
+
             rows.append({
                 "Venda": str(order_id), "Data": date, "Status": status,
                 "SKU": sku, "Produto": produto, "Quantidade": qty,
