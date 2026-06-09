@@ -229,14 +229,14 @@ def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
                 return sid, 0.0
             data = resp.json()
             opt  = data.get("shipping_option", {})
-            # Log temporário para diagnóstico — remover depois
-            import json as _json
-            print(f"[FRETE DEBUG] sid={sid} | shipping_option={_json.dumps(opt)}")
-            # "cost"      = valor real pago pelo VENDEDOR (após subsídio ML)
-            # "base_cost" = custo base antes de subsídios
-            # "list_cost" = preço cheio cobrado do comprador — NUNCA usar como custo do vendedor
-            cost = opt.get("cost") or opt.get("base_cost") or 0
-            return sid, float(cost)
+            # Estrutura ML:
+            # list_cost = frete total (vendedor + comprador)
+            # cost      = parte extra paga pelo comprador (excede o padrão)
+            # custo do vendedor = list_cost - cost
+            list_cost = float(opt.get("list_cost") or 0)
+            extra_cost = float(opt.get("cost") or 0)
+            cost = max(list_cost - extra_cost, 0)
+            return sid, cost
         except:
             return sid, 0.0
     fretes = {}
