@@ -223,32 +223,6 @@ def get_orders(user_id, token, date_from, date_to):
 
     return list(seen.values())
 
-def diagnostico_cancelamento(token, order_id="2000016674244020", st_out=None):
-    """Diagnóstico temporário — busca order cancelada e shipment completo."""
-    import json as _json
-    def _log(msg):
-        print(msg)
-        if st_out: st_out.write(msg)
-    headers = {"Authorization": f"Bearer {token}"}
-    r = requests.get(f"https://api.mercadolibre.com/orders/{order_id}", headers=headers, timeout=15)
-    if r.status_code != 200:
-        _log(f"Order {order_id} erro: {r.status_code} {r.text[:200]}")
-        return
-    order = r.json()
-    _log(f"Order {order_id} | status={order.get('status')} | date_closed={order.get('date_closed')}")
-    shipping_id = order.get("shipping", {}).get("id")
-    _log(f"shipping_id={shipping_id}")
-    if shipping_id:
-        rs = requests.get(f"https://api.mercadolibre.com/shipments/{shipping_id}", headers=headers, timeout=15)
-        if rs.status_code == 200:
-            ship = rs.json()
-            _log(f"shipment status={ship.get('status')} substatus={ship.get('substatus')}")
-            _log(f"shipping_option={_json.dumps(ship.get('shipping_option', {}))}")
-            _log(f"return_details={_json.dumps(ship.get('return_details', {}))}")
-            _log(f"charges={_json.dumps(ship.get('charges', {}))}")
-            _log(f"base_cost={ship.get('base_cost')} | cost={ship.get('cost')}")
-        else:
-            _log(f"Shipment erro: {rs.status_code}")
 
 def get_orders_reembolsados(orders):
     """
@@ -341,14 +315,20 @@ def parse_orders(orders, fretes=None, reembolsados=None):
                         
                         if ship_resp.status_code == 200:
                             ship_data = ship_resp.json()
-                            # Frete reverso: campo específico de devolução
-                            frete = float(ship_data.get('return_details', {}).get('reverse_shipping_fee', 0.0))
-                            if frete == 0.0:
-                                # Fallback: mesmo custo do frete original (list_cost - cost)
-                                opt = ship_data.get('shipping_option', {})
-                                lc  = float(opt.get('list_cost') or 0)
-                                ec  = float(opt.get('cost') or 0)
-                                frete = max(lc - ec, 0)
+                            # Estrutura real da API ML para cancelados:
+                            # base_cost = valor cheio do frete (sem subsídio) = ex: R$33,70
+                            # list_cost = frete de ida com subsídio 50% ML   = ex: R$16,85
+                            # cost      = excedente pago pelo comprador       = ex: R$0
+                            # frete ida (vendedor) = list_cost - cost         = R$16,85
+                            # frete reverso (sem subsídio) = base_cost        = R$33,70
+                            # prejuízo total = frete_ida + frete_reverso
+                            bc  = float(ship_data.get('base_cost') or 0)
+                            opt = ship_data.get('shipping_option', {})
+                            lc  = float(opt.get('list_cost') or 0)
+                            ec  = float(opt.get('cost') or 0)
+                            frete_ida     = max(lc - ec, 0)  # ida: subsidiado pelo ML
+                            frete_reverso = bc                # reverso: sem subsídio, valor cheio
+                            frete = frete_ida + frete_reverso
                     except Exception:
                         pass # Em caso de erro, mantém o frete zerado
                 
@@ -728,11 +708,6 @@ if st.session_state["aba_ativa"] == "financeiro":
         date_from = d.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
         date_to   = agora_br.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
         label_periodo = f"{periodo} • até {agora_br.strftime('%d/%m/%Y')}"
-
-    # DIAGNÓSTICO TEMPORÁRIO — fora do spinner
-    st.warning("🔍 DEBUG cancelamento rodando...")
-    diagnostico_cancelamento(token, st_out=st)
-    st.write("---")
 
     with st.spinner("Buscando vendas..."):
         orders = get_orders(str(user_id), token, date_from, date_to)
