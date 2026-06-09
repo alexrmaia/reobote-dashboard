@@ -181,23 +181,72 @@ def get_user_info(user_id, token):
 @st.cache_data(ttl=300, show_spinner=False)
 def get_orders(user_id, token, date_from, date_to):
     headers = {"Authorization": f"Bearer {token}"}
-    orders, offset, limit = [], 0, 50
-    while True:
-        resp = requests.get(f"{ML_API_BASE}/orders/search", headers=headers, params={
-            "seller": user_id, "order.date_created.from": date_from,
-            "order.date_created.to": date_to, "sort": "date_desc",
-            "offset": offset, "limit": limit,
-        }, timeout=30)
-        if resp.status_code != 200:
-            break
-        data = resp.json()
-        results = data.get("results", [])
-        orders.extend(results)
-        paging = data.get("paging", {})
-        offset += limit
-        if offset >= paging.get("total", 0) or not results:
-            break
-    return orders
+
+    def _fetch(params_extra):
+        """Busca paginada com parâmetros extras."""
+        results_all, offset, limit = [], 0, 50
+        while True:
+            params = {"seller": user_id, "sort": "date_desc",
+                      "offset": offset, "limit": limit, **params_extra}
+            resp = requests.get(f"{ML_API_BASE}/orders/search",
+                                headers=headers, params=params, timeout=30)
+            if resp.status_code != 200:
+                break
+            data    = resp.json()
+            results = data.get("results", [])
+            results_all.extend(results)
+            paging  = data.get("paging", {})
+            offset += limit
+            if offset >= paging.get("total", 0) or not results:
+                break
+        return results_all
+
+    # 1) Ordens criadas no período (aprovadas + canceladas antes de sair do período)
+    ordens_criadas = _fetch({
+        "order.date_created.from": date_from,
+        "order.date_created.to":   date_to,
+    })
+
+    # 2) Ordens canceladas/fechadas NO período (podem ter sido criadas antes)
+    ordens_fechadas = _fetch({
+        "order.date_closed.from": date_from,
+        "order.date_closed.to":   date_to,
+        "order.status":           "cancelled",
+    })
+
+    # Mesclar sem duplicatas (usar order id como chave)
+    seen = {str(o.get("id")): o for o in ordens_criadas}
+    for o in ordens_fechadas:
+        oid = str(o.get("id"))
+        if oid not in seen:
+            seen[oid] = o
+
+    return list(seen.values())
+
+def diagnostico_cancelamento(token, order_id="2000016674244020"):
+    """Diagnóstico temporário — busca order cancelada e shipment completo."""
+    import json as _json
+    headers = {"Authorization": f"Bearer {token}"}
+    # Buscar a order
+    r = requests.get(f"https://api.mercadolibre.com/orders/{order_id}", headers=headers, timeout=15)
+    if r.status_code != 200:
+        print(f"[DIAG] Order {order_id} erro: {r.status_code} {r.text[:200]}")
+        return
+    order = r.json()
+    print(f"[DIAG] Order {order_id} status={order.get('status')} date_closed={order.get('date_closed')}")
+    shipping_id = order.get("shipping", {}).get("id")
+    print(f"[DIAG] shipping_id={shipping_id}")
+    if shipping_id:
+        rs = requests.get(f"https://api.mercadolibre.com/shipments/{shipping_id}", headers=headers, timeout=15)
+        if rs.status_code == 200:
+            ship = rs.json()
+            print(f"[DIAG] shipment status={ship.get('status')} substatus={ship.get('substatus')}")
+            print(f"[DIAG] shipping_option={_json.dumps(ship.get('shipping_option', {}))}")
+            print(f"[DIAG] return_details={_json.dumps(ship.get('return_details', {}))}")
+            print(f"[DIAG] charges={_json.dumps(ship.get('charges', {}))}")
+            print(f"[DIAG] base_cost={ship.get('base_cost')} cost={ship.get('cost')}")
+        else:
+            print(f"[DIAG] Shipment erro: {rs.status_code}")
 
 def get_orders_reembolsados(orders):
     """
@@ -290,14 +339,14 @@ def parse_orders(orders, fretes=None, reembolsados=None):
                         
                         if ship_resp.status_code == 200:
                             ship_data = ship_resp.json()
-                            import json as _json
-                            print(f"[CANCEL DEBUG] sid={shipping_id} order={order_id}")
-                            print(f"  return_details={_json.dumps(ship_data.get('return_details', {}))}")
-                            print(f"  shipping_option={_json.dumps(ship_data.get('shipping_option', {}))}")
-                            print(f"  status={ship_data.get('status')} substatus={ship_data.get('substatus')}")
+                            # Frete reverso: campo específico de devolução
                             frete = float(ship_data.get('return_details', {}).get('reverse_shipping_fee', 0.0))
                             if frete == 0.0:
-                                frete = float(ship_data.get('shipping_option', {}).get('cost', 0.0))
+                                # Fallback: mesmo custo do frete original (list_cost - cost)
+                                opt = ship_data.get('shipping_option', {})
+                                lc  = float(opt.get('list_cost') or 0)
+                                ec  = float(opt.get('cost') or 0)
+                                frete = max(lc - ec, 0)
                     except Exception:
                         pass # Em caso de erro, mantém o frete zerado
                 
@@ -679,6 +728,8 @@ if st.session_state["aba_ativa"] == "financeiro":
         label_periodo = f"{periodo} • até {agora_br.strftime('%d/%m/%Y')}"
 
     with st.spinner("Buscando vendas..."):
+        # DIAGNÓSTICO TEMPORÁRIO
+        diagnostico_cancelamento(token)
         orders = get_orders(str(user_id), token, date_from, date_to)
 
     if not orders:
