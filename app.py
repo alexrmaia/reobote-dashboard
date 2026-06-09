@@ -228,8 +228,10 @@ def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
             if resp.status_code != 200:
                 return sid, 0.0
             opt = resp.json().get("shipping_option", {})
-            # "cost" = valor real pago pelo vendedor (após subsídio ML); "list_cost" = preço cheio
-            cost = opt.get("cost") or opt.get("base_cost") or opt.get("list_cost") or 0
+            # "cost"      = valor real pago pelo VENDEDOR (após subsídio ML)
+            # "base_cost" = custo base antes de subsídios
+            # "list_cost" = preço cheio cobrado do comprador — NUNCA usar como custo do vendedor
+            cost = opt.get("cost") or opt.get("base_cost") or 0
             return sid, float(cost)
         except:
             return sid, 0.0
