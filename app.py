@@ -227,7 +227,11 @@ def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
             resp = requests.get(f"{ML_API_BASE}/shipments/{sid}", headers=headers, timeout=15)
             if resp.status_code != 200:
                 return sid, 0.0
-            opt = resp.json().get("shipping_option", {})
+            data = resp.json()
+            opt  = data.get("shipping_option", {})
+            # Log temporário para diagnóstico — remover depois
+            import json as _json
+            print(f"[FRETE DEBUG] sid={sid} | shipping_option={_json.dumps(opt)}")
             # "cost"      = valor real pago pelo VENDEDOR (após subsídio ML)
             # "base_cost" = custo base antes de subsídios
             # "list_cost" = preço cheio cobrado do comprador — NUNCA usar como custo do vendedor
