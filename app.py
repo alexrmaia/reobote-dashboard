@@ -323,14 +323,19 @@ def parse_orders(orders, fretes=None, reembolsados=None, token=""):
                             ec          = float(opt.get("cost") or 0)
                             import streamlit as _st
                             if ship_status in ("delivered", "not_delivered"):
-                                # Buscar motivo de cancelamento da order
+                                # Buscar extrato financeiro real da order
                                 r2 = requests.get(
-                                    f"https://api.mercadolibre.com/orders/{order_id}/cancellations",
+                                    f"https://api.mercadolibre.com/orders/{order_id}",
                                     headers={"Authorization": f"Bearer {token}"},
                                     timeout=10
                                 )
-                                cancel_data = r2.json() if r2.status_code == 200 else {}
-                                _st.write(f"🔍 order={order_id} | status={ship_status} | bc={bc} | lc={lc} | cancellations={_j.dumps(cancel_data)[:300]}")
+                                if r2.status_code == 200:
+                                    od = r2.json()
+                                    shipping_cost = od.get("shipping_cost")
+                                    taxes         = od.get("taxes", {})
+                                    payments      = od.get("payments", [{}])
+                                    shipping_amt  = payments[0].get("shipping_cost") if payments else None
+                                    _st.write(f"🔍 order={order_id} | ship_status={ship_status} | bc={bc} | lc={lc} | order.shipping_cost={shipping_cost} | payment.shipping_cost={shipping_amt} | taxes={_j.dumps(taxes)[:100]}")
                             if ship_status in ("delivered", "not_delivered"):
                                 frete_ida     = max(lc - ec, 0)
                                 frete_reverso = bc
