@@ -314,20 +314,19 @@ def parse_orders(orders, fretes=None, reembolsados=None, token=""):
                         
                         if ship_resp.status_code == 200:
                             ship_data = ship_resp.json()
-                            # Estrutura real da API ML para cancelados:
-                            # base_cost = valor cheio do frete (sem subsídio) = ex: R$33,70
-                            # list_cost = frete de ida com subsídio 50% ML   = ex: R$16,85
-                            # cost      = excedente pago pelo comprador       = ex: R$0
-                            # frete ida (vendedor) = list_cost - cost         = R$16,85
-                            # frete reverso (sem subsídio) = base_cost        = R$33,70
-                            # prejuízo total = frete_ida + frete_reverso
-                            bc  = float(ship_data.get('base_cost') or 0)
-                            opt = ship_data.get('shipping_option', {})
-                            lc  = float(opt.get('list_cost') or 0)
-                            ec  = float(opt.get('cost') or 0)
-                            frete_ida     = max(lc - ec, 0)  # ida: subsidiado pelo ML
-                            frete_reverso = bc                # reverso: sem subsídio, valor cheio
-                            frete = frete_ida + frete_reverso
+                            import json as _j
+                            ship_status = ship_data.get('status', '')
+                            ship_sub    = ship_data.get('substatus', '')
+                            bc          = ship_data.get('base_cost')
+                            opt         = ship_data.get('shipping_option', {})
+                            ret         = ship_data.get('return_details')
+                            chg         = ship_data.get('charges')
+                            print(f"[CANCEL_SHIP] order={order_id} sid={shipping_id}")
+                            print(f"  status={ship_status} substatus={ship_sub}")
+                            print(f"  base_cost={bc}")
+                            print(f"  shipping_option.list_cost={opt.get('list_cost')} cost={opt.get('cost')}")
+                            print(f"  return_details={_j.dumps(ret)}")
+                            print(f"  charges={_j.dumps(chg)}")
                     except Exception:
                         pass # Em caso de erro, mantém o frete zerado
                 
