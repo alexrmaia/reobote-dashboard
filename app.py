@@ -290,6 +290,11 @@ def parse_orders(orders, fretes=None, reembolsados=None):
                         
                         if ship_resp.status_code == 200:
                             ship_data = ship_resp.json()
+                            import json as _json
+                            print(f"[CANCEL DEBUG] sid={shipping_id} order={order_id}")
+                            print(f"  return_details={_json.dumps(ship_data.get('return_details', {}))}")
+                            print(f"  shipping_option={_json.dumps(ship_data.get('shipping_option', {}))}")
+                            print(f"  status={ship_data.get('status')} substatus={ship_data.get('substatus')}")
                             frete = float(ship_data.get('return_details', {}).get('reverse_shipping_fee', 0.0))
                             if frete == 0.0:
                                 frete = float(ship_data.get('shipping_option', {}).get('cost', 0.0))
