@@ -243,9 +243,12 @@ def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
 def parse_orders(orders, fretes=None, reembolsados=None):
     import requests
     import streamlit as st
+    import pandas as pd
+    
     fretes       = fretes or {}
     reembolsados = reembolsados or {}
     rows = []
+    
     for order in orders:
         order_id    = order.get("id", "")
         status      = order.get("status", "")
@@ -267,7 +270,7 @@ def parse_orders(orders, fretes=None, reembolsados=None):
             # INÍCIO DA NOVA LÓGICA DE CANCELADOS
             # ==========================================
             if cancelada:
-                receita = 0.0
+                receita = unit_price * qty  # MANTÉM A RECEITA para o card "Canceladas" não zerar
                 sale_fee = 0.0
                 frete = 0.0
                 
@@ -286,13 +289,16 @@ def parse_orders(orders, fretes=None, reembolsados=None):
                                 frete = float(ship_data.get('shipping_option', {}).get('cost', 0.0))
                     except Exception:
                         pass # Em caso de erro, mantém o frete zerado
+                
+                # O repasse do ML é apenas o débito do frete reverso (prejuízo)
+                total_ml = -frete
+                
             else:
                 # Lógica original para vendas aprovadas
                 sale_fee   = abs(float(item.get("sale_fee", 0) or 0)) * qty
                 frete      = float(fretes.get(shipping_id, 0) or 0)
                 receita    = unit_price * qty
-            
-            total_ml = receita - sale_fee - frete
+                total_ml   = receita - sale_fee - frete
             # ==========================================
             # FIM DA NOVA LÓGICA
             # ==========================================
@@ -305,6 +311,7 @@ def parse_orders(orders, fretes=None, reembolsados=None):
                 "Cancelada": cancelada,
                 "Reembolsado": reemb_val,
             })
+            
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 def apply_costs_online(df, user_id):
