@@ -1129,17 +1129,26 @@ if st.session_state["aba_ativa"] == "financeiro":
         elif fifo_flag:
             tag_custo = '<span style="background:#EDE9FE;color:#5B21B6;border-radius:4px;padding:1px 5px;font-size:10px;font-weight:700;">FIFO</span> '
 
+        if cancelada:
+            frete_cancel = abs(row['Frete'])
+            lucro_cancel = row['Lucro']  # já é negativo = -frete total
+            cel_frete  = f'<span style="color:#DC2626;font-weight:700;">-R$ {frete_cancel:,.2f}</span>'
+            cel_lucro  = f'<span style="color:#DC2626;font-weight:700;">-R$ {abs(lucro_cancel):,.2f}</span> <span style="background:#FEE2E2;color:#DC2626;border-radius:999px;padding:2px 9px;font-size:12px;font-weight:800;">prejuízo</span>'
+        else:
+            cel_frete = badge(row['Frete'], rec,'#DBEAFE','#1D4ED8')
+            cel_lucro = margem_badge(row.get('Margem %',0), row.get('Lucro',0))
+
         linhas += f"""<tr style="background:{bg_row};border-bottom:1px solid #F1F5F9;">
             <td style="padding:10px 8px;font-weight:800;color:#7C3AED;white-space:nowrap;">{row['SKU']}</td>
             <td style="padding:10px 8px;color:#64748B;font-size:13px;white-space:nowrap;">{pd.to_datetime(row['Data']).strftime('%d/%m/%Y %H:%M')}</td>
             <td style="padding:10px 8px;font-size:18px;text-align:center;">{status_icon(row['Status'])}</td>
             <td style="padding:10px 8px;text-align:center;font-weight:700;">{int(row['Quantidade'])}</td>
-            <td style="padding:10px 8px;font-weight:700;">{badge(rec, fat_total,'#DCFCE7','#15803D')}</td>
-            <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Frete'], rec,'#DBEAFE','#1D4ED8')}</td>
+            <td style="padding:10px 8px;font-weight:700;">{'<span style="color:#DC2626;font-weight:700;">-R$ ' + f'{rec:,.2f}</span>' if cancelada else badge(rec, fat_total,'#DCFCE7','#15803D')}</td>
+            <td style="padding:10px 8px;">{cel_frete}</td>
             <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Taxas ML'], rec,'#FEF3C7','#B45309')}</td>
             <td style="padding:10px 8px;">{'–' if cancelada else f'{tag_custo}{badge(row["Custo Total"], rec, "#EDE9FE","#6D28D9")}'}</td>
             <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Imposto'], rec,'#F1F5F9','#475569')}</td>
-            <td style="padding:10px 8px;text-align:center;">{'<span style="color:#DC2626;font-weight:700;">Cancelada</span>' if cancelada else margem_badge(row.get('Margem %',0), row.get('Lucro',0))}</td>
+            <td style="padding:10px 8px;text-align:center;">{cel_lucro}</td>
             <td style="padding:10px 8px;color:#94A3B8;font-size:12px;white-space:nowrap;">{row['Venda']}</td>
         </tr>"""
 
