@@ -305,30 +305,25 @@ def parse_orders(orders, fretes=None, reembolsados=None, token=""):
                 sale_fee = 0.0
                 frete = 0.0
                 
-                # Busca o frete reverso na API
-                if shipping_id:
+                # Busca frete reverso na API — mesma lógica do diagnóstico
+                if shipping_id and token:
                     try:
-                        headers = {"Authorization": f"Bearer {token}"}
-                        ship_url = f"https://api.mercadolibre.com/shipments/{shipping_id}"
-                        ship_resp = requests.get(ship_url, headers=headers, timeout=10)
-                        
-                        if ship_resp.status_code == 200:
-                            ship_data = ship_resp.json()
-                            import json as _j
-                            ship_status = ship_data.get('status', '')
-                            ship_sub    = ship_data.get('substatus', '')
-                            bc          = ship_data.get('base_cost')
-                            opt         = ship_data.get('shipping_option', {})
-                            ret         = ship_data.get('return_details')
-                            chg         = ship_data.get('charges')
-                            print(f"[CANCEL_SHIP] order={order_id} sid={shipping_id}")
-                            print(f"  status={ship_status} substatus={ship_sub}")
-                            print(f"  base_cost={bc}")
-                            print(f"  shipping_option.list_cost={opt.get('list_cost')} cost={opt.get('cost')}")
-                            print(f"  return_details={_j.dumps(ret)}")
-                            print(f"  charges={_j.dumps(chg)}")
+                        r = requests.get(
+                            f"https://api.mercadolibre.com/shipments/{shipping_id}",
+                            headers={"Authorization": f"Bearer {token}"},
+                            timeout=10
+                        )
+                        if r.status_code == 200:
+                            sd  = r.json()
+                            opt = sd.get("shipping_option", {})
+                            bc  = float(sd.get("base_cost") or 0)
+                            lc  = float(opt.get("list_cost") or 0)
+                            ec  = float(opt.get("cost") or 0)
+                            frete_ida     = max(lc - ec, 0)
+                            frete_reverso = bc
+                            frete = frete_ida + frete_reverso
                     except Exception:
-                        pass # Em caso de erro, mantém o frete zerado
+                        pass
                 
                 # O repasse do ML é apenas o débito do frete reverso (prejuízo)
                 total_ml = -frete
