@@ -754,7 +754,7 @@ if st.session_state["aba_ativa"] == "financeiro":
     fretes_sum  = aprovadas["Frete"].sum()
     custos      = aprovadas["Custo Total"].sum()
     impostos    = aprovadas["Imposto"].sum()
-    lucro_total = aprovadas["Lucro"].sum()
+    lucro_total = aprovadas["Lucro"].sum() + canceladas["Lucro"].sum()
     margem_real = (lucro_total / faturamento * 100) if faturamento > 0 else 0
     # Salva lucro no session_state para uso no ROI do Caixa
     if "lucro_acumulado" not in st.session_state or periodo == "Personalizar":
