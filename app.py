@@ -306,9 +306,6 @@ def parse_orders(orders, fretes=None, reembolsados=None, token=""):
                 frete = 0.0
                 
                 # Busca frete reverso na API — mesma lógica do diagnóstico
-                import streamlit as _st
-                if str(order_id) == "2000016713611572":
-                    _st.warning(f"ORDER 2000016713611572 | cancelada={cancelada} | shipping_id={shipping_id} | token_ok={bool(token)}")
                 if shipping_id and token:
                     try:
                         hdrs = {"Authorization": "Bearer " + token}
@@ -333,16 +330,16 @@ def parse_orders(orders, fretes=None, reembolsados=None, token=""):
                                     if rc.status_code == 200:
                                         cd = rc.json()
                                         cl = cd if isinstance(cd, list) else cd.get("data", [])
+                                        # pdd9939 = arrependimento          → ML subsidia frete reverso
+                                        # pdd9946 = produto chegou quebrado  → ML absorve (culpa transporte)
+                                        # pdd9949 = produto não funciona     → vendedor paga frete reverso
+                                        FRETE_GRATIS = ["pdd9939", "pdd9946"]
                                         for claim in cl:
                                             reason = str(claim.get("reason_id", "") or "").lower()
-                                            _st.write(f"📦 order={order_id} | reason={reason}")
-                                            if "remorse" in reason or "agreement" in reason:
+                                            if reason in FRETE_GRATIS:
                                                 cobra_reverso = False
-                                    else:
-                                        _st.write(f"📦 order={order_id} | claims={rc.status_code} | {rc.text[:300]}")
-                                except Exception as ce:
-                                    import streamlit as _st
-                                    _st.write(f"📦 order={order_id} | err={ce}")
+                                except Exception:
+                                    pass
                                 if cobra_reverso:
                                     frete_ida     = max(lc - ec, 0)
                                     frete_reverso = lc * 2
