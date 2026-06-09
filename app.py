@@ -325,11 +325,11 @@ def parse_orders(orders, fretes=None, reembolsados=None, token=""):
                                 import streamlit as _st
                                 # Buscar motivo da claim para decidir se cobra frete reverso
                                 # Arrependimento = frete gratuito; Problema = frete cobrado
-                                MOTIVOS_FRETE_GRATIS = {
+                                MOTIVOS_FRETE_GRATIS = [
                                     "buyer_remorse",          # arrependimento
                                     "out_of_stock",           # sem estoque
                                     "by_agreement",           # acordo entre partes
-                                }
+                                ]
                                 cobra_reverso = True  # padrão: cobra
                                 try:
                                     rc = requests.get(
