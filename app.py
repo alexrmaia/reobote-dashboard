@@ -314,17 +314,21 @@ def parse_orders(orders, fretes=None, reembolsados=None, token=""):
                             timeout=10
                         )
                         if r.status_code == 200:
-                            import json as _j
                             sd          = r.json()
                             ship_status = sd.get("status", "")
-                            import streamlit as _st
-                            # Log JSON completo só para orders específicas para análise
-                            if str(order_id) in ("2000016614437710", "2000016531151490", "2000016613446658"):
-                                _st.write(f"=== order={order_id} ===")
-                                _st.json(sd)
-                    except Exception as e:
-                        import streamlit as _st
-                        _st.write(f"❌ {order_id} {e}")
+                            opt         = sd.get("shipping_option", {})
+                            lc          = float(opt.get("list_cost") or 0)
+                            ec          = float(opt.get("cost") or 0)
+                            # Fórmula validada com extrato real ML (3 orders confirmadas):
+                            # frete_ida     = list_cost - cost  (subsidiado pelo ML)
+                            # frete_reverso = list_cost * 2     (sem subsídio)
+                            # só cobra se produto foi enviado (delivered/not_delivered)
+                            if ship_status in ("delivered", "not_delivered"):
+                                frete_ida     = max(lc - ec, 0)
+                                frete_reverso = lc * 2
+                                frete = frete_ida + frete_reverso
+                    except Exception:
+                        pass
                 
                 # O repasse do ML é apenas o débito do frete reverso (prejuízo)
                 total_ml = -frete
