@@ -271,7 +271,7 @@ def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
             fretes[sid] = custo
     return fretes
 
-def parse_orders(orders, fretes=None, reembolsados=None):
+def parse_orders(orders, fretes=None, reembolsados=None, token=""):
     import requests
     import streamlit as st
     import pandas as pd
@@ -308,7 +308,6 @@ def parse_orders(orders, fretes=None, reembolsados=None):
                 # Busca o frete reverso na API
                 if shipping_id:
                     try:
-                        token = st.session_state.get("ml_token", "")
                         headers = {"Authorization": f"Bearer {token}"}
                         ship_url = f"https://api.mercadolibre.com/shipments/{shipping_id}"
                         ship_resp = requests.get(ship_url, headers=headers, timeout=10)
@@ -724,7 +723,7 @@ if st.session_state["aba_ativa"] == "financeiro":
     # Detecta reembolsos nas orders já buscadas — sem chamada extra à API
     reembolsados = get_orders_reembolsados(orders)
 
-    df_raw = parse_orders(orders, fretes, reembolsados)
+    df_raw = parse_orders(orders, fretes, reembolsados, token=token)
     if df_raw.empty:
         st.info("Nenhuma venda encontrada.")
         st.stop()
