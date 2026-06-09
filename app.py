@@ -317,29 +317,11 @@ def parse_orders(orders, fretes=None, reembolsados=None, token=""):
                             import json as _j
                             sd          = r.json()
                             ship_status = sd.get("status", "")
-                            opt         = sd.get("shipping_option", {})
-                            bc          = float(sd.get("base_cost") or 0)
-                            lc          = float(opt.get("list_cost") or 0)
-                            ec          = float(opt.get("cost") or 0)
                             import streamlit as _st
-                            if ship_status in ("delivered", "not_delivered"):
-                                # Buscar extrato financeiro real da order
-                                r2 = requests.get(
-                                    f"https://api.mercadolibre.com/orders/{order_id}",
-                                    headers={"Authorization": f"Bearer {token}"},
-                                    timeout=10
-                                )
-                                if r2.status_code == 200:
-                                    od = r2.json()
-                                    shipping_cost = od.get("shipping_cost")
-                                    taxes         = od.get("taxes", {})
-                                    payments      = od.get("payments", [{}])
-                                    shipping_amt  = payments[0].get("shipping_cost") if payments else None
-                                    _st.write(f"🔍 order={order_id} | ship_status={ship_status} | bc={bc} | lc={lc} | order.shipping_cost={shipping_cost} | payment.shipping_cost={shipping_amt} | taxes={_j.dumps(taxes)[:100]}")
-                            if ship_status in ("delivered", "not_delivered"):
-                                frete_ida     = max(lc - ec, 0)
-                                frete_reverso = bc
-                                frete = frete_ida + frete_reverso
+                            # Log JSON completo só para orders específicas para análise
+                            if str(order_id) in ("2000016614437710", "2000016531151490", "2000016613446658"):
+                                _st.write(f"=== order={order_id} ===")
+                                _st.json(sd)
                     except Exception as e:
                         import streamlit as _st
                         _st.write(f"❌ {order_id} {e}")
