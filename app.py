@@ -223,30 +223,32 @@ def get_orders(user_id, token, date_from, date_to):
 
     return list(seen.values())
 
-def diagnostico_cancelamento(token, order_id="2000016674244020"):
+def diagnostico_cancelamento(token, order_id="2000016674244020", st_out=None):
     """Diagnóstico temporário — busca order cancelada e shipment completo."""
     import json as _json
+    def _log(msg):
+        print(msg)
+        if st_out: st_out.write(msg)
     headers = {"Authorization": f"Bearer {token}"}
-    # Buscar a order
     r = requests.get(f"https://api.mercadolibre.com/orders/{order_id}", headers=headers, timeout=15)
     if r.status_code != 200:
-        print(f"[DIAG] Order {order_id} erro: {r.status_code} {r.text[:200]}")
+        _log(f"Order {order_id} erro: {r.status_code} {r.text[:200]}")
         return
     order = r.json()
-    print(f"[DIAG] Order {order_id} status={order.get('status')} date_closed={order.get('date_closed')}")
+    _log(f"Order {order_id} | status={order.get('status')} | date_closed={order.get('date_closed')}")
     shipping_id = order.get("shipping", {}).get("id")
-    print(f"[DIAG] shipping_id={shipping_id}")
+    _log(f"shipping_id={shipping_id}")
     if shipping_id:
         rs = requests.get(f"https://api.mercadolibre.com/shipments/{shipping_id}", headers=headers, timeout=15)
         if rs.status_code == 200:
             ship = rs.json()
-            print(f"[DIAG] shipment status={ship.get('status')} substatus={ship.get('substatus')}")
-            print(f"[DIAG] shipping_option={_json.dumps(ship.get('shipping_option', {}))}")
-            print(f"[DIAG] return_details={_json.dumps(ship.get('return_details', {}))}")
-            print(f"[DIAG] charges={_json.dumps(ship.get('charges', {}))}")
-            print(f"[DIAG] base_cost={ship.get('base_cost')} cost={ship.get('cost')}")
+            _log(f"shipment status={ship.get('status')} substatus={ship.get('substatus')}")
+            _log(f"shipping_option={_json.dumps(ship.get('shipping_option', {}))}")
+            _log(f"return_details={_json.dumps(ship.get('return_details', {}))}")
+            _log(f"charges={_json.dumps(ship.get('charges', {}))}")
+            _log(f"base_cost={ship.get('base_cost')} | cost={ship.get('cost')}")
         else:
-            print(f"[DIAG] Shipment erro: {rs.status_code}")
+            _log(f"Shipment erro: {rs.status_code}")
 
 def get_orders_reembolsados(orders):
     """
@@ -727,9 +729,12 @@ if st.session_state["aba_ativa"] == "financeiro":
         date_to   = agora_br.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
         label_periodo = f"{periodo} • até {agora_br.strftime('%d/%m/%Y')}"
 
+    # DIAGNÓSTICO TEMPORÁRIO — fora do spinner
+    st.warning("🔍 DEBUG cancelamento rodando...")
+    diagnostico_cancelamento(token, st_out=st)
+    st.write("---")
+
     with st.spinner("Buscando vendas..."):
-        # DIAGNÓSTICO TEMPORÁRIO
-        diagnostico_cancelamento(token)
         orders = get_orders(str(user_id), token, date_from, date_to)
 
     if not orders:
