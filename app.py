@@ -322,8 +322,24 @@ def parse_orders(orders, fretes=None, reembolsados=None, token=""):
                             ship_status = sd.get("status", "")
                             import streamlit as _st
                             if str(order_id) == "2000016713611572":
-                                _st.write(f"=== JSON COMPLETO order={order_id} ===")
-                                _st.json(sd)
+                                _st.write(f"=== SHIPMENT FORWARD order={order_id} type={sd.get('type')} ===")
+                                _st.write(f"compensation={sd.get('cost_components',{}).get('compensation')}")
+                                # Buscar shipment de RETORNO separado
+                                r3 = requests.get(
+                                    f"https://api.mercadolibre.com/shipments/search?order_id={order_id}",
+                                    headers={{"Authorization": f"Bearer {token}"}},
+                                    timeout=10
+                                )
+                                _st.write(f"search status={r3.status_code}")
+                                if r3.status_code == 200:
+                                    _st.json(r3.json())
+                                # Tentar também via order
+                                r4 = requests.get(
+                                    f"https://api.mercadolibre.com/orders/{order_id}/shipments",
+                                    headers={{"Authorization": f"Bearer {token}"}},
+                                    timeout=10
+                                )
+                                _st.write(f"order/shipments status={r4.status_code} | {r4.text[:300]}")
                             opt         = sd.get("shipping_option", {})
                             lc          = float(opt.get("list_cost") or 0)
                             ec          = float(opt.get("cost") or 0)
