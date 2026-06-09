@@ -306,6 +306,9 @@ def parse_orders(orders, fretes=None, reembolsados=None, token=""):
                 frete = 0.0
                 
                 # Busca frete reverso na API — mesma lógica do diagnóstico
+                import streamlit as _st
+                if str(order_id) == "2000016713611572":
+                    _st.warning(f"ORDER 2000016713611572 | cancelada={cancelada} | shipping_id={shipping_id} | token_ok={bool(token)}")
                 if shipping_id and token:
                     try:
                         r = requests.get(
@@ -319,18 +322,8 @@ def parse_orders(orders, fretes=None, reembolsados=None, token=""):
                             ship_status = sd.get("status", "")
                             import streamlit as _st
                             if str(order_id) == "2000016713611572":
-                                _st.write(f"=== JSON order={order_id} ship_status={ship_status} ===")
-                                # Mostrar todos os campos relevantes
-                                _st.write(f"base_cost={sd.get('base_cost')}")
-                                _st.write(f"order_cost={sd.get('order_cost')}")
-                                _st.write(f"cost_components={sd.get('cost_components')}")
-                                _st.write(f"return_details={sd.get('return_details')}")
-                                _st.write(f"sibling={sd.get('sibling')}")
-                                _st.write(f"type={sd.get('type')}")
-                                _st.write(f"logistic_type={sd.get('logistic_type')}")
-                                _st.write(f"tags={sd.get('tags')}")
-                                _st.write(f"return_tracking_number={sd.get('return_tracking_number')}")
-                                _st.write(f"status_history={sd.get('status_history')}")
+                                _st.write(f"=== JSON COMPLETO order={order_id} ===")
+                                _st.json(sd)
                             opt         = sd.get("shipping_option", {})
                             lc          = float(opt.get("list_cost") or 0)
                             ec          = float(opt.get("cost") or 0)
