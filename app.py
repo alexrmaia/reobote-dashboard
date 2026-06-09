@@ -311,54 +311,42 @@ def parse_orders(orders, fretes=None, reembolsados=None, token=""):
                     _st.warning(f"ORDER 2000016713611572 | cancelada={cancelada} | shipping_id={shipping_id} | token_ok={bool(token)}")
                 if shipping_id and token:
                     try:
+                        hdrs = {"Authorization": "Bearer " + token}
                         r = requests.get(
-                            f"https://api.mercadolibre.com/shipments/{shipping_id}",
-                            headers={"Authorization": f"Bearer {token}"},
-                            timeout=10
+                            "https://api.mercadolibre.com/shipments/" + str(shipping_id),
+                            headers=hdrs, timeout=10
                         )
                         if r.status_code == 200:
-                            import json as _j
                             sd          = r.json()
                             ship_status = sd.get("status", "")
-                            import streamlit as _st
-                            if ship_status in ("delivered", "not_delivered"):
-                                import streamlit as _st
-                                # Buscar motivo da claim para decidir se cobra frete reverso
-                                # Arrependimento = frete gratuito; Problema = frete cobrado
-                                MOTIVOS_FRETE_GRATIS = [
-                                    "buyer_remorse",          # arrependimento
-                                    "out_of_stock",           # sem estoque
-                                    "by_agreement",           # acordo entre partes
-                                ]
-                                cobra_reverso = True  # padrão: cobra
-                                try:
-                                    rc = requests.get(
-                                        f"https://api.mercadolibre.com/post-purchase/v1/claims/search?order_id={order_id}&role=seller",
-                                        headers={{"Authorization": f"Bearer {token}"}},
-                                        timeout=10
-                                    )
-                                    if rc.status_code == 200:
-                                        claims = rc.json().get("data", [])
-                                        for claim in claims:
-                                            reason = claim.get("reason_id", "") or ""
-                                            _st.write(f"📦 order={order_id} | reason_id={reason} | ship_status={ship_status}")
-                                            if any(m in reason.lower() for m in MOTIVOS_FRETE_GRATIS):
-                                                cobra_reverso = False
-                                    else:
-                                        _st.write(f"📦 order={order_id} | claims status={rc.status_code} | {rc.text[:200]}")
-                                except Exception as ce:
-                                    _st.write(f"📦 order={order_id} | claims erro={ce}")
-                                if cobra_reverso:
-                                    frete_ida     = max(lc - ec, 0)
-                                    frete_reverso = lc * 2
-                                    frete = frete_ida + frete_reverso
                             opt         = sd.get("shipping_option", {})
                             lc          = float(opt.get("list_cost") or 0)
                             ec          = float(opt.get("cost") or 0)
                             if ship_status in ("delivered", "not_delivered"):
-                                frete_ida     = max(lc - ec, 0)
-                                frete_reverso = lc * 2
-                                frete = frete_ida + frete_reverso
+                                cobra_reverso = True
+                                try:
+                                    rc = requests.get(
+                                        "https://api.mercadolibre.com/post-purchase/v1/claims/search?order_id=" + str(order_id) + "&role=seller",
+                                        headers=hdrs, timeout=10
+                                    )
+                                    import streamlit as _st
+                                    if rc.status_code == 200:
+                                        cd = rc.json()
+                                        cl = cd if isinstance(cd, list) else cd.get("data", [])
+                                        for claim in cl:
+                                            reason = str(claim.get("reason_id", "") or "").lower()
+                                            _st.write(f"📦 order={order_id} | reason={reason}")
+                                            if "remorse" in reason or "agreement" in reason:
+                                                cobra_reverso = False
+                                    else:
+                                        _st.write(f"📦 order={order_id} | claims={rc.status_code} | {rc.text[:300]}")
+                                except Exception as ce:
+                                    import streamlit as _st
+                                    _st.write(f"📦 order={order_id} | err={ce}")
+                                if cobra_reverso:
+                                    frete_ida     = max(lc - ec, 0)
+                                    frete_reverso = lc * 2
+                                    frete = frete_ida + frete_reverso
                     except Exception:
                         pass
                 
