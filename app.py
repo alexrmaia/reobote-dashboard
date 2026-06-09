@@ -321,19 +321,23 @@ def parse_orders(orders, fretes=None, reembolsados=None, token=""):
                             bc          = float(sd.get("base_cost") or 0)
                             lc          = float(opt.get("list_cost") or 0)
                             ec          = float(opt.get("cost") or 0)
-                            ret         = sd.get("return_details") or {}
-                            tags        = sd.get("tags", [])
                             import streamlit as _st
                             if ship_status in ("delivered", "not_delivered"):
-                                _st.write(f"🔍 order={order_id} | status={ship_status} | base_cost={bc} | list_cost={lc} | cost={ec} | return_details={_j.dumps(ret)} | tags={tags}")
-                            # delivered/not_delivered = houve envio → paga ida + reverso
-                            # cancelled = nunca saiu → frete R$0
+                                # Buscar motivo de cancelamento da order
+                                r2 = requests.get(
+                                    f"https://api.mercadolibre.com/orders/{order_id}/cancellations",
+                                    headers={"Authorization": f"Bearer {token}"},
+                                    timeout=10
+                                )
+                                cancel_data = r2.json() if r2.status_code == 200 else {}
+                                _st.write(f"🔍 order={order_id} | status={ship_status} | bc={bc} | lc={lc} | cancellations={_j.dumps(cancel_data)[:300]}")
                             if ship_status in ("delivered", "not_delivered"):
                                 frete_ida     = max(lc - ec, 0)
                                 frete_reverso = bc
                                 frete = frete_ida + frete_reverso
                     except Exception as e:
-                        pass
+                        import streamlit as _st
+                        _st.write(f"❌ {order_id} {e}")
                 
                 # O repasse do ML é apenas o débito do frete reverso (prejuízo)
                 total_ml = -frete
