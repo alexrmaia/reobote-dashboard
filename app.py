@@ -1208,66 +1208,84 @@ elif st.session_state["aba_ativa"] == "custos":
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("**📋 Lotes cadastrados**")
 
+        # Inicializar estado de edição
+        if "editing_lote" not in st.session_state:
+            st.session_state["editing_lote"] = None
+
+        # Cabeçalho da tabela
+        h = st.columns([0.6, 0.8, 1.2, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 1.2, 0.4])
+        for col, label in zip(h, ["ID","SKU","Produto","Vigência","Qtd Comp.","Qtd Disp.",
+                                    "Custo Unit.","Frete Forn.","Embalagem","Outros","Margem","Obs.",""]):
+            col.markdown(f"<div style='font-size:11px;font-weight:700;color:#64748B;padding:4px 0;'>{label}</div>", unsafe_allow_html=True)
+        st.markdown("<hr style='margin:2px 0 6px 0;border:none;border-top:2px solid #E2E8F0;'>", unsafe_allow_html=True)
+
         for _, lote in custos_df.iterrows():
-            lote_id  = int(lote["id"])
-            vig_str  = lote["vigencia"].strftime("%d/%m/%Y") if pd.notna(lote["vigencia"]) else "Sem data"
-            qtd_disp = "ESGOTADO" if float(lote["qtd_disponivel"]) < 0 else str(int(float(lote["qtd_disponivel"])))
-            label    = f"**{lote['sku']}** · {lote['produto']} · Vigência {vig_str} · Qtd {qtd_disp} · R$ {float(lote['custo_produto']):.4f}/un"
+            lote_id   = int(lote["id"])
+            is_edit   = st.session_state["editing_lote"] == lote_id
+            vig_str   = lote["vigencia"].strftime("%d/%m/%Y") if pd.notna(lote["vigencia"]) else "Sem data"
+            qtd_disp  = "ESGOTADO" if float(lote["qtd_disponivel"]) < 0 else str(int(float(lote["qtd_disponivel"])))
 
-            with st.expander(label, expanded=False):
-                with st.form(f"edit_lote_{lote_id}", clear_on_submit=False):
-                    ea1, ea2, ea3 = st.columns(3)
-                    with ea1:
-                        e_sku     = st.text_input("SKU", value=str(lote["sku"]))
-                        e_produto = st.text_input("Produto", value=str(lote["produto"]))
-                    with ea2:
-                        e_vig     = st.date_input("Vigência", value=lote["vigencia"].date() if pd.notna(lote["vigencia"]) else date.today())
-                        e_qtd_c   = st.number_input("Qtd Comprada", value=int(lote["qtd_comprada"] or 0), min_value=0, step=1)
-                    with ea3:
-                        e_qtd_d   = st.number_input("Qtd Disponível", value=float(lote["qtd_disponivel"] or 0), step=1.0)
+            cols = st.columns([0.6, 0.8, 1.2, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 1.2, 0.4])
 
-                    eb1, eb2, eb3, eb4, eb5 = st.columns(5)
-                    with eb1:
-                        e_custo   = st.number_input("Custo Unit. (R$)", value=float(lote["custo_produto"] or 0), min_value=0.0, step=0.01, format="%.4f")
-                    with eb2:
-                        e_frete   = st.number_input("Frete Forn. (R$)", value=float(lote["frete_fornecedor"] or 0), min_value=0.0, step=0.01, format="%.4f")
-                    with eb3:
-                        e_embal   = st.number_input("Embalagem (R$)", value=float(lote["embalagem"] or 0), min_value=0.0, step=0.01, format="%.2f")
-                    with eb4:
-                        e_outros  = st.number_input("Outros (R$)", value=float(lote["outros_custos"] or 0), min_value=0.0, step=0.01, format="%.2f")
-                    with eb5:
-                        e_margem  = st.number_input("Margem Alvo (%)", value=float(lote["margem_alvo"] or 0), min_value=0.0, step=0.1, format="%.1f")
+            if not is_edit:
+                # Modo visualização
+                vals = [
+                    str(lote_id),
+                    str(lote["sku"]),
+                    str(lote["produto"]),
+                    vig_str,
+                    str(int(lote["qtd_comprada"] or 0)),
+                    qtd_disp,
+                    f"R$ {float(lote['custo_produto']):.4f}",
+                    f"R$ {float(lote['frete_fornecedor']):.4f}",
+                    f"R$ {float(lote['embalagem']):.2f}",
+                    f"R$ {float(lote['outros_custos']):.2f}",
+                    f"{float(lote['margem_alvo']):.1f}%",
+                    str(lote["observacao"] or ""),
+                ]
+                for col, val in zip(cols[:-1], vals):
+                    col.markdown(f"<div style='font-size:12px;padding:6px 0;color:#0F172A;'>{val}</div>", unsafe_allow_html=True)
+                if cols[-1].button("✏️", key=f"edit_btn_{lote_id}", help="Editar linha"):
+                    st.session_state["editing_lote"] = lote_id
+                    st.rerun()
+            else:
+                # Modo edição inline
+                e_sku    = cols[1].text_input("", value=str(lote["sku"]),    key=f"e_sku_{lote_id}",    label_visibility="collapsed")
+                e_prod   = cols[2].text_input("", value=str(lote["produto"]), key=f"e_prod_{lote_id}",  label_visibility="collapsed")
+                e_vig    = cols[3].text_input("", value=vig_str,              key=f"e_vig_{lote_id}",   label_visibility="collapsed", help="DD/MM/AAAA")
+                e_qtdc   = cols[4].number_input("", value=int(lote["qtd_comprada"] or 0),  min_value=0, step=1,   key=f"e_qtdc_{lote_id}",  label_visibility="collapsed")
+                e_qtdd   = cols[5].number_input("", value=float(lote["qtd_disponivel"] or 0), step=1.0, key=f"e_qtdd_{lote_id}",  label_visibility="collapsed")
+                e_custo  = cols[6].number_input("", value=float(lote["custo_produto"] or 0),  min_value=0.0, step=0.01, format="%.4f", key=f"e_custo_{lote_id}",  label_visibility="collapsed")
+                e_frete  = cols[7].number_input("", value=float(lote["frete_fornecedor"] or 0), min_value=0.0, step=0.01, format="%.4f", key=f"e_frete_{lote_id}", label_visibility="collapsed")
+                e_embal  = cols[8].number_input("", value=float(lote["embalagem"] or 0),  min_value=0.0, step=0.01, format="%.2f", key=f"e_embal_{lote_id}",  label_visibility="collapsed")
+                e_outros = cols[9].number_input("", value=float(lote["outros_custos"] or 0), min_value=0.0, step=0.01, format="%.2f", key=f"e_outros_{lote_id}", label_visibility="collapsed")
+                e_margem = cols[10].number_input("", value=float(lote["margem_alvo"] or 0), min_value=0.0, step=0.1, format="%.1f", key=f"e_margem_{lote_id}", label_visibility="collapsed")
+                e_obs    = cols[11].text_input("", value=str(lote["observacao"] or ""), key=f"e_obs_{lote_id}", label_visibility="collapsed")
 
-                    e_obs = st.text_input("Observação", value=str(lote["observacao"] or ""))
+                if cols[-1].button("💾", key=f"save_btn_{lote_id}", help="Salvar alterações"):
+                    try:
+                        from datetime import datetime as _dt
+                        vig_parsed = _dt.strptime(e_vig, "%d/%m/%Y").strftime("%Y-%m-%d")
+                    except Exception:
+                        vig_parsed = lote["vigencia"].strftime("%Y-%m-%d") if pd.notna(lote["vigencia"]) else None
+                    save_custo(str(user_id), {
+                        "id": lote_id,
+                        "sku": e_sku,
+                        "produto": e_prod,
+                        "vigencia": vig_parsed,
+                        "qtd_comprada": int(e_qtdc),
+                        "qtd_disponivel": float(e_qtdd),
+                        "custo_produto": round(float(e_custo), 4),
+                        "frete_fornecedor": round(float(e_frete), 4),
+                        "embalagem": round(float(e_embal), 4),
+                        "outros_custos": round(float(e_outros), 4),
+                        "margem_alvo": round(float(e_margem), 2),
+                        "observacao": e_obs,
+                    })
+                    st.session_state["editing_lote"] = None
+                    st.rerun()
 
-                    sc1, sc2 = st.columns(2)
-                    with sc1:
-                        salvar = st.form_submit_button("💾 Salvar alterações", type="primary", use_container_width=True)
-                    with sc2:
-                        excluir = st.form_submit_button("🗑️ Excluir lote", use_container_width=True)
-
-                    if salvar:
-                        save_custo(str(user_id), {
-                            "id": lote_id,
-                            "sku": e_sku,
-                            "produto": e_produto,
-                            "vigencia": e_vig.strftime("%Y-%m-%d"),
-                            "qtd_comprada": int(e_qtd_c),
-                            "qtd_disponivel": float(e_qtd_d),
-                            "custo_produto": round(float(e_custo), 4),
-                            "frete_fornecedor": round(float(e_frete), 4),
-                            "embalagem": round(float(e_embal), 4),
-                            "outros_custos": round(float(e_outros), 4),
-                            "margem_alvo": round(float(e_margem), 2),
-                            "observacao": e_obs,
-                        })
-                        st.success("✅ Lote atualizado!")
-                        st.rerun()
-
-                    if excluir:
-                        get_supabase().table("custos_sku").delete().eq("id", lote_id).execute()
-                        st.warning(f"🗑️ Lote #{lote_id} excluído.")
-                        st.rerun()
+            st.markdown("<hr style='margin:2px 0;border:none;border-top:1px solid #F1F5F9;'>", unsafe_allow_html=True)
 
         st.markdown('</div>', unsafe_allow_html=True)
 
