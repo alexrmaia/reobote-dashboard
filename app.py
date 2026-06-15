@@ -1540,64 +1540,67 @@ elif st.session_state["aba_ativa"] == "caixa":
 
     # ── Conciliação do Extrato ──
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="small-title">Conciliação do Extrato</div>', unsafe_allow_html=True)
-    st.caption("Categorize cada lançamento. Entradas em verde, saídas em vermelho. Marque como conciliado após identificar.")
+    pendentes_count = len(extrato_df[~extrato_df["conciliado"]]) if not extrato_df.empty and "conciliado" in extrato_df.columns else 0
+    total_count = len(extrato_df) if not extrato_df.empty else 0
+    _status_label = f"· {pendentes_count} pendentes" if pendentes_count > 0 else "· tudo conciliado ✅"
+    with st.expander(f"📋 Conciliação do Extrato — {total_count} lançamentos {_status_label}", expanded=False):
+        st.caption("Categorize cada lançamento. Entradas em verde, saídas em vermelho. Marque como conciliado após identificar.")
+        if extrato_df.empty:
+            st.info("Nenhum lançamento importado ainda. Faça upload do OFX acima.")
+        else:
+            # Filtros
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                filtro_status = st.radio("Filtrar por:", ["Todos", "Pendentes", "Conciliados"],
+                                         horizontal=True, key="filtro_conciliacao")
+            with fc2:
+                filtro_cat = st.selectbox("Categoria:", ["Todas"] + CATEGORIAS_INTER, key="filtro_cat")
 
-    if extrato_df.empty:
-        st.info("Nenhum lançamento importado ainda. Faça upload do OFX acima.")
-    else:
-        # Filtros
-        fc1, fc2 = st.columns(2)
-        with fc1:
-            filtro_status = st.radio("Filtrar por:", ["Todos", "Pendentes", "Conciliados"],
-                                     horizontal=True, key="filtro_conciliacao")
-        with fc2:
-            filtro_cat = st.selectbox("Categoria:", ["Todas"] + CATEGORIAS_INTER, key="filtro_cat")
+            df_show = extrato_df.copy()
+            if filtro_status == "Pendentes":
+                df_show = df_show[~df_show["conciliado"]]
+            elif filtro_status == "Conciliados":
+                df_show = df_show[df_show["conciliado"]]
+            if filtro_cat != "Todas":
+                df_show = df_show[df_show["categoria"] == filtro_cat]
 
-        df_show = extrato_df.copy()
-        if filtro_status == "Pendentes":
-            df_show = df_show[~df_show["conciliado"]]
-        elif filtro_status == "Conciliados":
-            df_show = df_show[df_show["conciliado"]]
-        if filtro_cat != "Todas":
-            df_show = df_show[df_show["categoria"] == filtro_cat]
+            st.markdown(f"**{len(df_show)} lançamentos**")
 
-        st.markdown(f"**{len(df_show)} lançamentos**")
+            # Tabela de conciliação
+            for idx, row in df_show.iterrows():
+                cor_val = "#16A34A" if row["valor"] >= 0 else "#DC2626"
+                sinal   = "+" if row["valor"] >= 0 else ""
+                concil  = row["conciliado"]
+                bg      = "#F0FDF4" if concil else "white"
 
-        # Tabela de conciliação
-        for idx, row in df_show.iterrows():
-            cor_val = "#16A34A" if row["valor"] >= 0 else "#DC2626"
-            sinal   = "+" if row["valor"] >= 0 else ""
-            concil  = row["conciliado"]
-            bg      = "#F0FDF4" if concil else "white"
+                with st.container():
+                    c1, c2, c3, c4, c5 = st.columns([1.2, 1, 3, 2, 1.5])
+                    with c1:
+                        st.markdown(f"<div style='padding:8px 0;font-size:13px;color:#64748B;'>{pd.to_datetime(row['data']).strftime('%d/%m/%Y') if pd.notna(row['data']) else '–'}</div>", unsafe_allow_html=True)
+                    with c2:
+                        st.markdown(f"<div style='padding:8px 0;font-weight:800;color:{cor_val};'>{sinal}R$ {abs(row['valor']):,.2f}</div>", unsafe_allow_html=True)
+                    with c3:
+                        st.markdown(f"<div style='padding:8px 0;font-size:13px;color:#0F172A;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;'>{str(row['memo'])[:60]}</div>", unsafe_allow_html=True)
+                    with c4:
+                        cat_sel = st.selectbox("", [""] + CATEGORIAS_INTER,
+                                               index=([""] + CATEGORIAS_INTER).index(row["categoria"]) if row["categoria"] in CATEGORIAS_INTER else 0,
+                                               key=f"cat_{row['id']}", label_visibility="collapsed")
+                    with c5:
+                        concil_btn = st.checkbox("✅ Conciliado", value=bool(concil), key=f"conc_{row['id']}")
 
-            with st.container():
-                c1, c2, c3, c4, c5 = st.columns([1.2, 1, 3, 2, 1.5])
-                with c1:
-                    st.markdown(f"<div style='padding:8px 0;font-size:13px;color:#64748B;'>{pd.to_datetime(row['data']).strftime('%d/%m/%Y') if pd.notna(row['data']) else '–'}</div>", unsafe_allow_html=True)
-                with c2:
-                    st.markdown(f"<div style='padding:8px 0;font-weight:800;color:{cor_val};'>{sinal}R$ {abs(row['valor']):,.2f}</div>", unsafe_allow_html=True)
-                with c3:
-                    st.markdown(f"<div style='padding:8px 0;font-size:13px;color:#0F172A;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;'>{str(row['memo'])[:60]}</div>", unsafe_allow_html=True)
-                with c4:
-                    cat_sel = st.selectbox("", [""] + CATEGORIAS_INTER,
-                                           index=([""] + CATEGORIAS_INTER).index(row["categoria"]) if row["categoria"] in CATEGORIAS_INTER else 0,
-                                           key=f"cat_{row['id']}", label_visibility="collapsed")
-                with c5:
-                    concil_btn = st.checkbox("✅ Conciliado", value=bool(concil), key=f"conc_{row['id']}")
+                    obs_key = f"obs_{row['id']}"
+                    obs_val = st.text_input("", value=str(row["observacao"] or ""),
+                                            placeholder="Observação (opcional)",
+                                            key=obs_key, label_visibility="collapsed")
 
-                obs_key = f"obs_{row['id']}"
-                obs_val = st.text_input("", value=str(row["observacao"] or ""),
-                                        placeholder="Observação (opcional)",
-                                        key=obs_key, label_visibility="collapsed")
+                    if cat_sel != row["categoria"] or concil_btn != concil or obs_val != str(row["observacao"] or ""):
+                        update_lancamento(str(user_id), str(row["id"]), cat_sel, obs_val, concil_btn)
+                        st.rerun()
 
-                if cat_sel != row["categoria"] or concil_btn != concil or obs_val != str(row["observacao"] or ""):
-                    update_lancamento(str(user_id), str(row["id"]), cat_sel, obs_val, concil_btn)
-                    st.rerun()
-
-                st.markdown("<hr style='margin:4px 0;border:none;border-top:1px solid #F1F5F9;'>", unsafe_allow_html=True)
+                    st.markdown("<hr style='margin:4px 0;border:none;border-top:1px solid #F1F5F9;'>", unsafe_allow_html=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
+
 
     # ── Agendamentos ──
     st.markdown('<div class="card">', unsafe_allow_html=True)
