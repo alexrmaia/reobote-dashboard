@@ -181,48 +181,23 @@ def get_user_info(user_id, token):
 @st.cache_data(ttl=300, show_spinner=False)
 def get_orders(user_id, token, date_from, date_to):
     headers = {"Authorization": f"Bearer {token}"}
-
-    def _fetch(params_extra):
-        """Busca paginada com parâmetros extras."""
-        results_all, offset, limit = [], 0, 50
-        while True:
-            params = {"seller": user_id, "sort": "date_desc",
-                      "offset": offset, "limit": limit, **params_extra}
-            resp = requests.get(f"{ML_API_BASE}/orders/search",
-                                headers=headers, params=params, timeout=30)
-            if resp.status_code != 200:
-                break
-            data    = resp.json()
-            results = data.get("results", [])
-            results_all.extend(results)
-            paging  = data.get("paging", {})
-            offset += limit
-            if offset >= paging.get("total", 0) or not results:
-                break
-        return results_all
-
-    # 1) Ordens criadas no período (aprovadas + canceladas antes de sair do período)
-    ordens_criadas = _fetch({
-        "order.date_created.from": date_from,
-        "order.date_created.to":   date_to,
-    })
-
-    # 2) Ordens canceladas/fechadas NO período (podem ter sido criadas antes)
-    ordens_fechadas = _fetch({
-        "order.date_closed.from": date_from,
-        "order.date_closed.to":   date_to,
-        "order.status":           "cancelled",
-    })
-
-    # Mesclar sem duplicatas (usar order id como chave)
-    seen = {str(o.get("id")): o for o in ordens_criadas}
-    for o in ordens_fechadas:
-        oid = str(o.get("id"))
-        if oid not in seen:
-            seen[oid] = o
-
-    return list(seen.values())
-
+    orders, offset, limit = [], 0, 50
+    while True:
+        resp = requests.get(f"{ML_API_BASE}/orders/search", headers=headers, params={
+            "seller": user_id, "order.date_created.from": date_from,
+            "order.date_created.to": date_to, "sort": "date_desc",
+            "offset": offset, "limit": limit,
+        }, timeout=30)
+        if resp.status_code != 200:
+            break
+        data = resp.json()
+        results = data.get("results", [])
+        orders.extend(results)
+        paging = data.get("paging", {})
+        offset += limit
+        if offset >= paging.get("total", 0) or not results:
+            break
+    return orders
 
 def get_orders_reembolsados(orders):
     """
@@ -252,16 +227,10 @@ def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
             resp = requests.get(f"{ML_API_BASE}/shipments/{sid}", headers=headers, timeout=15)
             if resp.status_code != 200:
                 return sid, 0.0
-            data = resp.json()
-            opt  = data.get("shipping_option", {})
-            # Estrutura ML:
-            # list_cost = frete total (vendedor + comprador)
-            # cost      = parte extra paga pelo comprador (excede o padrão)
-            # custo do vendedor = list_cost - cost
-            list_cost = float(opt.get("list_cost") or 0)
-            extra_cost = float(opt.get("cost") or 0)
-            cost = max(list_cost - extra_cost, 0)
-            return sid, cost
+            opt = resp.json().get("shipping_option", {})
+            # "cost" = valor real pago pelo vendedor (após subsídio ML); "list_cost" = preço cheio
+            cost = opt.get("cost") or opt.get("base_cost") or opt.get("list_cost") or 0
+            return sid, float(cost)
         except:
             return sid, 0.0
     fretes = {}
@@ -271,7 +240,7 @@ def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
             fretes[sid] = custo
     return fretes
 
-def parse_orders(orders, fretes=None, reembolsados=None, token=""):
+def parse_orders(orders, fretes=None, reembolsados=None):
     import requests
     import streamlit as st
     import pandas as pd
@@ -305,47 +274,21 @@ def parse_orders(orders, fretes=None, reembolsados=None, token=""):
                 sale_fee = 0.0
                 frete = 0.0
                 
-                # Busca frete reverso na API — mesma lógica do diagnóstico
-                if shipping_id and token:
+                # Busca o frete reverso na API
+                if shipping_id:
                     try:
-                        hdrs = {"Authorization": "Bearer " + token}
-                        r = requests.get(
-                            "https://api.mercadolibre.com/shipments/" + str(shipping_id),
-                            headers=hdrs, timeout=10
-                        )
-                        if r.status_code == 200:
-                            sd          = r.json()
-                            ship_status = sd.get("status", "")
-                            opt         = sd.get("shipping_option", {})
-                            lc          = float(opt.get("list_cost") or 0)
-                            ec          = float(opt.get("cost") or 0)
-                            if ship_status in ("delivered", "not_delivered"):
-                                cobra_reverso = True
-                                try:
-                                    rc = requests.get(
-                                        "https://api.mercadolibre.com/post-purchase/v1/claims/search?order_id=" + str(order_id) + "&role=seller",
-                                        headers=hdrs, timeout=10
-                                    )
-                                    import streamlit as _st
-                                    if rc.status_code == 200:
-                                        cd = rc.json()
-                                        cl = cd if isinstance(cd, list) else cd.get("data", [])
-                                        # pdd9939 = arrependimento          → ML subsidia frete reverso
-                                        # pdd9946 = produto chegou quebrado  → ML absorve (culpa transporte)
-                                        # pdd9949 = produto não funciona     → vendedor paga frete reverso
-                                        FRETE_GRATIS = ["pdd9939", "pdd9946"]
-                                        for claim in cl:
-                                            reason = str(claim.get("reason_id", "") or "").lower()
-                                            if reason in FRETE_GRATIS:
-                                                cobra_reverso = False
-                                except Exception:
-                                    pass
-                                if cobra_reverso:
-                                    frete_ida     = max(lc - ec, 0)
-                                    frete_reverso = lc * 2
-                                    frete = frete_ida + frete_reverso
+                        token = st.session_state.get("ml_token", "")
+                        headers = {"Authorization": f"Bearer {token}"}
+                        ship_url = f"https://api.mercadolibre.com/shipments/{shipping_id}"
+                        ship_resp = requests.get(ship_url, headers=headers, timeout=10)
+                        
+                        if ship_resp.status_code == 200:
+                            ship_data = ship_resp.json()
+                            frete = float(ship_data.get('return_details', {}).get('reverse_shipping_fee', 0.0))
+                            if frete == 0.0:
+                                frete = float(ship_data.get('shipping_option', {}).get('cost', 0.0))
                     except Exception:
-                        pass
+                        pass # Em caso de erro, mantém o frete zerado
                 
                 # O repasse do ML é apenas o débito do frete reverso (prejuízo)
                 total_ml = -frete
@@ -739,7 +682,7 @@ if st.session_state["aba_ativa"] == "financeiro":
     # Detecta reembolsos nas orders já buscadas — sem chamada extra à API
     reembolsados = get_orders_reembolsados(orders)
 
-    df_raw = parse_orders(orders, fretes, reembolsados, token=token)
+    df_raw = parse_orders(orders, fretes, reembolsados)
     if df_raw.empty:
         st.info("Nenhuma venda encontrada.")
         st.stop()
@@ -754,7 +697,7 @@ if st.session_state["aba_ativa"] == "financeiro":
     fretes_sum  = aprovadas["Frete"].sum()
     custos      = aprovadas["Custo Total"].sum()
     impostos    = aprovadas["Imposto"].sum()
-    lucro_total = aprovadas["Lucro"].sum() + canceladas["Lucro"].sum()
+    lucro_total = aprovadas["Lucro"].sum()
     margem_real = (lucro_total / faturamento * 100) if faturamento > 0 else 0
     # Salva lucro no session_state para uso no ROI do Caixa
     if "lucro_acumulado" not in st.session_state or periodo == "Personalizar":
@@ -1144,26 +1087,17 @@ if st.session_state["aba_ativa"] == "financeiro":
         elif fifo_flag:
             tag_custo = '<span style="background:#EDE9FE;color:#5B21B6;border-radius:4px;padding:1px 5px;font-size:10px;font-weight:700;">FIFO</span> '
 
-        if cancelada:
-            frete_cancel = abs(row['Frete'])
-            lucro_cancel = row['Lucro']  # já é negativo = -frete total
-            cel_frete  = f'<span style="color:#DC2626;font-weight:700;">-R$ {frete_cancel:,.2f}</span>'
-            cel_lucro  = f'<span style="color:#DC2626;font-weight:700;">-R$ {abs(lucro_cancel):,.2f}</span> <span style="background:#FEE2E2;color:#DC2626;border-radius:999px;padding:2px 9px;font-size:12px;font-weight:800;">prejuízo</span>'
-        else:
-            cel_frete = badge(row['Frete'], rec,'#DBEAFE','#1D4ED8')
-            cel_lucro = margem_badge(row.get('Margem %',0), row.get('Lucro',0))
-
         linhas += f"""<tr style="background:{bg_row};border-bottom:1px solid #F1F5F9;">
             <td style="padding:10px 8px;font-weight:800;color:#7C3AED;white-space:nowrap;">{row['SKU']}</td>
             <td style="padding:10px 8px;color:#64748B;font-size:13px;white-space:nowrap;">{pd.to_datetime(row['Data']).strftime('%d/%m/%Y %H:%M')}</td>
             <td style="padding:10px 8px;font-size:18px;text-align:center;">{status_icon(row['Status'])}</td>
             <td style="padding:10px 8px;text-align:center;font-weight:700;">{int(row['Quantidade'])}</td>
-            <td style="padding:10px 8px;font-weight:700;">{'<span style="color:#DC2626;font-weight:700;">-R$ ' + f'{rec:,.2f}</span>' if cancelada else badge(rec, fat_total,'#DCFCE7','#15803D')}</td>
-            <td style="padding:10px 8px;">{cel_frete}</td>
+            <td style="padding:10px 8px;font-weight:700;">{badge(rec, fat_total,'#DCFCE7','#15803D')}</td>
+            <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Frete'], rec,'#DBEAFE','#1D4ED8')}</td>
             <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Taxas ML'], rec,'#FEF3C7','#B45309')}</td>
             <td style="padding:10px 8px;">{'–' if cancelada else f'{tag_custo}{badge(row["Custo Total"], rec, "#EDE9FE","#6D28D9")}'}</td>
             <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Imposto'], rec,'#F1F5F9','#475569')}</td>
-            <td style="padding:10px 8px;text-align:center;">{cel_lucro}</td>
+            <td style="padding:10px 8px;text-align:center;">{'<span style="color:#DC2626;font-weight:700;">Cancelada</span>' if cancelada else margem_badge(row.get('Margem %',0), row.get('Lucro',0))}</td>
             <td style="padding:10px 8px;color:#94A3B8;font-size:12px;white-space:nowrap;">{row['Venda']}</td>
         </tr>"""
 
@@ -1273,17 +1207,68 @@ elif st.session_state["aba_ativa"] == "custos":
     if not custos_df.empty:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("**📋 Lotes cadastrados**")
-        exibir = custos_df[["id","sku","produto","vigencia","qtd_comprada","qtd_disponivel",
-                             "custo_produto","frete_fornecedor","embalagem","outros_custos","margem_alvo","observacao"]].copy()
-        exibir["vigencia"]       = exibir["vigencia"].apply(lambda x: x.strftime("%d/%m/%Y") if pd.notna(x) else "Sem data")
-        exibir["qtd_disponivel"] = exibir["qtd_disponivel"].apply(lambda x: "ESGOTADO" if float(x)<0 else str(int(float(x))))
-        for c in ["custo_produto","frete_fornecedor","embalagem","outros_custos"]:
-            exibir[c] = exibir[c].apply(lambda x: f"R$ {float(x):.4f}")
-        exibir["margem_alvo"] = exibir["margem_alvo"].apply(lambda x: f"{float(x):.1f}%")
-        st.dataframe(exibir.rename(columns={"id":"ID","sku":"SKU","produto":"Produto","vigencia":"Vigência",
-            "qtd_comprada":"Qtd Comprada","qtd_disponivel":"Qtd Disponível","custo_produto":"Custo Unit.",
-            "frete_fornecedor":"Frete Forn.","embalagem":"Embalagem","outros_custos":"Outros",
-            "margem_alvo":"Margem Alvo","observacao":"Obs."}), use_container_width=True, hide_index=True)
+
+        for _, lote in custos_df.iterrows():
+            lote_id  = int(lote["id"])
+            vig_str  = lote["vigencia"].strftime("%d/%m/%Y") if pd.notna(lote["vigencia"]) else "Sem data"
+            qtd_disp = "ESGOTADO" if float(lote["qtd_disponivel"]) < 0 else str(int(float(lote["qtd_disponivel"])))
+            label    = f"**{lote['sku']}** · {lote['produto']} · Vigência {vig_str} · Qtd {qtd_disp} · R$ {float(lote['custo_produto']):.4f}/un"
+
+            with st.expander(label, expanded=False):
+                with st.form(f"edit_lote_{lote_id}", clear_on_submit=False):
+                    ea1, ea2, ea3 = st.columns(3)
+                    with ea1:
+                        e_sku     = st.text_input("SKU", value=str(lote["sku"]))
+                        e_produto = st.text_input("Produto", value=str(lote["produto"]))
+                    with ea2:
+                        e_vig     = st.date_input("Vigência", value=lote["vigencia"].date() if pd.notna(lote["vigencia"]) else date.today())
+                        e_qtd_c   = st.number_input("Qtd Comprada", value=int(lote["qtd_comprada"] or 0), min_value=0, step=1)
+                    with ea3:
+                        e_qtd_d   = st.number_input("Qtd Disponível", value=float(lote["qtd_disponivel"] or 0), step=1.0)
+
+                    eb1, eb2, eb3, eb4, eb5 = st.columns(5)
+                    with eb1:
+                        e_custo   = st.number_input("Custo Unit. (R$)", value=float(lote["custo_produto"] or 0), min_value=0.0, step=0.01, format="%.4f")
+                    with eb2:
+                        e_frete   = st.number_input("Frete Forn. (R$)", value=float(lote["frete_fornecedor"] or 0), min_value=0.0, step=0.01, format="%.4f")
+                    with eb3:
+                        e_embal   = st.number_input("Embalagem (R$)", value=float(lote["embalagem"] or 0), min_value=0.0, step=0.01, format="%.2f")
+                    with eb4:
+                        e_outros  = st.number_input("Outros (R$)", value=float(lote["outros_custos"] or 0), min_value=0.0, step=0.01, format="%.2f")
+                    with eb5:
+                        e_margem  = st.number_input("Margem Alvo (%)", value=float(lote["margem_alvo"] or 0), min_value=0.0, step=0.1, format="%.1f")
+
+                    e_obs = st.text_input("Observação", value=str(lote["observacao"] or ""))
+
+                    sc1, sc2 = st.columns(2)
+                    with sc1:
+                        salvar = st.form_submit_button("💾 Salvar alterações", type="primary", use_container_width=True)
+                    with sc2:
+                        excluir = st.form_submit_button("🗑️ Excluir lote", use_container_width=True)
+
+                    if salvar:
+                        save_custo(str(user_id), {
+                            "id": lote_id,
+                            "sku": e_sku,
+                            "produto": e_produto,
+                            "vigencia": e_vig.strftime("%Y-%m-%d"),
+                            "qtd_comprada": int(e_qtd_c),
+                            "qtd_disponivel": float(e_qtd_d),
+                            "custo_produto": round(float(e_custo), 4),
+                            "frete_fornecedor": round(float(e_frete), 4),
+                            "embalagem": round(float(e_embal), 4),
+                            "outros_custos": round(float(e_outros), 4),
+                            "margem_alvo": round(float(e_margem), 2),
+                            "observacao": e_obs,
+                        })
+                        st.success("✅ Lote atualizado!")
+                        st.rerun()
+
+                    if excluir:
+                        get_supabase().table("custos_sku").delete().eq("id", lote_id).execute()
+                        st.warning(f"🗑️ Lote #{lote_id} excluído.")
+                        st.rerun()
+
         st.markdown('</div>', unsafe_allow_html=True)
 
 # ══════════════════════════════════════════
