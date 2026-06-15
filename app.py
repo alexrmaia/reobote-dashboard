@@ -1211,59 +1211,48 @@ elif st.session_state["aba_ativa"] == "custos":
         # CSS da tabela de lotes
         st.markdown("""
         <style>
-        .lotes-table { width:100%; border-collapse:collapse; font-family:'Inter',sans-serif; }
-        .lotes-table thead tr {
-            background: linear-gradient(135deg,#1E293B 0%,#0F172A 100%);
-        }
-        .lotes-table thead th {
-            padding: 10px 12px;
-            font-size: 10px;
-            font-weight: 700;
-            letter-spacing: 1.2px;
-            text-transform: uppercase;
-            color: #94A3B8;
-            text-align: left;
-            white-space: nowrap;
-        }
-        .lotes-table tbody tr {
-            border-bottom: 1px solid #F1F5F9;
-            transition: background .15s;
-        }
-        .lotes-table tbody tr:hover { background: #F8FAFC; }
-        .lotes-table tbody tr.editing { background: #FFF7ED; border-left: 3px solid #F59E0B; }
-        .lotes-table td {
-            padding: 11px 12px;
-            font-size: 12.5px;
-            color: #1E293B;
-            vertical-align: middle;
-        }
         .lote-id {
             font-size: 11px; font-weight: 700; color: #94A3B8;
             background: #F1F5F9; border-radius: 6px;
-            padding: 2px 7px; display:inline-block;
+            padding: 3px 8px; display:inline-block;
         }
         .lote-sku {
-            font-size: 12px; font-weight: 800; color: #7C3AED;
+            font-size: 11px; font-weight: 800; color: #7C3AED;
             background: #EDE9FE; border-radius: 6px;
-            padding: 2px 8px; display:inline-block;
+            padding: 3px 8px; display:inline-block;
+            white-space: nowrap;
         }
-        .lote-produto { font-weight: 600; color: #0F172A; }
-        .lote-vig { font-size: 11.5px; color: #64748B; }
-        .lote-qtd { font-weight: 700; color: #0F172A; }
+        .lote-produto { font-weight: 700; color: #0F172A; font-size:13px; }
+        .lote-vig { font-size: 11.5px; color: #64748B; white-space:nowrap; }
+        .lote-qtd { font-weight: 700; color: #0F172A; font-size:13px; }
         .lote-esgotado {
-            font-size: 10px; font-weight: 700; letter-spacing:.5px;
+            font-size: 9px; font-weight: 800; letter-spacing:.8px;
             color: #DC2626; background: #FEE2E2;
-            border-radius: 999px; padding: 2px 8px;
+            border-radius: 999px; padding: 3px 10px;
+            white-space: nowrap; display:inline-block;
         }
-        .lote-valor { font-family: 'Courier New',monospace; font-size: 12px; color: #0F172A; font-weight:600; }
-        .lote-margem { font-weight:700; color:#059669; }
-        .lote-obs { font-size:11px; color:#94A3B8; font-style:italic; }
-        .edit-pencil {
-            cursor:pointer; font-size:14px; padding:4px 8px;
-            border-radius:8px; border:none; background:transparent;
-            color:#94A3B8; transition:all .15s;
+        .lote-valor {
+            font-family: 'Courier New',monospace; font-size: 11.5px;
+            color: #334155; font-weight: 600; white-space:nowrap;
         }
-        .edit-pencil:hover { background:#EDE9FE; color:#7C3AED; }
+        .lote-margem { font-weight: 800; color: #059669; font-size:13px; }
+        .lote-margem-zero { font-weight: 700; color: #94A3B8; font-size:13px; }
+        .lote-obs { font-size: 11px; color: #94A3B8; font-style: italic; }
+        .lote-row-divider {
+            height: 1px;
+            background: linear-gradient(90deg, #E2E8F0 0%, #F8FAFC 60%, transparent 100%);
+            margin: 0;
+        }
+        .lote-header-cell {
+            font-size: 9.5px; font-weight: 800; letter-spacing: 1.2px;
+            text-transform: uppercase; color: #94A3B8;
+            padding: 6px 4px 8px 4px;
+            border-bottom: 2px solid #E2E8F0;
+        }
+        .lote-cell {
+            padding: 10px 4px;
+            display: flex; align-items: center;
+        }
         </style>
         """, unsafe_allow_html=True)
 
@@ -1276,13 +1265,14 @@ elif st.session_state["aba_ativa"] == "custos":
         </div>
         """, unsafe_allow_html=True)
 
-        COLS = [0.45, 0.7, 1.1, 0.75, 0.65, 0.7, 0.85, 0.85, 0.75, 0.7, 0.65, 1.1, 0.35]
+        COLS = [0.45, 0.7, 1.1, 0.75, 0.6, 0.85, 0.85, 0.85, 0.7, 0.65, 0.65, 1.0, 0.35]
         HDRS = ["ID","SKU","Produto","Vigência","Qtd Comp.","Qtd Disp.","Custo Unit.","Frete Forn.","Embalagem","Outros","Margem","Obs.",""]
 
         # Cabeçalho estilizado
         hrow = st.columns(COLS)
         for col, lbl in zip(hrow, HDRS):
-            col.markdown(f"<div style='font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#64748B;padding:6px 4px 4px 4px;border-bottom:2px solid #E2E8F0;'>{lbl}</div>", unsafe_allow_html=True)
+            col.markdown(f"<div class='lote-header-cell'>{lbl}</div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:2px;background:linear-gradient(90deg,#7C3AED22,#E2E8F0,transparent);margin:0 0 4px 0;'></div>", unsafe_allow_html=True)
 
         for i, (_, lote) in enumerate(custos_df.iterrows()):
             lote_id  = int(lote["id"])
@@ -1308,7 +1298,7 @@ elif st.session_state["aba_ativa"] == "custos":
                     f"<div style='background:{bg};padding:8px 4px;'><span class='lote-valor'>R$ {float(lote['frete_fornecedor']):.4f}</span></div>",
                     f"<div style='background:{bg};padding:8px 4px;'><span class='lote-valor'>R$ {float(lote['embalagem']):.2f}</span></div>",
                     f"<div style='background:{bg};padding:8px 4px;'><span class='lote-valor'>R$ {float(lote['outros_custos']):.2f}</span></div>",
-                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-margem'>{float(lote['margem_alvo']):.1f}%</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='{"lote-margem" if float(lote['margem_alvo'])>0 else "lote-margem-zero"}'>{float(lote['margem_alvo']):.1f}%</span></div>",
                     f"<div style='background:{bg};padding:8px 4px;'><span class='lote-obs'>{str(lote['observacao'] or '')}</span></div>",
                 ]):
                     col.markdown(html, unsafe_allow_html=True)
@@ -1349,7 +1339,7 @@ elif st.session_state["aba_ativa"] == "custos":
                     st.session_state["editing_lote"] = None
                     st.rerun()
 
-            st.markdown("<div style='height:1px;background:#F1F5F9;margin:0;'></div>", unsafe_allow_html=True)
+            st.markdown("<div class='lote-row-divider'></div>", unsafe_allow_html=True)
 
         st.markdown('</div>', unsafe_allow_html=True)
 
