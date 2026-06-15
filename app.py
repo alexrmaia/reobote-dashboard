@@ -1205,76 +1205,140 @@ elif st.session_state["aba_ativa"] == "custos":
     st.markdown('</div>', unsafe_allow_html=True)
 
     if not custos_df.empty:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("**📋 Lotes cadastrados**")
-
-        # Inicializar estado de edição
         if "editing_lote" not in st.session_state:
             st.session_state["editing_lote"] = None
 
-        # Cabeçalho da tabela
-        h = st.columns([0.6, 0.8, 1.2, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 1.2, 0.4])
-        for col, label in zip(h, ["ID","SKU","Produto","Vigência","Qtd Comp.","Qtd Disp.",
-                                    "Custo Unit.","Frete Forn.","Embalagem","Outros","Margem","Obs.",""]):
-            col.markdown(f"<div style='font-size:11px;font-weight:700;color:#64748B;padding:4px 0;'>{label}</div>", unsafe_allow_html=True)
-        st.markdown("<hr style='margin:2px 0 6px 0;border:none;border-top:2px solid #E2E8F0;'>", unsafe_allow_html=True)
+        # CSS da tabela de lotes
+        st.markdown("""
+        <style>
+        .lotes-table { width:100%; border-collapse:collapse; font-family:'Inter',sans-serif; }
+        .lotes-table thead tr {
+            background: linear-gradient(135deg,#1E293B 0%,#0F172A 100%);
+        }
+        .lotes-table thead th {
+            padding: 10px 12px;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 1.2px;
+            text-transform: uppercase;
+            color: #94A3B8;
+            text-align: left;
+            white-space: nowrap;
+        }
+        .lotes-table tbody tr {
+            border-bottom: 1px solid #F1F5F9;
+            transition: background .15s;
+        }
+        .lotes-table tbody tr:hover { background: #F8FAFC; }
+        .lotes-table tbody tr.editing { background: #FFF7ED; border-left: 3px solid #F59E0B; }
+        .lotes-table td {
+            padding: 11px 12px;
+            font-size: 12.5px;
+            color: #1E293B;
+            vertical-align: middle;
+        }
+        .lote-id {
+            font-size: 11px; font-weight: 700; color: #94A3B8;
+            background: #F1F5F9; border-radius: 6px;
+            padding: 2px 7px; display:inline-block;
+        }
+        .lote-sku {
+            font-size: 12px; font-weight: 800; color: #7C3AED;
+            background: #EDE9FE; border-radius: 6px;
+            padding: 2px 8px; display:inline-block;
+        }
+        .lote-produto { font-weight: 600; color: #0F172A; }
+        .lote-vig { font-size: 11.5px; color: #64748B; }
+        .lote-qtd { font-weight: 700; color: #0F172A; }
+        .lote-esgotado {
+            font-size: 10px; font-weight: 700; letter-spacing:.5px;
+            color: #DC2626; background: #FEE2E2;
+            border-radius: 999px; padding: 2px 8px;
+        }
+        .lote-valor { font-family: 'Courier New',monospace; font-size: 12px; color: #0F172A; font-weight:600; }
+        .lote-margem { font-weight:700; color:#059669; }
+        .lote-obs { font-size:11px; color:#94A3B8; font-style:italic; }
+        .edit-pencil {
+            cursor:pointer; font-size:14px; padding:4px 8px;
+            border-radius:8px; border:none; background:transparent;
+            color:#94A3B8; transition:all .15s;
+        }
+        .edit-pencil:hover { background:#EDE9FE; color:#7C3AED; }
+        </style>
+        """, unsafe_allow_html=True)
 
-        for _, lote in custos_df.iterrows():
-            lote_id   = int(lote["id"])
-            is_edit   = st.session_state["editing_lote"] == lote_id
-            vig_str   = lote["vigencia"].strftime("%d/%m/%Y") if pd.notna(lote["vigencia"]) else "Sem data"
-            qtd_disp  = "ESGOTADO" if float(lote["qtd_disponivel"]) < 0 else str(int(float(lote["qtd_disponivel"])))
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("""
+        <div style='display:flex;align-items:center;gap:10px;margin-bottom:16px;'>
+          <span style='font-size:18px;'>📋</span>
+          <span style='font-size:15px;font-weight:800;color:#0F172A;'>Lotes cadastrados</span>
+          <span style='font-size:12px;color:#94A3B8;font-weight:500;margin-left:4px;'>Clique no ✏️ para editar uma linha</span>
+        </div>
+        """, unsafe_allow_html=True)
 
-            cols = st.columns([0.6, 0.8, 1.2, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 1.2, 0.4])
+        COLS = [0.45, 0.7, 1.1, 0.75, 0.65, 0.7, 0.85, 0.85, 0.75, 0.7, 0.65, 1.1, 0.35]
+        HDRS = ["ID","SKU","Produto","Vigência","Qtd Comp.","Qtd Disp.","Custo Unit.","Frete Forn.","Embalagem","Outros","Margem","Obs.",""]
+
+        # Cabeçalho estilizado
+        hrow = st.columns(COLS)
+        for col, lbl in zip(hrow, HDRS):
+            col.markdown(f"<div style='font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#64748B;padding:6px 4px 4px 4px;border-bottom:2px solid #E2E8F0;'>{lbl}</div>", unsafe_allow_html=True)
+
+        for i, (_, lote) in enumerate(custos_df.iterrows()):
+            lote_id  = int(lote["id"])
+            is_edit  = st.session_state["editing_lote"] == lote_id
+            vig_str  = lote["vigencia"].strftime("%d/%m/%Y") if pd.notna(lote["vigencia"]) else "–"
+            qtd_d    = float(lote["qtd_disponivel"] or 0)
+            esgotado = qtd_d < 0
+            bg       = "#FFF7ED" if is_edit else ("#F8FAFC" if i % 2 == 0 else "#FFFFFF")
+            border   = "border-left:3px solid #F59E0B;" if is_edit else "border-left:3px solid transparent;"
+
+            row = st.columns(COLS)
 
             if not is_edit:
-                # Modo visualização
-                vals = [
-                    str(lote_id),
-                    str(lote["sku"]),
-                    str(lote["produto"]),
-                    vig_str,
-                    str(int(lote["qtd_comprada"] or 0)),
-                    qtd_disp,
-                    f"R$ {float(lote['custo_produto']):.4f}",
-                    f"R$ {float(lote['frete_fornecedor']):.4f}",
-                    f"R$ {float(lote['embalagem']):.2f}",
-                    f"R$ {float(lote['outros_custos']):.2f}",
-                    f"{float(lote['margem_alvo']):.1f}%",
-                    str(lote["observacao"] or ""),
-                ]
-                for col, val in zip(cols[:-1], vals):
-                    col.markdown(f"<div style='font-size:12px;padding:6px 0;color:#0F172A;'>{val}</div>", unsafe_allow_html=True)
-                if cols[-1].button("✏️", key=f"edit_btn_{lote_id}", help="Editar linha"):
+                qtd_disp_html = f"<span class='lote-esgotado'>ESGOTADO</span>" if esgotado else f"<span class='lote-qtd'>{int(qtd_d)}</span>"
+                for col, html in zip(row, [
+                    f"<div style='background:{bg};padding:8px 4px;{border}'><span class='lote-id'>#{lote_id}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-sku'>{lote['sku']}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-produto'>{lote['produto']}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-vig'>📅 {vig_str}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-qtd'>{int(lote['qtd_comprada'] or 0)}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'>{qtd_disp_html}</div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-valor'>R$ {float(lote['custo_produto']):.4f}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-valor'>R$ {float(lote['frete_fornecedor']):.4f}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-valor'>R$ {float(lote['embalagem']):.2f}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-valor'>R$ {float(lote['outros_custos']):.2f}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-margem'>{float(lote['margem_alvo']):.1f}%</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-obs'>{str(lote['observacao'] or '')}</span></div>",
+                ]):
+                    col.markdown(html, unsafe_allow_html=True)
+                if row[-1].button("✏️", key=f"edit_btn_{lote_id}", help="Editar linha"):
                     st.session_state["editing_lote"] = lote_id
                     st.rerun()
             else:
-                # Modo edição inline
-                e_sku    = cols[1].text_input("", value=str(lote["sku"]),    key=f"e_sku_{lote_id}",    label_visibility="collapsed")
-                e_prod   = cols[2].text_input("", value=str(lote["produto"]), key=f"e_prod_{lote_id}",  label_visibility="collapsed")
-                e_vig    = cols[3].text_input("", value=vig_str,              key=f"e_vig_{lote_id}",   label_visibility="collapsed", help="DD/MM/AAAA")
-                e_qtdc   = cols[4].number_input("", value=int(lote["qtd_comprada"] or 0),  min_value=0, step=1,   key=f"e_qtdc_{lote_id}",  label_visibility="collapsed")
-                e_qtdd   = cols[5].number_input("", value=float(lote["qtd_disponivel"] or 0), step=1.0, key=f"e_qtdd_{lote_id}",  label_visibility="collapsed")
-                e_custo  = cols[6].number_input("", value=float(lote["custo_produto"] or 0),  min_value=0.0, step=0.01, format="%.4f", key=f"e_custo_{lote_id}",  label_visibility="collapsed")
-                e_frete  = cols[7].number_input("", value=float(lote["frete_fornecedor"] or 0), min_value=0.0, step=0.01, format="%.4f", key=f"e_frete_{lote_id}", label_visibility="collapsed")
-                e_embal  = cols[8].number_input("", value=float(lote["embalagem"] or 0),  min_value=0.0, step=0.01, format="%.2f", key=f"e_embal_{lote_id}",  label_visibility="collapsed")
-                e_outros = cols[9].number_input("", value=float(lote["outros_custos"] or 0), min_value=0.0, step=0.01, format="%.2f", key=f"e_outros_{lote_id}", label_visibility="collapsed")
-                e_margem = cols[10].number_input("", value=float(lote["margem_alvo"] or 0), min_value=0.0, step=0.1, format="%.1f", key=f"e_margem_{lote_id}", label_visibility="collapsed")
-                e_obs    = cols[11].text_input("", value=str(lote["observacao"] or ""), key=f"e_obs_{lote_id}", label_visibility="collapsed")
+                row[0].markdown(f"<div style='padding:8px 4px;{border}'><span class='lote-id'>#{lote_id}</span></div>", unsafe_allow_html=True)
+                e_sku    = row[1].text_input("",  value=str(lote["sku"]),     key=f"e_sku_{lote_id}",    label_visibility="collapsed")
+                e_prod   = row[2].text_input("",  value=str(lote["produto"]), key=f"e_prod_{lote_id}",   label_visibility="collapsed")
+                e_vig    = row[3].text_input("",  value=vig_str,              key=f"e_vig_{lote_id}",    label_visibility="collapsed", help="DD/MM/AAAA")
+                e_qtdc   = row[4].number_input("", value=int(lote["qtd_comprada"] or 0), min_value=0, step=1, key=f"e_qtdc_{lote_id}", label_visibility="collapsed")
+                e_qtdd   = row[5].number_input("", value=qtd_d, step=1.0, key=f"e_qtdd_{lote_id}", label_visibility="collapsed")
+                e_custo  = row[6].number_input("", value=float(lote["custo_produto"] or 0), min_value=0.0, step=0.01, format="%.4f", key=f"e_custo_{lote_id}", label_visibility="collapsed")
+                e_frete  = row[7].number_input("", value=float(lote["frete_fornecedor"] or 0), min_value=0.0, step=0.01, format="%.4f", key=f"e_frete_{lote_id}", label_visibility="collapsed")
+                e_embal  = row[8].number_input("", value=float(lote["embalagem"] or 0), min_value=0.0, step=0.01, format="%.2f", key=f"e_embal_{lote_id}", label_visibility="collapsed")
+                e_outros = row[9].number_input("", value=float(lote["outros_custos"] or 0), min_value=0.0, step=0.01, format="%.2f", key=f"e_outros_{lote_id}", label_visibility="collapsed")
+                e_margem = row[10].number_input("", value=float(lote["margem_alvo"] or 0), min_value=0.0, step=0.1, format="%.1f", key=f"e_margem_{lote_id}", label_visibility="collapsed")
+                e_obs    = row[11].text_input("", value=str(lote["observacao"] or ""), key=f"e_obs_{lote_id}", label_visibility="collapsed")
 
-                if cols[-1].button("💾", key=f"save_btn_{lote_id}", help="Salvar alterações"):
+                if row[-1].button("💾", key=f"save_btn_{lote_id}", help="Salvar"):
                     try:
                         from datetime import datetime as _dt
                         vig_parsed = _dt.strptime(e_vig, "%d/%m/%Y").strftime("%Y-%m-%d")
                     except Exception:
                         vig_parsed = lote["vigencia"].strftime("%Y-%m-%d") if pd.notna(lote["vigencia"]) else None
                     save_custo(str(user_id), {
-                        "id": lote_id,
-                        "sku": e_sku,
-                        "produto": e_prod,
+                        "id": lote_id, "sku": e_sku, "produto": e_prod,
                         "vigencia": vig_parsed,
-                        "qtd_comprada": int(e_qtdc),
-                        "qtd_disponivel": float(e_qtdd),
+                        "qtd_comprada": int(e_qtdc), "qtd_disponivel": float(e_qtdd),
                         "custo_produto": round(float(e_custo), 4),
                         "frete_fornecedor": round(float(e_frete), 4),
                         "embalagem": round(float(e_embal), 4),
@@ -1285,7 +1349,7 @@ elif st.session_state["aba_ativa"] == "custos":
                     st.session_state["editing_lote"] = None
                     st.rerun()
 
-            st.markdown("<hr style='margin:2px 0;border:none;border-top:1px solid #F1F5F9;'>", unsafe_allow_html=True)
+            st.markdown("<div style='height:1px;background:#F1F5F9;margin:0;'></div>", unsafe_allow_html=True)
 
         st.markdown('</div>', unsafe_allow_html=True)
 
