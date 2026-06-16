@@ -679,23 +679,6 @@ if st.session_state["aba_ativa"] == "financeiro":
     shipping_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in orders if o.get("shipping",{}).get("id")}))
     token_hash   = token[-8:] if token else ""
 
-    # DIAGNÓSTICO TEMPORÁRIO — fora do cache
-    _order_diag = "2000016950701722"
-    _order_data = next((o for o in orders if str(o.get("id")) == _order_diag), None)
-    if _order_data:
-        _sid = _order_data.get("shipping", {}).get("id")
-        st.warning(f"🔍 DIAG order={_order_diag} | shipping_id={_sid}")
-        if _sid and token:
-            import requests as _rq
-            import json as _jj
-            _r = _rq.get(f"https://api.mercadolibre.com/shipments/{_sid}",
-                         headers={"Authorization": f"Bearer {token}"}, timeout=15)
-            if _r.status_code == 200:
-                _sd = _r.json()
-                _opt = _sd.get("shipping_option", {})
-                st.write(f"list_cost={_opt.get('list_cost')} | cost={_opt.get('cost')} | base_cost={_sd.get('base_cost')} | status={_sd.get('status')}")
-                st.write(f"cost_components={_sd.get('cost_components')}")
-
     with st.spinner("Buscando fretes..."):
         fretes       = fetch_fretes_batch(shipping_ids, token_hash, token)
     # Detecta reembolsos nas orders já buscadas — sem chamada extra à API
