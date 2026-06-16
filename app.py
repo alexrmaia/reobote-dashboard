@@ -1999,6 +1999,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
             _df_to   = f"{ano}-{mes:02d}-{_ultimo_dia:02d}T23:59:59.000-03:00"
             with st.spinner("Buscando dados do período..."):
                 _orders = get_orders(str(user_id), token, _df_from, _df_to)
+                st.write(f"DEBUG: {len(_orders)} ordens encontradas de {_df_from[:10]} a {_df_to[:10]}")
                 if _orders:
                     _ship_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in _orders if o.get("shipping",{}).get("id")}))
                     _tok_hash = token[-8:] if token else ""
@@ -2024,6 +2025,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
                     _est      = sum(float(r.get("qtd_disponivel",0)) * float(r.get("custo_produto",0))
                                    for _, r in _cdf.iterrows() if float(r.get("qtd_disponivel",0)) > 0) if not _cdf.empty else 0
 
+                    st.write(f"DEBUG salvar: fat={round(_fat,2)} luc={round(_luc,2)} ped={_ped}")
                     save_fechamento(str(user_id), {
                         "ano_mes": ano_mes,
                         "faturamento_bruto": round(_fat, 2),
