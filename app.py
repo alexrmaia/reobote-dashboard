@@ -2044,17 +2044,17 @@ elif st.session_state["aba_ativa"] == "fechamento":
                     _tok_hash = token[-8:] if token else ""
                     _fretes   = fetch_fretes_batch(_ship_ids, _tok_hash, token)
 
-                    # Processar aprovadas
-                    _reimb_a  = get_orders_reembolsados(_orders_aprov)
-                    _df_a_raw = parse_orders(_orders_aprov, _fretes, _reimb_a)
+                    # Processar aprovadas — forçar reembolsados vazio
+                    # para não marcar como cancelada vendas devolvidas em outro mês
+                    _df_a_raw = parse_orders(_orders_aprov, _fretes, {})
                     _df_a     = apply_costs_online(_df_a_raw, str(user_id))
-                    _aprov    = _df_a[~_df_a["Cancelada"]]
+                    _aprov    = _df_a  # todas são aprovadas por definição
 
-                    # Processar canceladas do mês
+                    # Processar canceladas — apenas as com date_closed no mês
                     _reimb_c  = get_orders_reembolsados(_orders_cancel)
                     _df_c_raw = parse_orders(_orders_cancel, _fretes, _reimb_c)
                     _df_c     = apply_costs_online(_df_c_raw, str(user_id))
-                    _cancel   = _df_c[_df_c["Cancelada"]]
+                    _cancel   = _df_c  # todas são canceladas por definição
 
                     _fat      = _aprov["Receita Bruta"].sum()
                     _devol    = abs(_cancel["Receita Bruta"].sum())
