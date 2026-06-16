@@ -614,15 +614,15 @@ nickname = get_user_info(str(user_id), token).get("nickname", "Vendedor")
 if "aba_ativa" not in st.session_state:
     st.session_state["aba_ativa"] = "financeiro"
 
-nav_cols = st.columns([2, 2, 2, 2, 4])
-abas = [("financeiro","📊 Financeiro"), ("custos","📦 Custos"), ("regime","🏛️ Regime"), ("caixa","💰 Caixa")]
-for col, (aba_id, aba_label) in zip(nav_cols[:4], abas):
+nav_cols = st.columns([2, 2, 2, 2, 2, 4])
+abas = [("financeiro","📊 Financeiro"), ("custos","📦 Custos"), ("regime","🏛️ Regime"), ("caixa","💰 Caixa"), ("fechamento","📅 Fechamento")]
+for col, (aba_id, aba_label) in zip(nav_cols[:5], abas):
     with col:
         if st.button(aba_label, use_container_width=True,
                      type="primary" if st.session_state["aba_ativa"] == aba_id else "secondary"):
             st.session_state["aba_ativa"] = aba_id
             st.rerun()
-with nav_cols[4]:
+with nav_cols[5]:
     c1, c2 = st.columns([1,1])
     with c2:
         if st.button("🔓 Sair", use_container_width=True):
@@ -1767,3 +1767,322 @@ elif st.session_state["aba_ativa"] == "caixa":
     else:
         st.info("Nenhum lançamento registrado ainda. Use o formulário acima para começar.")
     st.markdown('</div>', unsafe_allow_html=True)
+
+# ══════════════════════════════════════════
+# ABA: FECHAMENTO MENSAL
+# ══════════════════════════════════════════
+elif st.session_state["aba_ativa"] == "fechamento":
+    import calendar
+    from datetime import date as _date
+
+    # ── Funções Supabase para fechamentos ──
+    def get_fechamentos(uid):
+        try:
+            r = get_supabase().table("fechamentos_mensais")\
+                .select("*").eq("user_id", uid).order("ano_mes", desc=True).execute()
+            return r.data or []
+        except Exception:
+            return []
+
+    def save_fechamento(uid, dados):
+        try:
+            get_supabase().table("fechamentos_mensais").upsert(
+                {"user_id": uid, **dados}, on_conflict="user_id,ano_mes"
+            ).execute()
+        except Exception as e:
+            st.error(f"Erro ao salvar: {e}")
+
+    fechamentos = get_fechamentos(str(user_id))
+    fechamentos_map = {f["ano_mes"]: f for f in fechamentos}
+
+    # ── Navegação de mês ──
+    hoje = _date.today()
+    if "fech_ano" not in st.session_state:
+        st.session_state["fech_ano"]  = hoje.year
+        st.session_state["fech_mes"]  = hoje.month - 1 if hoje.month > 1 else 12
+        if hoje.month == 1:
+            st.session_state["fech_ano"] = hoje.year - 1
+
+    ano  = st.session_state["fech_ano"]
+    mes  = st.session_state["fech_mes"]
+    ano_mes = f"{ano}-{mes:02d}"
+    nome_mes = ["", "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+                "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"][mes]
+
+    fechado = ano_mes in fechamentos_map
+    dados_fech = fechamentos_map.get(ano_mes, {})
+
+    # ── Topo ──
+    st.markdown('<div style="padding:0 0 1.5rem 0;">', unsafe_allow_html=True)
+    t1, t2, t3 = st.columns([0.5, 2, 1])
+    with t1:
+        if st.button("◀", key="fech_prev"):
+            if mes == 1:
+                st.session_state["fech_mes"] = 12
+                st.session_state["fech_ano"] = ano - 1
+            else:
+                st.session_state["fech_mes"] = mes - 1
+            st.rerun()
+    with t2:
+        st.markdown(f"""
+        <div style='text-align:center;'>
+          <div style='font-size:22px;font-weight:700;color:var(--color-text-primary,#0F172A);'>{nome_mes} {ano}</div>
+          <div style='font-size:12px;color:#64748B;margin-top:2px;'>
+            {"✅ Fechado em " + dados_fech.get("fechado_em","")[:10] if fechado else "⏳ Aguardando fechamento"}
+          </div>
+        </div>""", unsafe_allow_html=True)
+    with t3:
+        if st.button("▶", key="fech_next"):
+            if mes == 12:
+                st.session_state["fech_mes"] = 1
+                st.session_state["fech_ano"] = ano + 1
+            else:
+                st.session_state["fech_mes"] = mes + 1
+            st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if fechado:
+        # ── Exibir fechamento salvo ──
+        d = dados_fech
+        fat     = float(d.get("faturamento_bruto", 0))
+        devol   = float(d.get("devolucoes", 0))
+        fat_liq = fat - devol
+        tarifas = float(d.get("tarifas_ml", 0))
+        fretes  = float(d.get("frete_ml", 0))
+        custos  = float(d.get("custo_produto", 0))
+        impostos= float(d.get("impostos", 0))
+        lucro   = float(d.get("lucro_liquido", 0))
+        margem  = float(d.get("margem", 0))
+        pedidos = int(d.get("pedidos", 0))
+        canceladas_n = int(d.get("canceladas", 0))
+        ticket  = float(d.get("ticket_medio", 0))
+        estoque = float(d.get("estoque_valor", 0))
+
+        # Waterfall
+        st.markdown(f"""
+        <div style='display:grid;grid-template-columns:repeat(6,1fr);border:1px solid #E2E8F0;border-radius:16px;overflow:hidden;margin-bottom:20px;'>
+          <div style='padding:16px 14px;background:white;border-right:1px solid #E2E8F0;'>
+            <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Faturamento bruto</div>
+            <div style='font-size:20px;font-weight:800;color:#0F172A;'>R$ {fat:,.0f}</div>
+            <div style='font-size:11px;color:#64748B;margin-top:2px;'>{pedidos} pedidos</div>
+            <div style='height:3px;background:#7C3AED;border-radius:99px;margin-top:10px;'></div>
+          </div>
+          <div style='padding:16px 14px;background:white;border-right:1px solid #E2E8F0;'>
+            <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Devoluções</div>
+            <div style='font-size:20px;font-weight:800;color:#DC2626;'>− R$ {devol:,.0f}</div>
+            <div style='font-size:11px;color:#64748B;margin-top:2px;'>{canceladas_n} pedidos</div>
+            <div style='height:3px;background:#FCA5A5;border-radius:99px;margin-top:10px;'></div>
+          </div>
+          <div style='padding:16px 14px;background:#F8FAFC;border-right:1px solid #E2E8F0;'>
+            <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Receita líquida</div>
+            <div style='font-size:20px;font-weight:800;color:#0F172A;'>R$ {fat_liq:,.0f}</div>
+            <div style='font-size:11px;color:#64748B;margin-top:2px;'>após devoluções</div>
+            <div style='height:3px;background:#94A3B8;border-radius:99px;margin-top:10px;'></div>
+          </div>
+          <div style='padding:16px 14px;background:white;border-right:1px solid #E2E8F0;'>
+            <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Tarifas + Frete</div>
+            <div style='font-size:20px;font-weight:800;color:#DC2626;'>− R$ {tarifas+fretes:,.0f}</div>
+            <div style='font-size:11px;color:#64748B;margin-top:2px;'>ML + envios</div>
+            <div style='height:3px;background:#FCA5A5;border-radius:99px;margin-top:10px;'></div>
+          </div>
+          <div style='padding:16px 14px;background:white;border-right:1px solid #E2E8F0;'>
+            <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Custo + Impostos</div>
+            <div style='font-size:20px;font-weight:800;color:#DC2626;'>− R$ {custos+impostos:,.0f}</div>
+            <div style='font-size:11px;color:#64748B;margin-top:2px;'>produto + 4%</div>
+            <div style='height:3px;background:#FCA5A5;border-radius:99px;margin-top:10px;'></div>
+          </div>
+          <div style='padding:16px 14px;background:#F0FDF4;'>
+            <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Lucro líquido</div>
+            <div style='font-size:20px;font-weight:800;color:#16A34A;'>R$ {lucro:,.0f}</div>
+            <div style='font-size:11px;color:#16A34A;font-weight:700;margin-top:2px;'>margem {margem:.1f}%</div>
+            <div style='height:3px;background:#16A34A;border-radius:99px;margin-top:10px;'></div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Métricas rápidas
+        m1, m2, m3, m4 = st.columns(4)
+        for col, label, val, sub in [
+            (m1, "Ticket médio",        f"R$ {ticket:,.2f}",     f"lucro/venda R$ {lucro/pedidos:.2f}" if pedidos else "–"),
+            (m2, "Taxa cancelamento",   f"{(canceladas_n/(pedidos+canceladas_n)*100):.1f}%" if pedidos+canceladas_n else "–", f"{canceladas_n} de {pedidos+canceladas_n} pedidos"),
+            (m3, "Estoque em caixa",    f"R$ {estoque:,.0f}",    "valor no fechamento"),
+            (m4, "Margem líquida",      f"{margem:.1f}%",        f"lucro R$ {lucro:,.0f}"),
+        ]:
+            col.markdown(f"""
+            <div style='background:#F8FAFC;border-radius:12px;padding:14px 16px;'>
+              <div style='font-size:11px;color:#64748B;margin-bottom:6px;'>{label}</div>
+              <div style='font-size:22px;font-weight:800;color:#0F172A;'>{val}</div>
+              <div style='font-size:11px;color:#94A3B8;margin-top:3px;'>{sub}</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # DRE + Histórico lado a lado
+        col_dre, col_hist = st.columns(2)
+
+        with col_dre:
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown(f"**📋 DRE · {nome_mes} {ano}**")
+            linhas_dre = [
+                ("Receita bruta",     f"R$ {fat:,.2f}",              False),
+                ("  Devoluções",      f"− R$ {devol:,.2f}",          True),
+                ("Receita líquida",   f"R$ {fat_liq:,.2f}",          False),
+                ("  Tarifas ML",      f"− R$ {tarifas:,.2f}",        True),
+                ("  Frete ML",        f"− R$ {fretes:,.2f}",         True),
+                ("  Custo produto",   f"− R$ {custos:,.2f}",         True),
+                ("  Impostos (4%)",   f"− R$ {impostos:,.2f}",       True),
+                ("Lucro líquido",     f"R$ {lucro:,.2f}",            False),
+            ]
+            for label, valor, negativo in linhas_dre:
+                peso = "font-weight:800;" if "líquido" in label or "bruta" in label else ""
+                cor  = "color:#DC2626;" if negativo else ("color:#16A34A;" if "Lucro" in label else "")
+                borda = "border-top:2px solid #E2E8F0;margin-top:4px;padding-top:8px;" if "líquido" in label or "Lucro" in label else ""
+                st.markdown(f"""
+                <div style='display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #F1F5F9;font-size:13px;{borda}'>
+                  <span style='color:#64748B;{peso}'>{label}</span>
+                  <span style='{cor}{peso}'>{valor}</span>
+                </div>""", unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        with col_hist:
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown("**📈 Histórico mensal**")
+            if fechamentos:
+                max_fat = max(float(f.get("faturamento_bruto", 0)) for f in fechamentos)
+                for f in fechamentos[:6]:
+                    fm = f["ano_mes"]
+                    ano_h, mes_h = int(fm[:4]), int(fm[5:7])
+                    nome_h = ["","Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"][mes_h]
+                    fat_h  = float(f.get("faturamento_bruto", 0))
+                    luc_h  = float(f.get("lucro_liquido", 0))
+                    mar_h  = float(f.get("margem", 0))
+                    pct    = int(fat_h / max_fat * 100) if max_fat > 0 else 0
+                    atual  = fm == ano_mes
+                    st.markdown(f"""
+                    <div style='display:grid;grid-template-columns:55px 1fr 80px 55px;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #F1F5F9;font-size:12px;'>
+                      <span style='{"font-weight:800;color:#7C3AED;" if atual else "color:#64748B;"}'>{nome_h} {str(ano_h)[2:]}</span>
+                      <div>
+                        <div style='font-size:10px;color:#94A3B8;margin-bottom:2px;'>R$ {fat_h:,.0f}</div>
+                        <div style='background:#F1F5F9;border-radius:99px;height:6px;overflow:hidden;'>
+                          <div style='height:6px;border-radius:99px;background:#7C3AED;width:{pct}%;'></div>
+                        </div>
+                      </div>
+                      <span style='color:{"#16A34A" if luc_h >= 0 else "#DC2626"};font-weight:700;'>R$ {luc_h:,.0f}</span>
+                      <span style='text-align:right;color:{"#16A34A" if mar_h >= 15 else "#64748B"};font-weight:700;'>{mar_h:.1f}%</span>
+                    </div>""", unsafe_allow_html=True)
+            else:
+                st.info("Nenhum mês fechado ainda.")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        # Botão reabrir
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔓 Reabrir e editar este fechamento", key="reabrir_fech"):
+            del fechamentos_map[ano_mes]
+            fechados_novos = [f for f in fechamentos if f["ano_mes"] != ano_mes]
+            get_supabase().table("fechamentos_mensais")\
+                .delete().eq("user_id", str(user_id)).eq("ano_mes", ano_mes).execute()
+            st.rerun()
+
+    else:
+        # ── Formulário de fechamento ──
+        st.info(f"ℹ️ {nome_mes} {ano} ainda não foi fechado. Preencha os dados abaixo ou clique em **Fechar automaticamente** para importar do dashboard.")
+
+        # Botão fechar automático
+        if st.button("⚡ Fechar automaticamente (importar do dashboard)", type="primary", key="auto_fech"):
+            # Buscar dados do período
+            import zoneinfo as _zi
+            _tz = _zi.ZoneInfo("America/Sao_Paulo")
+            from datetime import datetime as _dtt
+            import calendar as _cal
+            _ultimo_dia = _cal.monthrange(ano, mes)[1]
+            _df_from = f"{ano}-{mes:02d}-01T00:00:00.000-03:00"
+            _df_to   = f"{ano}-{mes:02d}-{_ultimo_dia:02d}T23:59:59.000-03:00"
+            with st.spinner("Buscando dados do período..."):
+                _orders = get_orders(str(user_id), token, _df_from, _df_to)
+                if _orders:
+                    _ship_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in _orders if o.get("shipping",{}).get("id")}))
+                    _tok_hash = token[-8:] if token else ""
+                    _fretes   = fetch_fretes_batch(_ship_ids, _tok_hash, token)
+                    _reimb    = get_reembolsados(str(user_id), _tok_hash, token, _df_from, _df_to)
+                    _df       = parse_orders(_orders, _fretes, _reimb, token=token)
+                    _aprov    = _df[~_df["Cancelada"]]
+                    _cancel   = _df[_df["Cancelada"]]
+                    _fat      = _aprov["Receita Bruta"].sum()
+                    _devol    = abs(_cancel["Receita Bruta"].sum())
+                    _tar      = _aprov["Taxas ML"].sum()
+                    _frt      = _aprov["Frete"].sum()
+                    _cst      = _aprov["Custo Total"].sum()
+                    _imp      = _aprov["Imposto"].sum()
+                    _luc      = _aprov["Lucro"].sum() + _cancel["Lucro"].sum()
+                    _mar      = (_luc / _fat * 100) if _fat > 0 else 0
+                    _ped      = len(_aprov)
+                    _can_n    = len(_cancel)
+                    _tick     = _fat / _ped if _ped else 0
+                    # Estoque atual
+                    _cdf      = load_custos(str(user_id))
+                    _est      = sum(float(r.get("qtd_disponivel",0)) * float(r.get("custo_produto",0))
+                                   for _, r in _cdf.iterrows() if float(r.get("qtd_disponivel",0)) > 0) if not _cdf.empty else 0
+
+                    save_fechamento(str(user_id), {
+                        "ano_mes": ano_mes,
+                        "faturamento_bruto": round(_fat, 2),
+                        "devolucoes": round(_devol, 2),
+                        "tarifas_ml": round(_tar, 2),
+                        "frete_ml": round(_frt, 2),
+                        "custo_produto": round(_cst, 2),
+                        "impostos": round(_imp, 2),
+                        "lucro_liquido": round(_luc, 2),
+                        "margem": round(_mar, 2),
+                        "pedidos": _ped,
+                        "canceladas": _can_n,
+                        "ticket_medio": round(_tick, 2),
+                        "estoque_valor": round(_est, 2),
+                        "fechado_em": _dtt.now(_tz).strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                    st.success(f"✅ {nome_mes} {ano} fechado com sucesso!")
+                    st.rerun()
+                else:
+                    st.warning("Nenhuma venda encontrada no período.")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("**Ou preencha manualmente:**")
+
+        with st.form(f"form_fech_{ano_mes}"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                f_fat   = st.number_input("Faturamento bruto (R$)",  min_value=0.0, step=0.01, format="%.2f")
+                f_devol = st.number_input("Devoluções (R$)",          min_value=0.0, step=0.01, format="%.2f")
+                f_ped   = st.number_input("Pedidos aprovados",        min_value=0, step=1)
+            with c2:
+                f_tar   = st.number_input("Tarifas ML (R$)",          min_value=0.0, step=0.01, format="%.2f")
+                f_frt   = st.number_input("Frete ML (R$)",            min_value=0.0, step=0.01, format="%.2f")
+                f_can   = st.number_input("Pedidos cancelados",       min_value=0, step=1)
+            with c3:
+                f_cst   = st.number_input("Custo produto (R$)",       min_value=0.0, step=0.01, format="%.2f")
+                f_imp   = st.number_input("Impostos (R$)",            min_value=0.0, step=0.01, format="%.2f")
+                f_est   = st.number_input("Estoque em caixa (R$)",    min_value=0.0, step=0.01, format="%.2f")
+
+            if st.form_submit_button("💾 Salvar fechamento", type="primary", use_container_width=True):
+                from datetime import datetime as _dtt2
+                import zoneinfo as _zi2
+                _tz2 = _zi2.ZoneInfo("America/Sao_Paulo")
+                _luc_m  = f_fat - f_devol - f_tar - f_frt - f_cst - f_imp
+                _mar_m  = (_luc_m / f_fat * 100) if f_fat > 0 else 0
+                save_fechamento(str(user_id), {
+                    "ano_mes": ano_mes,
+                    "faturamento_bruto": round(f_fat, 2),
+                    "devolucoes": round(f_devol, 2),
+                    "tarifas_ml": round(f_tar, 2),
+                    "frete_ml": round(f_frt, 2),
+                    "custo_produto": round(f_cst, 2),
+                    "impostos": round(f_imp, 2),
+                    "lucro_liquido": round(_luc_m, 2),
+                    "margem": round(_mar_m, 2),
+                    "pedidos": int(f_ped),
+                    "canceladas": int(f_can),
+                    "ticket_medio": round(f_fat / f_ped if f_ped else 0, 2),
+                    "estoque_valor": round(f_est, 2),
+                    "fechado_em": _dtt2.now(_tz2).strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                st.success(f"✅ {nome_mes} {ano} fechado!")
+                st.rerun()
