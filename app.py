@@ -227,10 +227,12 @@ def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
             resp = requests.get(f"{ML_API_BASE}/shipments/{sid}", headers=headers, timeout=15)
             if resp.status_code != 200:
                 return sid, 0.0
-            opt = resp.json().get("shipping_option", {})
-            # "cost" = valor real pago pelo vendedor (após subsídio ML); "list_cost" = preço cheio
-            cost = opt.get("cost") or opt.get("base_cost") or opt.get("list_cost") or 0
-            return sid, float(cost)
+            data = resp.json()
+            opt  = data.get("shipping_option", {})
+            lc   = float(opt.get("list_cost") or 0)
+            ec   = float(opt.get("cost") or 0)
+            cost = max(lc - ec, 0)
+            return sid, cost
         except:
             return sid, 0.0
     fretes = {}
@@ -676,6 +678,23 @@ if st.session_state["aba_ativa"] == "financeiro":
 
     shipping_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in orders if o.get("shipping",{}).get("id")}))
     token_hash   = token[-8:] if token else ""
+
+    # DIAGNÓSTICO TEMPORÁRIO — fora do cache
+    _order_diag = "2000016950701722"
+    _order_data = next((o for o in orders if str(o.get("id")) == _order_diag), None)
+    if _order_data:
+        _sid = _order_data.get("shipping", {}).get("id")
+        st.warning(f"🔍 DIAG order={_order_diag} | shipping_id={_sid}")
+        if _sid and token:
+            import requests as _rq
+            import json as _jj
+            _r = _rq.get(f"https://api.mercadolibre.com/shipments/{_sid}",
+                         headers={"Authorization": f"Bearer {token}"}, timeout=15)
+            if _r.status_code == 200:
+                _sd = _r.json()
+                _opt = _sd.get("shipping_option", {})
+                st.write(f"list_cost={_opt.get('list_cost')} | cost={_opt.get('cost')} | base_cost={_sd.get('base_cost')} | status={_sd.get('status')}")
+                st.write(f"cost_components={_sd.get('cost_components')}")
 
     with st.spinner("Buscando fretes..."):
         fretes       = fetch_fretes_batch(shipping_ids, token_hash, token)
