@@ -2011,17 +2011,51 @@ elif st.session_state["aba_ativa"] == "fechamento":
             _df_from = f"{ano}-{mes:02d}-01T00:00:00.000-03:00"
             _df_to   = f"{ano}-{mes:02d}-{_ultimo_dia:02d}T23:59:59.000-03:00"
             with st.spinner("Buscando dados do período..."):
-                _orders = get_orders(str(user_id), token, _df_from, _df_to)
+                # 1) Vendas APROVADAS criadas no mês
+                _orders_fat = get_orders(str(user_id), token, _df_from, _df_to)
+                # Filtrar apenas aprovadas (não canceladas)
+                _orders_aprov = [o for o in _orders_fat if o.get("status") != "cancelled"]
 
-                if _orders:
-                    _ship_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in _orders if o.get("shipping",{}).get("id")}))
+                # 2) Devoluções = cancelamentos com date_closed no mês
+                _headers_ml = {"Authorization": f"Bearer {token}"}
+                _orders_cancel = []
+                _offset_c, _limit_c = 0, 50
+                while True:
+                    _rc = requests.get(f"{ML_API_BASE}/orders/search",
+                        headers=_headers_ml,
+                        params={"seller": user_id,
+                                "order.date_closed.from": _df_from,
+                                "order.date_closed.to": _df_to,
+                                "order.status": "cancelled",
+                                "sort": "date_desc",
+                                "offset": _offset_c, "limit": _limit_c},
+                        timeout=30)
+                    if _rc.status_code != 200: break
+                    _res_c = _rc.json().get("results", [])
+                    _orders_cancel.extend(_res_c)
+                    _offset_c += _limit_c
+                    if _offset_c >= _rc.json().get("paging", {}).get("total", 0) or not _res_c:
+                        break
+
+                # Juntar para calcular fretes
+                _all_orders = _orders_aprov + _orders_cancel
+                if _all_orders:
+                    _ship_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in _all_orders if o.get("shipping",{}).get("id")}))
                     _tok_hash = token[-8:] if token else ""
                     _fretes   = fetch_fretes_batch(_ship_ids, _tok_hash, token)
-                    _reimb    = get_orders_reembolsados(_orders)
-                    _df_raw   = parse_orders(_orders, _fretes, _reimb)
-                    _df       = apply_costs_online(_df_raw, str(user_id))
-                    _aprov    = _df[~_df["Cancelada"]]
-                    _cancel   = _df[_df["Cancelada"]]
+
+                    # Processar aprovadas
+                    _reimb_a  = get_orders_reembolsados(_orders_aprov)
+                    _df_a_raw = parse_orders(_orders_aprov, _fretes, _reimb_a)
+                    _df_a     = apply_costs_online(_df_a_raw, str(user_id))
+                    _aprov    = _df_a[~_df_a["Cancelada"]]
+
+                    # Processar canceladas do mês
+                    _reimb_c  = get_orders_reembolsados(_orders_cancel)
+                    _df_c_raw = parse_orders(_orders_cancel, _fretes, _reimb_c)
+                    _df_c     = apply_costs_online(_df_c_raw, str(user_id))
+                    _cancel   = _df_c[_df_c["Cancelada"]]
+
                     _fat      = _aprov["Receita Bruta"].sum()
                     _devol    = abs(_cancel["Receita Bruta"].sum())
                     _tar      = _aprov["Taxas ML"].sum()
