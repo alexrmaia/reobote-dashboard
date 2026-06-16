@@ -2003,7 +2003,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
                     _ship_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in _orders if o.get("shipping",{}).get("id")}))
                     _tok_hash = token[-8:] if token else ""
                     _fretes   = fetch_fretes_batch(_ship_ids, _tok_hash, token)
-                    _reimb    = get_reembolsados(str(user_id), _tok_hash, token, _df_from, _df_to)
+                    _reimb    = get_orders_reembolsados(_orders)
                     _df       = parse_orders(_orders, _fretes, _reimb, token=token)
                     _aprov    = _df[~_df["Cancelada"]]
                     _cancel   = _df[_df["Cancelada"]]
