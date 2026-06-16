@@ -2004,7 +2004,8 @@ elif st.session_state["aba_ativa"] == "fechamento":
                     _tok_hash = token[-8:] if token else ""
                     _fretes   = fetch_fretes_batch(_ship_ids, _tok_hash, token)
                     _reimb    = get_orders_reembolsados(_orders)
-                    _df       = parse_orders(_orders, _fretes, _reimb, token=token)
+                    _df_raw   = parse_orders(_orders, _fretes, _reimb)
+                    _df       = apply_costs_online(_df_raw, str(user_id))
                     _aprov    = _df[~_df["Cancelada"]]
                     _cancel   = _df[_df["Cancelada"]]
                     _fat      = _aprov["Receita Bruta"].sum()
