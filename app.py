@@ -1785,12 +1785,22 @@ elif st.session_state["aba_ativa"] == "fechamento":
             return []
 
     def save_fechamento(uid, dados):
+        sb = get_supabase()
+        payload = {"user_id": uid, **dados}
         try:
-            get_supabase().table("fechamentos_mensais").upsert(
-                {"user_id": uid, **dados}, on_conflict="user_id,ano_mes"
-            ).execute()
-        except Exception as e:
-            st.error(f"Erro ao salvar: {e}")
+            r = sb.table("fechamentos_mensais").upsert(payload).execute()
+            st.session_state["fech_erro"] = None
+            return True
+        except Exception as e1:
+            try:
+                sb.table("fechamentos_mensais")\
+                    .delete().eq("user_id", uid).eq("ano_mes", dados["ano_mes"]).execute()
+                sb.table("fechamentos_mensais").insert(payload).execute()
+                st.session_state["fech_erro"] = None
+                return True
+            except Exception as e2:
+                st.session_state["fech_erro"] = str(e2)
+                return False
 
     fechamentos = get_fechamentos(str(user_id))
     fechamentos_map = {f["ano_mes"]: f for f in fechamentos}
@@ -1985,8 +1995,11 @@ elif st.session_state["aba_ativa"] == "fechamento":
 
     else:
         # ── Formulário de fechamento ──
-        st.info(f"ℹ️ {nome_mes} {ano} ainda não foi fechado. Preencha os dados abaixo ou clique em **Fechar automaticamente** para importar do dashboard.")
+        if st.session_state.get("fech_erro"):
+            st.error(f"❌ Erro ao salvar: {st.session_state['fech_erro']}")
+            st.info("💡 Verifique se a tabela 'fechamentos_mensais' foi criada no Supabase.")
 
+        st.info(f"ℹ️ {nome_mes} {ano} ainda não foi fechado. Preencha os dados abaixo ou clique em **Fechar automaticamente** para importar do dashboard.")
         # Botão fechar automático
         if st.button("⚡ Fechar automaticamente (importar do dashboard)", type="primary", key="auto_fech"):
             # Buscar dados do período
@@ -1999,7 +2012,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
             _df_to   = f"{ano}-{mes:02d}-{_ultimo_dia:02d}T23:59:59.000-03:00"
             with st.spinner("Buscando dados do período..."):
                 _orders = get_orders(str(user_id), token, _df_from, _df_to)
-                st.write(f"DEBUG: {len(_orders)} ordens encontradas de {_df_from[:10]} a {_df_to[:10]}")
+
                 if _orders:
                     _ship_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in _orders if o.get("shipping",{}).get("id")}))
                     _tok_hash = token[-8:] if token else ""
@@ -2025,8 +2038,8 @@ elif st.session_state["aba_ativa"] == "fechamento":
                     _est      = sum(float(r.get("qtd_disponivel",0)) * float(r.get("custo_produto",0))
                                    for _, r in _cdf.iterrows() if float(r.get("qtd_disponivel",0)) > 0) if not _cdf.empty else 0
 
-                    st.write(f"DEBUG salvar: fat={round(_fat,2)} luc={round(_luc,2)} ped={_ped}")
-                    save_fechamento(str(user_id), {
+
+                    _saved = save_fechamento(str(user_id), {
                         "ano_mes": ano_mes,
                         "faturamento_bruto": round(_fat, 2),
                         "devolucoes": round(_devol, 2),
@@ -2042,8 +2055,9 @@ elif st.session_state["aba_ativa"] == "fechamento":
                         "estoque_valor": round(_est, 2),
                         "fechado_em": _dtt.now(_tz).strftime("%Y-%m-%d %H:%M:%S"),
                     })
-                    st.success(f"✅ {nome_mes} {ano} fechado com sucesso!")
-                    st.rerun()
+                    if _saved:
+                        st.success(f"✅ {nome_mes} {ano} fechado com sucesso!")
+                        st.rerun()
                 else:
                     st.warning("Nenhuma venda encontrada no período.")
 
