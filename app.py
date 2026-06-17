@@ -251,16 +251,30 @@ def parse_orders(orders, fretes=None, reembolsados=None):
     reembolsados = reembolsados or {}
     rows = []
     
+    # Status de envio que indicam que o produto SAIU do CD (logo = devolução, não cancelamento)
+    _SHIPPED_STATUSES = {"shipped", "delivered", "not_delivered", "ready_to_ship"}
+    
     for order in orders:
         order_id    = order.get("id", "")
         status      = order.get("status", "")
         date        = pd.to_datetime(order.get("date_created", ""), errors="coerce")
-        shipping_id = order.get("shipping", {}).get("id", 0)
+        shipping    = order.get("shipping", {}) or {}
+        shipping_id = shipping.get("id", 0)
+        ship_status = (shipping.get("status") or "").lower()
         paid_amount = float(order.get("paid_amount") or 0)
         reemb_val   = float(reembolsados.get(str(order_id), 0) or 0)
         
         # Cancelada = status cancelled OU reembolso total (>= 90% do valor pago)
         cancelada   = status in ["cancelled"] or (reemb_val > 0 and paid_amount > 0 and reemb_val >= paid_amount * 0.9)
+        
+        # Categoria: aprovada / cancelada (não saiu) / devolvida (saiu e voltou)
+        if not cancelada:
+            categoria = "aprovada"
+        elif ship_status in _SHIPPED_STATUSES:
+            categoria = "devolvida"
+        else:
+            # pending, ready_to_print, cancelled, handling, vazio → não saiu do CD
+            categoria = "cancelada"
         
         for item in order.get("order_items", []):
             sku        = (item.get("item", {}).get("seller_sku", "") or "").strip()
@@ -311,6 +325,7 @@ def parse_orders(orders, fretes=None, reembolsados=None):
                 "Receita Bruta": receita, "Taxas ML": sale_fee,
                 "Frete": frete, "Total ML": total_ml,
                 "Cancelada": cancelada,
+                "Categoria": categoria,
                 "Reembolsado": reemb_val,
             })
             
@@ -1865,6 +1880,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
         margem  = float(d.get("margem", 0))
         pedidos = int(d.get("pedidos", 0))
         canceladas_n = int(d.get("canceladas", 0))
+        devolvidas_n = int(d.get("devolvidas", 0))
         ticket  = float(d.get("ticket_medio", 0))
         estoque = float(d.get("estoque_valor", 0))
 
@@ -1880,7 +1896,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
           <div style='padding:16px 14px;background:white;border-right:1px solid #E2E8F0;'>
             <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Devoluções</div>
             <div style='font-size:20px;font-weight:800;color:#DC2626;'>− R$ {devol:,.0f}</div>
-            <div style='font-size:11px;color:#64748B;margin-top:2px;'>{canceladas_n} pedidos</div>
+            <div style='font-size:11px;color:#64748B;margin-top:2px;'>{devolvidas_n} devolvidos</div>
             <div style='height:3px;background:#FCA5A5;border-radius:99px;margin-top:10px;'></div>
           </div>
           <div style='padding:16px 14px;background:#F8FAFC;border-right:1px solid #E2E8F0;'>
@@ -1912,9 +1928,12 @@ elif st.session_state["aba_ativa"] == "fechamento":
 
         # Métricas rápidas
         m1, m2, m3, m4 = st.columns(4)
+        _total_coorte = pedidos + canceladas_n + devolvidas_n
+        _perdidos     = canceladas_n + devolvidas_n
+        _taxa_pct     = (_perdidos / _total_coorte * 100) if _total_coorte else 0
         for col, label, val, sub in [
             (m1, "Ticket médio",        f"R$ {ticket:,.2f}",     f"lucro/venda R$ {lucro/pedidos:.2f}" if pedidos else "–"),
-            (m2, "Taxa cancelamento",   f"{(canceladas_n/(pedidos+canceladas_n)*100):.1f}%" if pedidos+canceladas_n else "–", f"{canceladas_n} de {pedidos+canceladas_n} pedidos"),
+            (m2, "Taxa cancel + devol", f"{_taxa_pct:.1f}%",     f"{canceladas_n} cancel · {devolvidas_n} devol · {_total_coorte} total"),
             (m3, "Estoque em caixa",    f"R$ {estoque:,.0f}",    "valor no fechamento"),
             (m4, "Margem líquida",      f"{margem:.1f}%",        f"lucro R$ {lucro:,.0f}"),
         ]:
@@ -2011,72 +2030,54 @@ elif st.session_state["aba_ativa"] == "fechamento":
             _df_from = f"{ano}-{mes:02d}-01T00:00:00.000-03:00"
             _df_to   = f"{ano}-{mes:02d}-{_ultimo_dia:02d}T23:59:59.000-03:00"
             with st.spinner("Buscando dados do período..."):
-                # 1) Vendas APROVADAS criadas no mês
-                _orders_fat = get_orders(str(user_id), token, _df_from, _df_to)
-                # Filtrar apenas aprovadas (não canceladas)
-                _orders_aprov = [o for o in _orders_fat if o.get("status") != "cancelled"]
+                # COORTE: todas as orders criadas no mês (aprovadas + canceladas + devolvidas)
+                # Mesma janela temporal para tudo — denominador e numerador alinhados.
+                _orders_mes = get_orders(str(user_id), token, _df_from, _df_to)
+                
+                # Diagnóstico de paginação/status
+                from collections import Counter as _Counter
+                _status_count = _Counter(o.get("status","?") for o in _orders_mes)
+                st.info(f"📊 Total orders buscadas: {len(_orders_mes)} | Status: {dict(_status_count)}")
 
-                # 2) Devoluções = cancelamentos com date_closed no mês
-                _headers_ml = {"Authorization": f"Bearer {token}"}
-                _orders_cancel = []
-                _offset_c, _limit_c = 0, 50
-                while True:
-                    _rc = requests.get(f"{ML_API_BASE}/orders/search",
-                        headers=_headers_ml,
-                        params={"seller": user_id,
-                                "order.date_closed.from": _df_from,
-                                "order.date_closed.to": _df_to,
-                                "order.status": "cancelled",
-                                "sort": "date_desc",
-                                "offset": _offset_c, "limit": _limit_c},
-                        timeout=30)
-                    if _rc.status_code != 200: break
-                    _res_c = _rc.json().get("results", [])
-                    _orders_cancel.extend(_res_c)
-                    _offset_c += _limit_c
-                    if _offset_c >= _rc.json().get("paging", {}).get("total", 0) or not _res_c:
-                        break
-
-                # Juntar para calcular fretes
-                _all_orders = _orders_aprov + _orders_cancel
-                if _all_orders:
-                    _ship_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in _all_orders if o.get("shipping",{}).get("id")}))
+                if _orders_mes:
+                    _ship_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in _orders_mes if o.get("shipping",{}).get("id")}))
                     _tok_hash = token[-8:] if token else ""
                     _fretes   = fetch_fretes_batch(_ship_ids, _tok_hash, token)
+                    _reimb    = get_orders_reembolsados(_orders_mes)
 
-                    # Processar aprovadas — forçar reembolsados vazio
-                    # para não marcar como cancelada vendas devolvidas em outro mês
-                    _df_a_raw = parse_orders(_orders_aprov, _fretes, {})
-                    _df_a     = apply_costs_online(_df_a_raw, str(user_id))
-                    _aprov    = _df_a  # todas são aprovadas por definição
+                    # Processa TUDO de uma vez — Categoria classifica em aprovada/cancelada/devolvida
+                    _df_raw = parse_orders(_orders_mes, _fretes, _reimb)
+                    _df     = apply_costs_online(_df_raw, str(user_id))
 
-                    # Processar canceladas — apenas as com date_closed no mês
-                    _reimb_c  = get_orders_reembolsados(_orders_cancel)
-                    _df_c_raw = parse_orders(_orders_cancel, _fretes, _reimb_c)
-                    _df_c     = apply_costs_online(_df_c_raw, str(user_id))
-                    _cancel   = _df_c  # todas são canceladas por definição
+                    # Segmentar por categoria
+                    _aprov  = _df[_df["Categoria"] == "aprovada"]
+                    _cancel = _df[_df["Categoria"] == "cancelada"]   # não saiu do CD
+                    _devol  = _df[_df["Categoria"] == "devolvida"]   # saiu e voltou
 
-                    _fat      = _aprov["Receita Bruta"].sum()
-                    _devol    = abs(_cancel["Receita Bruta"].sum())
-                    _tar      = _aprov["Taxas ML"].sum()
-                    _frt      = _aprov["Frete"].sum()
-                    _cst      = _aprov["Custo Total"].sum()
-                    _imp      = _aprov["Imposto"].sum()
-                    _luc      = _aprov["Lucro"].sum() + _cancel["Lucro"].sum()
-                    _mar      = (_luc / _fat * 100) if _fat > 0 else 0
-                    _ped      = len(_aprov)
-                    _can_n    = len(_cancel)
-                    _tick     = _fat / _ped if _ped else 0
+                    _fat       = _aprov["Receita Bruta"].sum()
+                    # Devoluções = só as que saíram e voltaram (impacto $ real)
+                    _devol_val = abs(_devol["Receita Bruta"].sum())
+                    _tar       = _aprov["Taxas ML"].sum()
+                    _frt       = _aprov["Frete"].sum()
+                    _cst       = _aprov["Custo Total"].sum()
+                    _imp       = _aprov["Imposto"].sum()
+                    # Lucro = aprovadas + impacto negativo das devolvidas (frete reverso)
+                    _luc       = _aprov["Lucro"].sum() + _devol["Lucro"].sum()
+                    _mar       = (_luc / _fat * 100) if _fat > 0 else 0
+                    _ped       = len(_aprov)
+                    _can_n     = len(_cancel)
+                    _dev_n     = len(_devol)
+                    _tick      = _fat / _ped if _ped else 0
                     # Estoque atual
-                    _cdf      = load_custos(str(user_id))
-                    _est      = sum(float(r.get("qtd_disponivel",0)) * float(r.get("custo_produto",0))
-                                   for _, r in _cdf.iterrows() if float(r.get("qtd_disponivel",0)) > 0) if not _cdf.empty else 0
+                    _cdf       = load_custos(str(user_id))
+                    _est       = sum(float(r.get("qtd_disponivel",0)) * float(r.get("custo_produto",0))
+                                    for _, r in _cdf.iterrows() if float(r.get("qtd_disponivel",0)) > 0) if not _cdf.empty else 0
 
 
                     _saved = save_fechamento(str(user_id), {
                         "ano_mes": ano_mes,
                         "faturamento_bruto": round(_fat, 2),
-                        "devolucoes": round(_devol, 2),
+                        "devolucoes": round(_devol_val, 2),
                         "tarifas_ml": round(_tar, 2),
                         "frete_ml": round(_frt, 2),
                         "custo_produto": round(_cst, 2),
@@ -2085,6 +2086,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
                         "margem": round(_mar, 2),
                         "pedidos": _ped,
                         "canceladas": _can_n,
+                        "devolvidas": _dev_n,
                         "ticket_medio": round(_tick, 2),
                         "estoque_valor": round(_est, 2),
                         "fechado_em": _dtt.now(_tz).strftime("%Y-%m-%d %H:%M:%S"),
