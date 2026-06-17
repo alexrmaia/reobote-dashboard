@@ -891,19 +891,47 @@ if st.session_state["aba_ativa"] == "financeiro":
     kpi_card(k2, "Taxas ML",       f"R$ {tarifas:,.2f}",    "#EF4444")
     kpi_card(k3, "Frete ML",       f"R$ {fretes_sum:,.2f}", "#EF4444")
     k4, k5, k6 = st.columns(3)
-    # Card ADS clicável (toggle on/off afetando lucro líquido)
-    _ads_color   = "#EF4444" if ads_on else "#9CA3AF"
-    _ads_value   = f"R$ {ads_cost:,.2f}" if ads_on else f"<span style='text-decoration:line-through;'>R$ {ads_cost:,.2f}</span>"
-    _ads_badge   = "🟢 ON · contando no lucro" if ads_on else "⚪ OFF · ignorado no lucro"
-    k4.markdown(f"""<div class="kpi-card" style="border:1px solid {'#EF4444' if ads_on else '#D1D5DB'};">
-        <div class="kpi-title">ADS (Product Ads)</div>
-        <div class="kpi-value" style="color:{_ads_color};">{_ads_value}</div>
-        <div style="font-size:11px;color:#64748B;margin-top:4px;text-align:center;">{_ads_badge}</div>
-    </div>""", unsafe_allow_html=True)
-    if k4.button(("Desligar ADS do lucro" if ads_on else "Ligar ADS no lucro"),
-                 key="toggle_ads", use_container_width=True):
-        st.session_state["ads_on"] = not ads_on
-        st.rerun()
+    # Card ADS com chip ON/OFF no canto superior direito
+    _ads_color = "#EF4444" if ads_on else "#9CA3AF"
+    _ads_value = f"R$ {ads_cost:,.2f}" if ads_on else f"<span style='text-decoration:line-through;'>R$ {ads_cost:,.2f}</span>"
+    _ads_sub   = "contando no lucro" if ads_on else "ignorado no lucro"
+    _chip_bg   = "#16A34A" if ads_on else "#9CA3AF"
+    _chip_txt  = "ON ⇋" if ads_on else "OFF ⇋"
+    with k4:
+        # CSS para sobrepor o botão real do Streamlit em cima do chip visual
+        st.markdown(f"""
+        <style>
+        div[data-testid="stVerticalBlock"] div[data-testid="stButton"]:has(button[kind="secondary"][aria-label]) {{}}
+        .ads-card-wrap {{ position: relative; }}
+        .ads-card-wrap .ads-chip {{
+            position: absolute; top: 10px; right: 12px;
+            background: {_chip_bg}; color: white; font-size: 10px; font-weight: 700;
+            letter-spacing: .5px; padding: 4px 9px; border-radius: 99px;
+            text-transform: uppercase; pointer-events: none; z-index: 2;
+        }}
+        /* Botão Streamlit fica invisível por cima do card todo */
+        .ads-toggle-area + div[data-testid="stButton"] > button {{
+            position: absolute !important;
+            top: -110px; right: 0;
+            width: 100%; height: 110px;
+            opacity: 0 !important;
+            cursor: pointer !important;
+            z-index: 3;
+        }}
+        </style>
+        <div class="ads-card-wrap">
+            <div class="ads-chip">{_chip_txt}</div>
+            <div class="kpi-card" style="border:1px solid {'#EF4444' if ads_on else '#D1D5DB'};position:relative;">
+                <div class="kpi-title">ADS (Product Ads)</div>
+                <div class="kpi-value" style="color:{_ads_color};">{_ads_value}</div>
+                <div style="font-size:11px;color:#64748B;margin-top:4px;text-align:center;">{_ads_sub}</div>
+            </div>
+            <div class="ads-toggle-area"></div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button(" ", key="toggle_ads", help="Liga/desliga ADS no lucro líquido"):
+            st.session_state["ads_on"] = not ads_on
+            st.rerun()
     kpi_card(k5, "Custo Produto",  f"R$ {custos:,.2f}",     "#EF4444")
     kpi_card(k6, "Lucro Real",     f"R$ {lucro_total:,.2f}", "#059669" if lucro_total >= 0 else "#DC2626")
     k7, k8, k9 = st.columns(3)
