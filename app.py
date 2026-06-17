@@ -218,6 +218,20 @@ def get_orders_reembolsados(orders):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
+    """
+    Retorna dict {shipping_id: custo_frete (float)}.
+    Mantido para compatibilidade — usa internamente fetch_shipments_batch.
+    """
+    full = fetch_shipments_batch(shipping_ids_tuple, token_hash, token)
+    return {sid: info.get("cost", 0.0) for sid, info in full.items()}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_shipments_batch(shipping_ids_tuple, token_hash, token):
+    """
+    Busca shipments em paralelo. Retorna dict {sid: {"cost": float, "status": str, "reverse_fee": float}}.
+    Uma única função para evitar chamar /shipments/{id} duas vezes.
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     if not shipping_ids_tuple:
         return {}
@@ -226,29 +240,33 @@ def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
         try:
             resp = requests.get(f"{ML_API_BASE}/shipments/{sid}", headers=headers, timeout=15)
             if resp.status_code != 200:
-                return sid, 0.0
+                return sid, {"cost": 0.0, "status": "", "reverse_fee": 0.0}
             data = resp.json()
-            opt  = data.get("shipping_option", {})
+            opt  = data.get("shipping_option", {}) or {}
             lc   = float(opt.get("list_cost") or 0)
             ec   = float(opt.get("cost") or 0)
             cost = max(lc - ec, 0)
-            return sid, cost
+            status = (data.get("status") or "").lower()
+            ret    = data.get("return_details", {}) or {}
+            rev_fee = float(ret.get("reverse_shipping_fee") or 0)
+            return sid, {"cost": cost, "status": status, "reverse_fee": rev_fee}
         except:
-            return sid, 0.0
-    fretes = {}
+            return sid, {"cost": 0.0, "status": "", "reverse_fee": 0.0}
+    out = {}
     with ThreadPoolExecutor(max_workers=10) as ex:
         for future in as_completed({ex.submit(fetch_one, sid): sid for sid in shipping_ids_tuple}):
-            sid, custo = future.result()
-            fretes[sid] = custo
-    return fretes
+            sid, info = future.result()
+            out[sid] = info
+    return out
 
-def parse_orders(orders, fretes=None, reembolsados=None):
+def parse_orders(orders, fretes=None, reembolsados=None, shipments_info=None):
     import requests
     import streamlit as st
     import pandas as pd
     
-    fretes       = fretes or {}
-    reembolsados = reembolsados or {}
+    fretes         = fretes or {}
+    reembolsados   = reembolsados or {}
+    shipments_info = shipments_info or {}
     rows = []
     
     # Status de envio que indicam que o produto SAIU do CD (= devolução, não cancelamento)
@@ -260,7 +278,10 @@ def parse_orders(orders, fretes=None, reembolsados=None):
         date        = pd.to_datetime(order.get("date_created", ""), errors="coerce")
         shipping    = order.get("shipping", {}) or {}
         shipping_id = shipping.get("id", 0)
-        ship_status = (shipping.get("status") or "").lower()
+        # Prioriza shipping.status do shipments_info (vem do /shipments), fallback pro embedded
+        _sinfo      = shipments_info.get(shipping_id, {}) if shipping_id else {}
+        ship_status = (_sinfo.get("status") or shipping.get("status") or "").lower()
+        rev_fee     = float(_sinfo.get("reverse_fee") or 0)
         paid_amount = float(order.get("paid_amount") or 0)
         reemb_val   = float(reembolsados.get(str(order_id), 0) or 0)
         
@@ -268,9 +289,10 @@ def parse_orders(orders, fretes=None, reembolsados=None):
         cancelada   = status in ["cancelled"] or (reemb_val > 0 and paid_amount > 0 and reemb_val >= paid_amount * 0.9)
         
         # Categoria: aprovada / cancelada (não saiu) / devolvida (saiu e voltou)
+        # Sinais de devolução: shipping.status indica que saiu OU houve frete reverso
         if not cancelada:
             categoria = "aprovada"
-        elif ship_status in _SHIPPED_STATUSES:
+        elif ship_status in _SHIPPED_STATUSES or rev_fee > 0:
             categoria = "devolvida"
         else:
             categoria = "cancelada"
@@ -2132,10 +2154,19 @@ elif st.session_state["aba_ativa"] == "fechamento":
                 if _all_orders:
                     _ship_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in _all_orders if o.get("shipping",{}).get("id")}))
                     _tok_hash = token[-8:] if token else ""
-                    _fretes   = fetch_fretes_batch(_ship_ids, _tok_hash, token)
+                    _shipinfo = fetch_shipments_batch(_ship_ids, _tok_hash, token)
+                    _fretes   = {sid: info.get("cost", 0.0) for sid, info in _shipinfo.items()}
                     _reimb    = get_orders_reembolsados(_all_orders)
 
-                    _df_raw = parse_orders(_all_orders, _fretes, _reimb)
+                    # Diagnóstico: distribuição de shipping.status real (do /shipments)
+                    _ship_real = _Counter(
+                        (_shipinfo.get((o.get("shipping",{}) or {}).get("id"), {}).get("status") or "(vazio)")
+                        for o in _all_orders if o.get("status") == "cancelled"
+                    )
+                    with _diag:
+                        st.info(f"**Shipping.status REAL das canceladas (via /shipments):** {dict(_ship_real)}")
+
+                    _df_raw = parse_orders(_all_orders, _fretes, _reimb, _shipinfo)
                     _df     = apply_costs_online(_df_raw, str(user_id))
 
                     # Diagnóstico final de classificação
