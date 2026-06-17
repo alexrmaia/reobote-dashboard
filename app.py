@@ -300,7 +300,7 @@ def fetch_ads_cost(advertiser_id, token_hash, token, date_from_ymd, date_to_ymd)
                 "date_to": date_to_ymd,
                 "metrics": "cost",
                 "metrics_summary": "true",
-                "limit": 1,  # só queremos o summary
+                "limit": 50,  # pegar todas as campanhas; summary só funciona certo com limit alto
                 "offset": 0,
             },
             timeout=20,
@@ -308,7 +308,11 @@ def fetch_ads_cost(advertiser_id, token_hash, token, date_from_ymd, date_to_ymd)
         if resp.status_code != 200:
             return 0.0
         data = resp.json()
-        # O summary fica em "metrics_summary" no nível do payload
+        # Preferir somar o cost de cada campanha (mais confiável que metrics_summary)
+        results = data.get("results", []) or []
+        if results:
+            return float(sum((c.get("metrics", {}) or {}).get("cost", 0) or 0 for c in results))
+        # Fallback: metrics_summary
         summary = data.get("metrics_summary") or {}
         return float(summary.get("cost") or 0)
     except Exception:
@@ -2216,64 +2220,6 @@ elif st.session_state["aba_ativa"] == "fechamento":
                     _ads_to     = f"{ano}-{mes:02d}-{_ultimo_dia:02d}"
                     _ads_cost   = fetch_ads_cost(_adv_id, token[-8:] if token else "", token, _ads_from, _ads_to)
 
-                    # ─── DIAGNÓSTICO ADS ───
-                    st.markdown("### 🔍 Diagnóstico ADS")
-                    st.info(f"advertiser_id descoberto: `{_adv_id}` | range: {_ads_from} → {_ads_to}")
-
-                    # Chamada direta sem cache para ver resposta crua
-                    try:
-                        _ads_resp = requests.get(
-                            f"{ML_API_BASE}/advertising/advertisers/{_adv_id}/product_ads/campaigns",
-                            headers={"Authorization": f"Bearer {token}", "api-version": "2"},
-                            params={
-                                "date_from": _ads_from,
-                                "date_to": _ads_to,
-                                "metrics": "cost,clicks,prints,direct_amount,indirect_amount,total_amount",
-                                "metrics_summary": "true",
-                                "limit": 50,
-                                "offset": 0,
-                            },
-                            timeout=20,
-                        )
-                        st.info(f"HTTP status: {_ads_resp.status_code}")
-                        if _ads_resp.status_code == 200:
-                            _ads_data = _ads_resp.json()
-                            _camps    = _ads_data.get("results", []) or []
-                            _summary  = _ads_data.get("metrics_summary", {}) or {}
-                            st.info(f"**metrics_summary (todas campanhas no período):** {_summary}")
-                            st.info(f"**Campanhas retornadas:** {len(_camps)}")
-                            for _c in _camps:
-                                _cm = _c.get("metrics", {}) or {}
-                                st.info(
-                                    f"📊 **{_c.get('name','?')}** (id={_c.get('id')}, status={_c.get('status')}) — "
-                                    f"cost=R${_cm.get('cost',0):.2f} · clicks={_cm.get('clicks',0)} · "
-                                    f"start={_c.get('date_start','?')} · end={_c.get('date_end','?')}"
-                                )
-
-                            # Tentar também sem filtro de status (alguns endpoints filtram active por default)
-                            _ads_resp2 = requests.get(
-                                f"{ML_API_BASE}/advertising/advertisers/{_adv_id}/product_ads/campaigns",
-                                headers={"Authorization": f"Bearer {token}", "api-version": "2"},
-                                params={
-                                    "date_from": _ads_from,
-                                    "date_to": _ads_to,
-                                    "metrics": "cost",
-                                    "metrics_summary": "true",
-                                    "status": "active,paused,idle,terminated",
-                                    "limit": 50,
-                                    "offset": 0,
-                                },
-                                timeout=20,
-                            )
-                            if _ads_resp2.status_code == 200:
-                                _d2 = _ads_resp2.json()
-                                st.info(f"**Com status=active,paused,idle,terminated:** {len(_d2.get('results',[]))} campanhas · summary={_d2.get('metrics_summary',{})}")
-                        else:
-                            st.error(f"Resposta: {_ads_resp.text[:500]}")
-                    except Exception as _e:
-                        st.error(f"Erro no diagnóstico ADS: {_e}")
-                    # ─── FIM DIAGNÓSTICO ───
-
                     _luc        = _aprov["Lucro"].sum() + _devol["Lucro"].sum() - _ads_cost
                     _mar        = (_luc / _fat * 100) if _fat > 0 else 0
                     _ped        = len(_aprov)
@@ -2305,7 +2251,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
                     })
                     if _saved:
                         st.success(f"✅ {nome_mes} {ano} fechado! Aprovadas: {_ped} · Cancel: {_can_n} (R$ {_cancel_val:,.0f}) · Devol: {_dev_n} (R$ {_devol_val:,.0f}) · ADS: R$ {_ads_cost:,.0f}")
-                        st.warning("⚠️ Diagnóstico ADS exibido acima — leia antes de navegar.")
+                        st.rerun()
                 else:
                     st.warning("Nenhuma venda encontrada no período.")
 
