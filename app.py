@@ -850,7 +850,7 @@ if st.session_state["aba_ativa"] == "financeiro":
 
     def kpi_card(col, title, value, color="#1F2937"):
         col.markdown(f"""<div style="background:#F4F1EA;border:1px solid transparent;border-radius:14px;
-                                     padding:18px 14px;text-align:center;min-height:130px;
+                                     padding:18px 14px;text-align:center;min-height:150px;
                                      display:flex;flex-direction:column;justify-content:center;">
             <div style="font-size:13px;font-weight:800;color:#44403C;text-transform:uppercase;
                         letter-spacing:.25px;margin-bottom:10px;">{title}</div>
@@ -900,6 +900,7 @@ if st.session_state["aba_ativa"] == "financeiro":
     kpi_card(k1, "Receita Bruta",  f"R$ {faturamento:,.2f}")
     kpi_card(k2, "Taxas ML",       f"R$ {tarifas:,.2f}",    "#EF4444")
     kpi_card(k3, "Frete ML",       f"R$ {fretes_sum:,.2f}", "#EF4444")
+    st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
     k4, k5, k6 = st.columns(3)
     # Card ADS clicável: chip ON/OFF no canto superior direito
     # Usa st_click_detector para o card inteiro virar clicável
@@ -921,7 +922,7 @@ if st.session_state["aba_ativa"] == "financeiro":
         <a href='#' id='ads_toggle' style='text-decoration:none;color:inherit;display:block;'>
           <div style='background:#F4F1EA;border:1px solid {_border};border-radius:14px;
                       padding:18px 14px;text-align:center;position:relative;cursor:pointer;
-                      min-height:130px;box-sizing:border-box;
+                      min-height:150px;box-sizing:border-box;
                       display:flex;flex-direction:column;justify-content:center;'>
             <span style='position:absolute;top:10px;right:12px;background:{_chip_bg};color:white;
                          font-size:9px;font-weight:700;letter-spacing:.5px;padding:3px 8px;
@@ -940,6 +941,7 @@ if st.session_state["aba_ativa"] == "financeiro":
             st.rerun()
     kpi_card(k5, "Custo Produto",  f"R$ {custos:,.2f}",     "#EF4444")
     kpi_card(k6, "Lucro Real",     f"R$ {lucro_total:,.2f}", "#059669" if lucro_total >= 0 else "#DC2626")
+    st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
     k7, _, _ = st.columns(3)
     kpi_card(k7, "Margem",         f"{margem_real:.2f}%",   "#B45309")
 
