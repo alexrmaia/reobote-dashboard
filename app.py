@@ -259,6 +259,61 @@ def fetch_shipments_batch(shipping_ids_tuple, token_hash, token):
             out[sid] = info
     return out
 
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_advertiser_id(token_hash, token):
+    """Descobre o advertiser_id vinculado ao token. Cache de 24h (raramente muda)."""
+    try:
+        resp = requests.get(
+            f"{ML_API_BASE}/advertising/advertisers",
+            headers={"Authorization": f"Bearer {token}", "api-version": "1"},
+            params={"product_id": "PADS"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        advs = data.get("advertisers") or data.get("results") or []
+        if advs and isinstance(advs, list):
+            return advs[0].get("advertiser_id") or advs[0].get("id")
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_ads_cost(advertiser_id, token_hash, token, date_from_ymd, date_to_ymd):
+    """
+    Busca o gasto total em Product Ads no período.
+    date_from_ymd / date_to_ymd no formato 'YYYY-MM-DD'.
+    Range máximo da API: 90 dias.
+    Retorna float (R$).
+    """
+    if not advertiser_id:
+        return 0.0
+    try:
+        resp = requests.get(
+            f"{ML_API_BASE}/advertising/advertisers/{advertiser_id}/product_ads/campaigns",
+            headers={"Authorization": f"Bearer {token}", "api-version": "2"},
+            params={
+                "date_from": date_from_ymd,
+                "date_to": date_to_ymd,
+                "metrics": "cost",
+                "metrics_summary": "true",
+                "limit": 1,  # só queremos o summary
+                "offset": 0,
+            },
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return 0.0
+        data = resp.json()
+        # O summary fica em "metrics_summary" no nível do payload
+        summary = data.get("metrics_summary") or {}
+        return float(summary.get("cost") or 0)
+    except Exception:
+        return 0.0
+
 def parse_orders(orders, fretes=None, reembolsados=None, shipments_info=None):
     import requests
     import streamlit as st
@@ -736,7 +791,14 @@ if st.session_state["aba_ativa"] == "financeiro":
     fretes_sum  = aprovadas["Frete"].sum()
     custos      = aprovadas["Custo Total"].sum()
     impostos    = aprovadas["Imposto"].sum()
-    lucro_total = aprovadas["Lucro"].sum()
+
+    # Gasto com ADS no mesmo período (ao vivo)
+    _adv_id_fin   = get_advertiser_id(token[-8:] if token else "", token)
+    _ads_from_fin = date_from[:10]  # YYYY-MM-DD
+    _ads_to_fin   = date_to[:10]
+    ads_cost      = fetch_ads_cost(_adv_id_fin, token[-8:] if token else "", token, _ads_from_fin, _ads_to_fin)
+
+    lucro_total = aprovadas["Lucro"].sum() - ads_cost
     margem_real = (lucro_total / faturamento * 100) if faturamento > 0 else 0
     # Salva lucro no session_state para uso no ROI do Caixa
     if "lucro_acumulado" not in st.session_state or periodo == "Personalizar":
@@ -819,9 +881,11 @@ if st.session_state["aba_ativa"] == "financeiro":
     kpi_card(k2, "Taxas ML",       f"R$ {tarifas:,.2f}",    "#EF4444")
     kpi_card(k3, "Frete ML",       f"R$ {fretes_sum:,.2f}", "#EF4444")
     k4, k5, k6 = st.columns(3)
-    kpi_card(k4, "Custo Produto",  f"R$ {custos:,.2f}",     "#EF4444")
-    kpi_card(k5, "Lucro Real",     f"R$ {lucro_total:,.2f}", "#059669" if lucro_total >= 0 else "#DC2626")
-    kpi_card(k6, "Margem",         f"{margem_real:.2f}%",   "#B45309")
+    kpi_card(k4, "ADS (Product Ads)", f"R$ {ads_cost:,.2f}", "#EF4444")
+    kpi_card(k5, "Custo Produto",  f"R$ {custos:,.2f}",     "#EF4444")
+    kpi_card(k6, "Lucro Real",     f"R$ {lucro_total:,.2f}", "#059669" if lucro_total >= 0 else "#DC2626")
+    k7, k8, k9 = st.columns(3)
+    kpi_card(k7, "Margem",         f"{margem_real:.2f}%",   "#B45309")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -1897,6 +1961,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
         fat_liq     = fat - devol  # cancelamentos não entram no faturamento, só devoluções saem
         tarifas     = float(d.get("tarifas_ml", 0))
         fretes      = float(d.get("frete_ml", 0))
+        ads_cost    = float(d.get("ads_cost", 0))
         custos      = float(d.get("custo_produto", 0))
         impostos    = float(d.get("impostos", 0))
         lucro       = float(d.get("lucro_liquido", 0))
@@ -1935,9 +2000,9 @@ elif st.session_state["aba_ativa"] == "fechamento":
             <div style='height:3px;background:#94A3B8;border-radius:99px;margin-top:10px;'></div>
           </div>
           <div style='padding:16px 14px;background:white;border-right:1px solid #E2E8F0;'>
-            <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Tarifas + Frete</div>
-            <div style='font-size:20px;font-weight:800;color:#DC2626;'>− R$ {tarifas+fretes:,.0f}</div>
-            <div style='font-size:11px;color:#64748B;margin-top:2px;'>ML + envios</div>
+            <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Tarifas + Frete + ADS</div>
+            <div style='font-size:20px;font-weight:800;color:#DC2626;'>− R$ {tarifas+fretes+ads_cost:,.0f}</div>
+            <div style='font-size:11px;color:#64748B;margin-top:2px;'>ML + envios + ads</div>
             <div style='height:3px;background:#FCA5A5;border-radius:99px;margin-top:10px;'></div>
           </div>
           <div style='padding:16px 14px;background:white;border-right:1px solid #E2E8F0;'>
@@ -1959,11 +2024,12 @@ elif st.session_state["aba_ativa"] == "fechamento":
         _total_coorte = pedidos + canceladas_n + devolvidas_n
         _taxa_devol   = (devolvidas_n / _total_coorte * 100) if _total_coorte else 0
         _taxa_cancel  = (canceladas_n / _total_coorte * 100) if _total_coorte else 0
+        _ads_pct = (ads_cost / fat * 100) if fat else 0
         m1, m2, m3, m4 = st.columns(4)
         for col, label, val, sub in [
             (m1, "Ticket médio",        f"R$ {ticket:,.2f}",     f"lucro/venda R$ {lucro/pedidos:.2f}" if pedidos else "–"),
             (m2, "Taxa de devolução",   f"{_taxa_devol:.1f}%",   f"{devolvidas_n} devol · {_total_coorte} total · {_taxa_cancel:.1f}% cancel"),
-            (m3, "Estoque em caixa",    f"R$ {estoque:,.0f}",    "valor no fechamento"),
+            (m3, "ADS (Product Ads)",   f"R$ {ads_cost:,.0f}",   f"{_ads_pct:.1f}% do faturamento"),
             (m4, "Margem líquida",      f"{margem:.1f}%",        f"lucro R$ {lucro:,.0f}"),
         ]:
             col.markdown(f"""
@@ -1988,6 +2054,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
                 ("Receita líquida",   f"R$ {fat_liq:,.2f}",          False),
                 ("  Tarifas ML",      f"− R$ {tarifas:,.2f}",        True),
                 ("  Frete ML",        f"− R$ {fretes:,.2f}",         True),
+                ("  ADS (Product Ads)", f"− R$ {ads_cost:,.2f}",     True),
                 ("  Custo produto",   f"− R$ {custos:,.2f}",         True),
                 ("  Impostos (4%)",   f"− R$ {impostos:,.2f}",       True),
                 ("Lucro líquido",     f"R$ {lucro:,.2f}",            False),
@@ -2142,7 +2209,14 @@ elif st.session_state["aba_ativa"] == "fechamento":
                     _frt        = _aprov["Frete"].sum()
                     _cst        = _aprov["Custo Total"].sum()
                     _imp        = _aprov["Imposto"].sum()
-                    _luc        = _aprov["Lucro"].sum() + _devol["Lucro"].sum()
+
+                    # Gasto com ADS (Product Ads) no período
+                    _adv_id     = get_advertiser_id(token[-8:] if token else "", token)
+                    _ads_from   = f"{ano}-{mes:02d}-01"
+                    _ads_to     = f"{ano}-{mes:02d}-{_ultimo_dia:02d}"
+                    _ads_cost   = fetch_ads_cost(_adv_id, token[-8:] if token else "", token, _ads_from, _ads_to)
+
+                    _luc        = _aprov["Lucro"].sum() + _devol["Lucro"].sum() - _ads_cost
                     _mar        = (_luc / _fat * 100) if _fat > 0 else 0
                     _ped        = len(_aprov)
                     _can_n      = len(_cancel)
@@ -2159,6 +2233,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
                         "cancelamentos_valor": round(_cancel_val, 2),
                         "tarifas_ml": round(_tar, 2),
                         "frete_ml": round(_frt, 2),
+                        "ads_cost": round(_ads_cost, 2),
                         "custo_produto": round(_cst, 2),
                         "impostos": round(_imp, 2),
                         "lucro_liquido": round(_luc, 2),
@@ -2171,7 +2246,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
                         "fechado_em": _dtt.now(_tz).strftime("%Y-%m-%d %H:%M:%S"),
                     })
                     if _saved:
-                        st.success(f"✅ {nome_mes} {ano} fechado! Aprovadas: {_ped} · Cancel: {_can_n} (R$ {_cancel_val:,.0f}) · Devol: {_dev_n} (R$ {_devol_val:,.0f})")
+                        st.success(f"✅ {nome_mes} {ano} fechado! Aprovadas: {_ped} · Cancel: {_can_n} (R$ {_cancel_val:,.0f}) · Devol: {_dev_n} (R$ {_devol_val:,.0f}) · ADS: R$ {_ads_cost:,.0f}")
                         st.rerun()
                 else:
                     st.warning("Nenhuma venda encontrada no período.")
