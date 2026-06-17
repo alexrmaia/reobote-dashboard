@@ -251,7 +251,7 @@ def parse_orders(orders, fretes=None, reembolsados=None):
     reembolsados = reembolsados or {}
     rows = []
     
-    # Status de envio que indicam que o produto SAIU do CD (logo = devolução, não cancelamento)
+    # Status de envio que indicam que o produto SAIU do CD (= devolução, não cancelamento)
     _SHIPPED_STATUSES = {"shipped", "delivered", "not_delivered", "ready_to_ship"}
     
     for order in orders:
@@ -273,7 +273,6 @@ def parse_orders(orders, fretes=None, reembolsados=None):
         elif ship_status in _SHIPPED_STATUSES:
             categoria = "devolvida"
         else:
-            # pending, ready_to_print, cancelled, handling, vazio → não saiu do CD
             categoria = "cancelada"
         
         for item in order.get("order_items", []):
@@ -1880,7 +1879,6 @@ elif st.session_state["aba_ativa"] == "fechamento":
         margem  = float(d.get("margem", 0))
         pedidos = int(d.get("pedidos", 0))
         canceladas_n = int(d.get("canceladas", 0))
-        devolvidas_n = int(d.get("devolvidas", 0))
         ticket  = float(d.get("ticket_medio", 0))
         estoque = float(d.get("estoque_valor", 0))
 
@@ -1896,7 +1894,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
           <div style='padding:16px 14px;background:white;border-right:1px solid #E2E8F0;'>
             <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Devoluções</div>
             <div style='font-size:20px;font-weight:800;color:#DC2626;'>− R$ {devol:,.0f}</div>
-            <div style='font-size:11px;color:#64748B;margin-top:2px;'>{devolvidas_n} devolvidos</div>
+            <div style='font-size:11px;color:#64748B;margin-top:2px;'>{canceladas_n} pedidos</div>
             <div style='height:3px;background:#FCA5A5;border-radius:99px;margin-top:10px;'></div>
           </div>
           <div style='padding:16px 14px;background:#F8FAFC;border-right:1px solid #E2E8F0;'>
@@ -1928,12 +1926,9 @@ elif st.session_state["aba_ativa"] == "fechamento":
 
         # Métricas rápidas
         m1, m2, m3, m4 = st.columns(4)
-        _total_coorte = pedidos + canceladas_n + devolvidas_n
-        _perdidos     = canceladas_n + devolvidas_n
-        _taxa_pct     = (_perdidos / _total_coorte * 100) if _total_coorte else 0
         for col, label, val, sub in [
             (m1, "Ticket médio",        f"R$ {ticket:,.2f}",     f"lucro/venda R$ {lucro/pedidos:.2f}" if pedidos else "–"),
-            (m2, "Taxa cancel + devol", f"{_taxa_pct:.1f}%",     f"{canceladas_n} cancel · {devolvidas_n} devol · {_total_coorte} total"),
+            (m2, "Taxa cancelamento",   f"{(canceladas_n/(pedidos+canceladas_n)*100):.1f}%" if pedidos+canceladas_n else "–", f"{canceladas_n} de {pedidos+canceladas_n} pedidos"),
             (m3, "Estoque em caixa",    f"R$ {estoque:,.0f}",    "valor no fechamento"),
             (m4, "Margem líquida",      f"{margem:.1f}%",        f"lucro R$ {lucro:,.0f}"),
         ]:
@@ -2026,58 +2021,154 @@ elif st.session_state["aba_ativa"] == "fechamento":
             _tz = _zi.ZoneInfo("America/Sao_Paulo")
             from datetime import datetime as _dtt
             import calendar as _cal
+            from collections import Counter as _Counter
             _ultimo_dia = _cal.monthrange(ano, mes)[1]
             _df_from = f"{ano}-{mes:02d}-01T00:00:00.000-03:00"
             _df_to   = f"{ano}-{mes:02d}-{_ultimo_dia:02d}T23:59:59.000-03:00"
-            with st.spinner("Buscando dados do período..."):
-                # COORTE: todas as orders criadas no mês (aprovadas + canceladas + devolvidas)
-                # Mesma janela temporal para tudo — denominador e numerador alinhados.
-                _orders_mes = get_orders(str(user_id), token, _df_from, _df_to)
-                
-                # Diagnóstico de paginação/status
-                from collections import Counter as _Counter
-                _status_count = _Counter(o.get("status","?") for o in _orders_mes)
-                st.info(f"📊 Total orders buscadas: {len(_orders_mes)} | Status: {dict(_status_count)}")
 
-                if _orders_mes:
-                    _ship_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in _orders_mes if o.get("shipping",{}).get("id")}))
+            # ──────── DIAGNÓSTICO VERBOSO ────────
+            st.markdown("### 🔍 Diagnóstico")
+            _diag = st.container()
+
+            with st.spinner("Buscando dados do período..."):
+                _headers_ml = {"Authorization": f"Bearer {token}"}
+
+                # ── QUERY 1: orders por date_created (vendas do mês) ──
+                _orders_dc = []
+                _pages_dc  = []
+                _offset, _limit = 0, 50
+                while True:
+                    _r = requests.get(f"{ML_API_BASE}/orders/search",
+                        headers=_headers_ml,
+                        params={"seller": user_id,
+                                "order.date_created.from": _df_from,
+                                "order.date_created.to": _df_to,
+                                "sort": "date_desc",
+                                "offset": _offset, "limit": _limit},
+                        timeout=30)
+                    if _r.status_code != 200:
+                        _pages_dc.append(f"❌ HTTP {_r.status_code} offset={_offset}")
+                        break
+                    _data = _r.json()
+                    _res  = _data.get("results", [])
+                    _tot  = _data.get("paging", {}).get("total", 0)
+                    _pages_dc.append(f"offset={_offset} got={len(_res)} total_api={_tot}")
+                    _orders_dc.extend(_res)
+                    _offset += _limit
+                    if _offset >= _tot or not _res:
+                        break
+
+                _status_dc = _Counter(o.get("status","?") for o in _orders_dc)
+
+                # ── QUERY 2: orders canceladas por date_closed (devoluções fechadas no mês) ──
+                _orders_dcl = []
+                _pages_dcl  = []
+                _offset, _limit = 0, 50
+                while True:
+                    _r = requests.get(f"{ML_API_BASE}/orders/search",
+                        headers=_headers_ml,
+                        params={"seller": user_id,
+                                "order.date_closed.from": _df_from,
+                                "order.date_closed.to": _df_to,
+                                "order.status": "cancelled",
+                                "sort": "date_desc",
+                                "offset": _offset, "limit": _limit},
+                        timeout=30)
+                    if _r.status_code != 200:
+                        _pages_dcl.append(f"❌ HTTP {_r.status_code} offset={_offset}")
+                        break
+                    _data = _r.json()
+                    _res  = _data.get("results", [])
+                    _tot  = _data.get("paging", {}).get("total", 0)
+                    _pages_dcl.append(f"offset={_offset} got={len(_res)} total_api={_tot}")
+                    _orders_dcl.extend(_res)
+                    _offset += _limit
+                    if _offset >= _tot or not _res:
+                        break
+
+                _status_dcl = _Counter(o.get("status","?") for o in _orders_dcl)
+
+                # ── Mesclar e deduplicar por order_id ──
+                _seen_ids   = set()
+                _all_orders = []
+                _ids_dc     = {str(o.get("id")) for o in _orders_dc}
+                _ids_dcl    = {str(o.get("id")) for o in _orders_dcl}
+                for o in _orders_dc + _orders_dcl:
+                    oid = str(o.get("id"))
+                    if oid in _seen_ids:
+                        continue
+                    _seen_ids.add(oid)
+                    _all_orders.append(o)
+
+                _overlap = _ids_dc & _ids_dcl
+                _only_dcl = _ids_dcl - _ids_dc  # canceladas que NÃO apareceram na busca date_created
+
+                # ── Sample dos shipping.status para canceladas ──
+                _cancel_orders = [o for o in _all_orders if o.get("status") == "cancelled"]
+                _ship_statuses = _Counter(
+                    (o.get("shipping", {}) or {}).get("status", "(vazio)")
+                    for o in _cancel_orders
+                )
+
+                # ── Mostrar diagnóstico ──
+                with _diag:
+                    st.info(
+                        f"**QUERY date_created:** {len(_orders_dc)} orders | status={dict(_status_dc)}\n\n"
+                        f"Paginação: {_pages_dc}"
+                    )
+                    st.info(
+                        f"**QUERY date_closed (cancelled):** {len(_orders_dcl)} orders | status={dict(_status_dcl)}\n\n"
+                        f"Paginação: {_pages_dcl}"
+                    )
+                    st.info(
+                        f"**Mesclado (dedup):** {len(_all_orders)} orders únicos\n\n"
+                        f"Overlap entre as duas queries: {len(_overlap)}\n\n"
+                        f"Só em date_closed (canceladas de meses anteriores fechadas em {nome_mes}): {len(_only_dcl)}"
+                    )
+                    st.info(
+                        f"**Shipping.status das {len(_cancel_orders)} canceladas:** {dict(_ship_statuses)}"
+                    )
+
+                if _all_orders:
+                    _ship_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in _all_orders if o.get("shipping",{}).get("id")}))
                     _tok_hash = token[-8:] if token else ""
                     _fretes   = fetch_fretes_batch(_ship_ids, _tok_hash, token)
-                    _reimb    = get_orders_reembolsados(_orders_mes)
+                    _reimb    = get_orders_reembolsados(_all_orders)
 
-                    # Processa TUDO de uma vez — Categoria classifica em aprovada/cancelada/devolvida
-                    _df_raw = parse_orders(_orders_mes, _fretes, _reimb)
+                    _df_raw = parse_orders(_all_orders, _fretes, _reimb)
                     _df     = apply_costs_online(_df_raw, str(user_id))
 
-                    # Segmentar por categoria
+                    # Diagnóstico final de classificação
+                    _cat_count = _df["Categoria"].value_counts().to_dict() if "Categoria" in _df.columns else {}
+                    with _diag:
+                        st.info(f"**Classificação final (após parse_orders):** {_cat_count}")
+
                     _aprov  = _df[_df["Categoria"] == "aprovada"]
-                    _cancel = _df[_df["Categoria"] == "cancelada"]   # não saiu do CD
-                    _devol  = _df[_df["Categoria"] == "devolvida"]   # saiu e voltou
+                    _cancel = _df[_df["Categoria"] == "cancelada"]
+                    _devol  = _df[_df["Categoria"] == "devolvida"]
 
                     _fat       = _aprov["Receita Bruta"].sum()
-                    # Devoluções = só as que saíram e voltaram (impacto $ real)
-                    _devol_val = abs(_devol["Receita Bruta"].sum())
+                    _cancel_val = abs(_cancel["Receita Bruta"].sum())
+                    _devol_val  = abs(_devol["Receita Bruta"].sum())
                     _tar       = _aprov["Taxas ML"].sum()
                     _frt       = _aprov["Frete"].sum()
                     _cst       = _aprov["Custo Total"].sum()
                     _imp       = _aprov["Imposto"].sum()
-                    # Lucro = aprovadas + impacto negativo das devolvidas (frete reverso)
                     _luc       = _aprov["Lucro"].sum() + _devol["Lucro"].sum()
                     _mar       = (_luc / _fat * 100) if _fat > 0 else 0
                     _ped       = len(_aprov)
                     _can_n     = len(_cancel)
                     _dev_n     = len(_devol)
                     _tick      = _fat / _ped if _ped else 0
-                    # Estoque atual
                     _cdf       = load_custos(str(user_id))
                     _est       = sum(float(r.get("qtd_disponivel",0)) * float(r.get("custo_produto",0))
                                     for _, r in _cdf.iterrows() if float(r.get("qtd_disponivel",0)) > 0) if not _cdf.empty else 0
-
 
                     _saved = save_fechamento(str(user_id), {
                         "ano_mes": ano_mes,
                         "faturamento_bruto": round(_fat, 2),
                         "devolucoes": round(_devol_val, 2),
+                        "cancelamentos_valor": round(_cancel_val, 2),
                         "tarifas_ml": round(_tar, 2),
                         "frete_ml": round(_frt, 2),
                         "custo_produto": round(_cst, 2),
@@ -2092,8 +2183,9 @@ elif st.session_state["aba_ativa"] == "fechamento":
                         "fechado_em": _dtt.now(_tz).strftime("%Y-%m-%d %H:%M:%S"),
                     })
                     if _saved:
-                        st.success(f"✅ {nome_mes} {ano} fechado com sucesso!")
-                        st.rerun()
+                        st.success(f"✅ {nome_mes} {ano} fechado! Aprovadas: {_ped} · Cancel: {_can_n} (R$ {_cancel_val:,.0f}) · Devol: {_dev_n} (R$ {_devol_val:,.0f})")
+                        # NÃO faz rerun pra você poder ler o diagnóstico!
+                        st.warning("⚠️ Diagnóstico exibido acima — leia antes de navegar.")
                 else:
                     st.warning("Nenhuma venda encontrada no período.")
 
