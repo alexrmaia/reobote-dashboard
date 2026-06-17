@@ -906,14 +906,12 @@ if st.session_state["aba_ativa"] == "financeiro":
     with k4:
         _card_html = f"""
         <a href='#' id='ads_toggle' style='text-decoration:none;color:inherit;display:block;'>
-          <div style='background:#FAF7F0;border:1px solid {_border};border-radius:10px;
-                      padding:16px 14px;text-align:center;position:relative;cursor:pointer;'>
-            <span style='position:absolute;top:8px;right:10px;background:{_chip_bg};color:white;
+          <div class='kpi-card' style='position:relative;border:1px solid {_border};cursor:pointer;'>
+            <span style='position:absolute;top:10px;right:12px;background:{_chip_bg};color:white;
                          font-size:9px;font-weight:700;letter-spacing:.5px;padding:3px 8px;
                          border-radius:99px;text-transform:uppercase;'>{_chip_txt}</span>
-            <div style='font-size:11px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;
-                        font-weight:600;'>ADS (Product Ads)</div>
-            <div style='font-size:22px;color:{_ads_color};font-weight:800;margin-top:8px;'>{_ads_val_html}</div>
+            <div class='kpi-title'>ADS (Product Ads)</div>
+            <div class='kpi-value' style='color:{_ads_color};'>{_ads_val_html}</div>
             <div style='font-size:11px;color:#64748B;margin-top:6px;'>{_ads_sub}</div>
           </div>
         </a>
