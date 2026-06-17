@@ -802,7 +802,13 @@ if st.session_state["aba_ativa"] == "financeiro":
     _ads_to_fin   = date_to[:10]
     ads_cost      = fetch_ads_cost(_adv_id_fin, token[-8:] if token else "", token, _ads_from_fin, _ads_to_fin)
 
-    lucro_total = aprovadas["Lucro"].sum() - ads_cost
+    # Toggle ADS no lucro (clicável no card de ADS abaixo)
+    if "ads_on" not in st.session_state:
+        st.session_state["ads_on"] = True
+    ads_on  = st.session_state["ads_on"]
+    ads_eff = ads_cost if ads_on else 0.0
+
+    lucro_total = aprovadas["Lucro"].sum() - ads_eff
     margem_real = (lucro_total / faturamento * 100) if faturamento > 0 else 0
     # Salva lucro no session_state para uso no ROI do Caixa
     if "lucro_acumulado" not in st.session_state or periodo == "Personalizar":
@@ -885,7 +891,19 @@ if st.session_state["aba_ativa"] == "financeiro":
     kpi_card(k2, "Taxas ML",       f"R$ {tarifas:,.2f}",    "#EF4444")
     kpi_card(k3, "Frete ML",       f"R$ {fretes_sum:,.2f}", "#EF4444")
     k4, k5, k6 = st.columns(3)
-    kpi_card(k4, "ADS (Product Ads)", f"R$ {ads_cost:,.2f}", "#EF4444")
+    # Card ADS clicável (toggle on/off afetando lucro líquido)
+    _ads_color   = "#EF4444" if ads_on else "#9CA3AF"
+    _ads_value   = f"R$ {ads_cost:,.2f}" if ads_on else f"<span style='text-decoration:line-through;'>R$ {ads_cost:,.2f}</span>"
+    _ads_badge   = "🟢 ON · contando no lucro" if ads_on else "⚪ OFF · ignorado no lucro"
+    k4.markdown(f"""<div class="kpi-card" style="border:1px solid {'#EF4444' if ads_on else '#D1D5DB'};">
+        <div class="kpi-title">ADS (Product Ads)</div>
+        <div class="kpi-value" style="color:{_ads_color};">{_ads_value}</div>
+        <div style="font-size:11px;color:#64748B;margin-top:4px;text-align:center;">{_ads_badge}</div>
+    </div>""", unsafe_allow_html=True)
+    if k4.button(("Desligar ADS do lucro" if ads_on else "Ligar ADS no lucro"),
+                 key="toggle_ads", use_container_width=True):
+        st.session_state["ads_on"] = not ads_on
+        st.rerun()
     kpi_card(k5, "Custo Produto",  f"R$ {custos:,.2f}",     "#EF4444")
     kpi_card(k6, "Lucro Real",     f"R$ {lucro_total:,.2f}", "#059669" if lucro_total >= 0 else "#DC2626")
     k7, k8, k9 = st.columns(3)
