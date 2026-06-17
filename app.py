@@ -844,9 +844,13 @@ if st.session_state["aba_ativa"] == "financeiro":
         </div>""", unsafe_allow_html=True)
 
     def kpi_card(col, title, value, color="#1F2937"):
-        col.markdown(f"""<div class="kpi-card">
-            <div class="kpi-title">{title}</div>
-            <div class="kpi-value" style="color:{color};">{value}</div>
+        col.markdown(f"""<div style="background:#F4F1EA;border:1px solid transparent;border-radius:14px;
+                                     padding:18px 14px;text-align:center;min-height:112px;
+                                     display:flex;flex-direction:column;justify-content:center;">
+            <div style="font-size:13px;font-weight:800;color:#44403C;text-transform:uppercase;
+                        letter-spacing:.25px;margin-bottom:10px;">{title}</div>
+            <div style="font-size:24px;color:{color};font-weight:900;letter-spacing:-.8px;
+                        line-height:1.05;white-space:nowrap;">{value}</div>
         </div>""", unsafe_allow_html=True)
 
     pct = lambda v: f"{v/faturamento*100:.1f}%" if faturamento else "0%"
@@ -906,12 +910,16 @@ if st.session_state["aba_ativa"] == "financeiro":
     with k4:
         _card_html = f"""
         <a href='#' id='ads_toggle' style='text-decoration:none;color:inherit;display:block;'>
-          <div class='kpi-card' style='position:relative;border:1px solid {_border};cursor:pointer;'>
+          <div style='background:#F4F1EA;border:1px solid {_border};border-radius:14px;
+                      padding:18px 14px;text-align:center;position:relative;cursor:pointer;
+                      min-height:112px;display:flex;flex-direction:column;justify-content:center;'>
             <span style='position:absolute;top:10px;right:12px;background:{_chip_bg};color:white;
                          font-size:9px;font-weight:700;letter-spacing:.5px;padding:3px 8px;
                          border-radius:99px;text-transform:uppercase;'>{_chip_txt}</span>
-            <div class='kpi-title'>ADS (Product Ads)</div>
-            <div class='kpi-value' style='color:{_ads_color};'>{_ads_val_html}</div>
+            <div style='font-size:13px;font-weight:800;color:#44403C;text-transform:uppercase;
+                        letter-spacing:.25px;margin-bottom:10px;'>ADS (Product Ads)</div>
+            <div style='font-size:24px;color:{_ads_color};font-weight:900;letter-spacing:-.8px;
+                        line-height:1.05;'>{_ads_val_html}</div>
             <div style='font-size:11px;color:#64748B;margin-top:6px;'>{_ads_sub}</div>
           </div>
         </a>
