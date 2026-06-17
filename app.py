@@ -1957,12 +1957,12 @@ elif st.session_state["aba_ativa"] == "fechamento":
 
         # Métricas rápidas
         _total_coorte = pedidos + canceladas_n + devolvidas_n
-        _perdidos     = canceladas_n + devolvidas_n
-        _taxa_pct     = (_perdidos / _total_coorte * 100) if _total_coorte else 0
+        _taxa_devol   = (devolvidas_n / _total_coorte * 100) if _total_coorte else 0
+        _taxa_cancel  = (canceladas_n / _total_coorte * 100) if _total_coorte else 0
         m1, m2, m3, m4 = st.columns(4)
         for col, label, val, sub in [
             (m1, "Ticket médio",        f"R$ {ticket:,.2f}",     f"lucro/venda R$ {lucro/pedidos:.2f}" if pedidos else "–"),
-            (m2, "Cancel + Devol",      f"{_taxa_pct:.1f}%",     f"{canceladas_n} cancel · {devolvidas_n} devol · {_total_coorte} total"),
+            (m2, "Taxa de devolução",   f"{_taxa_devol:.1f}%",   f"{devolvidas_n} devol · {_total_coorte} total · {_taxa_cancel:.1f}% cancel"),
             (m3, "Estoque em caixa",    f"R$ {estoque:,.0f}",    "valor no fechamento"),
             (m4, "Margem líquida",      f"{margem:.1f}%",        f"lucro R$ {lucro:,.0f}"),
         ]:
