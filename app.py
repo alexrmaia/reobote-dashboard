@@ -448,6 +448,26 @@ def apply_costs_online(df, user_id):
     df["Corrigido"]      = False
 
     df_sorted = df.sort_values("Data").reset_index(drop=True)
+    
+    # ─── DIAGNÓSTICO FIFO ───
+    _ja_consumido = 0
+    _vai_consumir = 0
+    _vai_consumir_ids = []
+    for _, _row in df_sorted.iterrows():
+        _vid = str(_row["Venda"])
+        _can = _row["Cancelada"]
+        _dt  = pd.to_datetime(_row["Data"], utc=True)
+        if _vid in correcoes:
+            continue
+        elif _vid in fifo_hist:
+            _ja_consumido += 1
+        elif _dt >= FIFO_CORTE and not _can:
+            _vai_consumir += 1
+            if len(_vai_consumir_ids) < 5:
+                _vai_consumir_ids.append(_vid)
+    st.info(f"🔍 FIFO diag: {len(df_sorted)} vendas no DF | {_ja_consumido} já em fifo_hist | {_vai_consumir} VÃO consumir lote AGORA · ids: {_vai_consumir_ids}")
+    # ─── FIM DIAGNÓSTICO ───
+    
     for idx, row in df_sorted.iterrows():
         venda_id  = str(row["Venda"])
         sku       = str(row["SKU"]).strip()
