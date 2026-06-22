@@ -465,7 +465,16 @@ def apply_costs_online(df, user_id):
             _vai_consumir += 1
             if len(_vai_consumir_ids) < 5:
                 _vai_consumir_ids.append(_vid)
-    st.info(f"🔍 FIFO diag: {len(df_sorted)} vendas no DF | {_ja_consumido} já em fifo_hist | {_vai_consumir} VÃO consumir lote AGORA · ids: {_vai_consumir_ids}")
+    _diag_msg = f"🔍 FIFO diag: {len(df_sorted)} vendas no DF | {_ja_consumido} já em fifo_hist | {_vai_consumir} VÃO consumir lote AGORA · ids: {_vai_consumir_ids}"
+    print(f"\n[FIFO_DIAG] {_diag_msg}\n", flush=True)
+    try:
+        st.toast(_diag_msg, icon="🔍")
+    except Exception:
+        pass
+    try:
+        st.warning(_diag_msg)
+    except Exception:
+        pass
     # ─── FIM DIAGNÓSTICO ───
     
     for idx, row in df_sorted.iterrows():
