@@ -466,13 +466,20 @@ def apply_costs_online(df, user_id):
             if len(_vai_consumir_ids) < 5:
                 _vai_consumir_ids.append(_vid)
     _diag_msg = f"🔍 FIFO diag: {len(df_sorted)} vendas no DF | {_ja_consumido} já em fifo_hist | {_vai_consumir} VÃO consumir lote AGORA · ids: {_vai_consumir_ids}"
-    print(f"\n[FIFO_DIAG] {_diag_msg}\n", flush=True)
+    # Checagem extra: tamanho real de fifo_hist e teste de uma venda específica
+    _test_vid = "2000016981776304"
+    _in_hist  = _test_vid in fifo_hist
+    _sample_keys = list(fifo_hist.keys())[:3] if fifo_hist else []
+    _diag_msg2 = f"🔬 fifo_hist tem {len(fifo_hist)} entradas | '{_test_vid}' está em fifo_hist? {_in_hist} | sample keys: {_sample_keys}"
+    print(f"\n[FIFO_DIAG] {_diag_msg}\n[FIFO_DIAG] {_diag_msg2}\n", flush=True)
     try:
         st.toast(_diag_msg, icon="🔍")
+        st.toast(_diag_msg2, icon="🔬")
     except Exception:
         pass
     try:
         st.warning(_diag_msg)
+        st.warning(_diag_msg2)
     except Exception:
         pass
     # ─── FIM DIAGNÓSTICO ───
