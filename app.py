@@ -92,10 +92,17 @@ def save_regime(user_id, row):
 
 def load_fifo_consumo(user_id):
     sb = get_supabase()
-    resp = sb.table("fifo_consumo").select("*").eq("user_id", user_id).execute()
-    if not resp.data:
-        return {}
-    return {r["venda_id"]: r for r in resp.data}
+    out = {}
+    offset, page = 0, 1000
+    while True:
+        resp = sb.table("fifo_consumo").select("*").eq("user_id", user_id).range(offset, offset + page - 1).execute()
+        rows = resp.data or []
+        for r in rows:
+            out[r["venda_id"]] = r
+        if len(rows) < page:
+            break
+        offset += page
+    return out
 
 def load_correcoes(user_id):
     sb = get_supabase()
@@ -448,42 +455,6 @@ def apply_costs_online(df, user_id):
     df["Corrigido"]      = False
 
     df_sorted = df.sort_values("Data").reset_index(drop=True)
-    
-    # ─── DIAGNÓSTICO FIFO ───
-    _ja_consumido = 0
-    _vai_consumir = 0
-    _vai_consumir_ids = []
-    for _, _row in df_sorted.iterrows():
-        _vid = str(_row["Venda"])
-        _can = _row["Cancelada"]
-        _dt  = pd.to_datetime(_row["Data"], utc=True)
-        if _vid in correcoes:
-            continue
-        elif _vid in fifo_hist:
-            _ja_consumido += 1
-        elif _dt >= FIFO_CORTE and not _can:
-            _vai_consumir += 1
-            if len(_vai_consumir_ids) < 5:
-                _vai_consumir_ids.append(_vid)
-    _diag_msg = f"🔍 FIFO diag: {len(df_sorted)} vendas no DF | {_ja_consumido} já em fifo_hist | {_vai_consumir} VÃO consumir lote AGORA · ids: {_vai_consumir_ids}"
-    # Checagem extra: tamanho real de fifo_hist e teste de uma venda específica
-    _test_vid = "2000016981776304"
-    _in_hist  = _test_vid in fifo_hist
-    _sample_keys = list(fifo_hist.keys())[:3] if fifo_hist else []
-    _diag_msg2 = f"🔬 fifo_hist tem {len(fifo_hist)} entradas | '{_test_vid}' está em fifo_hist? {_in_hist} | sample keys: {_sample_keys}"
-    print(f"\n[FIFO_DIAG] {_diag_msg}\n[FIFO_DIAG] {_diag_msg2}\n", flush=True)
-    try:
-        st.toast(_diag_msg, icon="🔍")
-        st.toast(_diag_msg2, icon="🔬")
-    except Exception:
-        pass
-    try:
-        st.warning(_diag_msg)
-        st.warning(_diag_msg2)
-    except Exception:
-        pass
-    # ─── FIM DIAGNÓSTICO ───
-    
     for idx, row in df_sorted.iterrows():
         venda_id  = str(row["Venda"])
         sku       = str(row["SKU"]).strip()
