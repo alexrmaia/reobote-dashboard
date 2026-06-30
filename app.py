@@ -2168,6 +2168,32 @@ elif st.session_state["aba_ativa"] == "fechamento":
                       <span style='color:{"#16A34A" if luc_h >= 0 else "#DC2626"};font-weight:700;'>R$ {luc_h:,.0f}</span>
                       <span style='text-align:right;color:{"#16A34A" if mar_h >= 15 else "#64748B"};font-weight:700;'>{mar_h:.1f}%</span>
                     </div>""", unsafe_allow_html=True)
+
+                # ── Gráfico de linhas: Faturamento vs Lucro (duplo eixo) ──
+                st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
+                _meses_pt = ["","Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"]
+                _df_hist = pd.DataFrame([{
+                    "ano_mes":  f["ano_mes"],
+                    "label":    f"{_meses_pt[int(f['ano_mes'][5:7])]}/{f['ano_mes'][2:4]}",
+                    "Faturamento": float(f.get("faturamento_bruto", 0)),
+                    "Lucro":       float(f.get("lucro_liquido", 0)),
+                } for f in fechamentos])
+                _df_hist = _df_hist.sort_values("ano_mes")
+
+                _base = alt.Chart(_df_hist).encode(
+                    x=alt.X("label:N", title=None, sort=list(_df_hist["label"]),
+                            axis=alt.Axis(labelAngle=0, labelFontSize=10))
+                )
+                _l_fat = _base.mark_line(color="#7C3AED", strokeWidth=2.5, point=alt.OverlayMarkDef(filled=True, size=60, color="#7C3AED")).encode(
+                    y=alt.Y("Faturamento:Q", title="Faturamento (R$)", axis=alt.Axis(titleColor="#7C3AED", labelColor="#7C3AED", format=",.0f")),
+                    tooltip=[alt.Tooltip("label:N", title="Mês"), alt.Tooltip("Faturamento:Q", format=",.2f")]
+                )
+                _l_luc = _base.mark_line(color="#16A34A", strokeWidth=2.5, point=alt.OverlayMarkDef(filled=True, size=60, color="#16A34A")).encode(
+                    y=alt.Y("Lucro:Q", title="Lucro (R$)", axis=alt.Axis(titleColor="#16A34A", labelColor="#16A34A", format=",.0f")),
+                    tooltip=[alt.Tooltip("label:N", title="Mês"), alt.Tooltip("Lucro:Q", format=",.2f")]
+                )
+                _chart = alt.layer(_l_fat, _l_luc).resolve_scale(y="independent").properties(height=220)
+                st.altair_chart(_chart, use_container_width=True)
             else:
                 st.info("Nenhum mês fechado ainda.")
             st.markdown('</div>', unsafe_allow_html=True)
