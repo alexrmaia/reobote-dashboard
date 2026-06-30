@@ -2147,7 +2147,20 @@ elif st.session_state["aba_ativa"] == "fechamento":
             st.markdown("**📈 Histórico mensal**")
             if fechamentos:
                 max_fat = max(float(f.get("faturamento_bruto", 0)) for f in fechamentos)
-                for f in fechamentos[:6]:
+                # Helper: gera HTML do delta (seta + %)
+                def _delta_html(atual, anterior):
+                    if anterior is None or anterior == 0:
+                        return ""
+                    var = (atual - anterior) / abs(anterior) * 100
+                    if abs(var) < 0.05:
+                        return ""
+                    if var > 0:
+                        return f"<span style='color:#16A34A;font-size:10px;font-weight:700;margin-left:4px;white-space:nowrap;'>▲ {var:.1f}%</span>"
+                    else:
+                        return f"<span style='color:#DC2626;font-size:10px;font-weight:700;margin-left:4px;white-space:nowrap;'>▼ {abs(var):.1f}%</span>"
+
+                fech_list = fechamentos[:6]
+                for i, f in enumerate(fech_list):
                     fm = f["ano_mes"]
                     ano_h, mes_h = int(fm[:4]), int(fm[5:7])
                     nome_h = ["","Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"][mes_h]
@@ -2156,17 +2169,26 @@ elif st.session_state["aba_ativa"] == "fechamento":
                     mar_h  = float(f.get("margem", 0))
                     pct    = int(fat_h / max_fat * 100) if max_fat > 0 else 0
                     atual  = fm == ano_mes
+                    # Mês anterior (lista vem ordenada do mais recente pro mais antigo)
+                    prev = fechamentos[i+1] if i+1 < len(fechamentos) else None
+                    fat_prev = float(prev.get("faturamento_bruto", 0)) if prev else None
+                    luc_prev = float(prev.get("lucro_liquido", 0))    if prev else None
+                    mar_prev = float(prev.get("margem", 0))           if prev else None
+                    d_fat = _delta_html(fat_h, fat_prev)
+                    d_luc = _delta_html(luc_h, luc_prev)
+                    d_mar = _delta_html(mar_h, mar_prev)
+
                     st.markdown(f"""
-                    <div style='display:grid;grid-template-columns:55px 1fr 80px 55px;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #F1F5F9;font-size:12px;'>
+                    <div style='display:grid;grid-template-columns:55px 1fr 110px 90px;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #F1F5F9;font-size:12px;'>
                       <span style='{"font-weight:800;color:#7C3AED;" if atual else "color:#64748B;"}'>{nome_h} {str(ano_h)[2:]}</span>
                       <div>
-                        <div style='font-size:10px;color:#94A3B8;margin-bottom:2px;'>R$ {fat_h:,.0f}</div>
+                        <div style='font-size:10px;color:#94A3B8;margin-bottom:2px;'>R$ {fat_h:,.0f}{d_fat}</div>
                         <div style='background:#F1F5F9;border-radius:99px;height:6px;overflow:hidden;'>
                           <div style='height:6px;border-radius:99px;background:#7C3AED;width:{pct}%;'></div>
                         </div>
                       </div>
-                      <span style='color:{"#16A34A" if luc_h >= 0 else "#DC2626"};font-weight:700;'>R$ {luc_h:,.0f}</span>
-                      <span style='text-align:right;color:{"#16A34A" if mar_h >= 15 else "#64748B"};font-weight:700;'>{mar_h:.1f}%</span>
+                      <span style='color:{"#16A34A" if luc_h >= 0 else "#DC2626"};font-weight:700;'>R$ {luc_h:,.0f}{d_luc}</span>
+                      <span style='text-align:right;color:{"#16A34A" if mar_h >= 15 else "#64748B"};font-weight:700;'>{mar_h:.1f}%{d_mar}</span>
                     </div>""", unsafe_allow_html=True)
 
                 # ── Gráfico de linhas: Faturamento vs Lucro (duplo eixo) ──
