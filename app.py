@@ -1759,7 +1759,49 @@ elif st.session_state["aba_ativa"] == "caixa":
     st.caption("Previsão de liberação do dinheiro das vendas dos últimos 90 dias, agrupado por dia.")
     _rec_df = get_recebimentos_futuros(str(user_id), token[-8:] if token else "", token)
     if _rec_df.empty:
+        # Diagnóstico
         st.info("Nenhum recebimento futuro previsto.")
+        with st.expander("🔍 Diagnóstico (por que está vazio?)", expanded=True):
+            from datetime import datetime as _dt, timedelta as _td
+            import zoneinfo as _zi
+            _tz_d = _zi.ZoneInfo("America/Sao_Paulo")
+            _h = _dt.now(_tz_d).date()
+            _from_d = (_h - _td(days=90)).strftime("%Y-%m-%dT00:00:00.000-03:00")
+            _to_d   = (_h + _td(days=1)).strftime("%Y-%m-%dT00:00:00.000-03:00")
+            _headers_d = {"Authorization": f"Bearer {token}"}
+            _r_diag = requests.get(f"{ML_API_BASE}/orders/search",
+                headers=_headers_d,
+                params={"seller": user_id,
+                        "order.date_created.from": _from_d,
+                        "order.date_created.to": _to_d,
+                        "sort": "date_desc",
+                        "offset": 0, "limit": 3},
+                timeout=30)
+            st.write(f"**Range da busca:** {_from_d[:10]} → {_to_d[:10]}")
+            st.write(f"**HTTP status:** {_r_diag.status_code}")
+            if _r_diag.status_code == 200:
+                _dj = _r_diag.json()
+                st.write(f"**Total orders no período:** {_dj.get('paging', {}).get('total', 0)}")
+                _res_d = _dj.get("results", [])
+                if _res_d:
+                    _o0 = _res_d[0]
+                    st.write("**Amostra da 1ª order:**")
+                    _pays = _o0.get("payments", []) or []
+                    st.write(f"- Order id: {_o0.get('id')}")
+                    st.write(f"- Status: {_o0.get('status')}")
+                    st.write(f"- date_created: {_o0.get('date_created')}")
+                    st.write(f"- Nº payments: {len(_pays)}")
+                    for i, _p in enumerate(_pays):
+                        st.write(f"- Payment #{i+1}:")
+                        st.write(f"  - status: {_p.get('status')}")
+                        st.write(f"  - money_release_date: `{_p.get('money_release_date')}`")
+                        st.write(f"  - date_approved: `{_p.get('date_approved')}`")
+                        st.write(f"  - date_last_updated: `{_p.get('date_last_updated')}`")
+                        st.write(f"  - net_received_amount: `{_p.get('net_received_amount')}`")
+                        st.write(f"  - transaction_amount: `{_p.get('transaction_amount')}`")
+                        st.write(f"  - keys disponíveis: {list(_p.keys())}")
+            else:
+                st.error(f"Resposta HTTP: {_r_diag.text[:500]}")
     else:
         from datetime import date, timedelta
         _hoje_d = date.today()
