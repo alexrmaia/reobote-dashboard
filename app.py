@@ -1761,12 +1761,12 @@ elif st.session_state["aba_ativa"] == "caixa":
     if _rec_df.empty:
         # Diagnóstico
         st.info("Nenhum recebimento futuro previsto.")
-        with st.expander("🔍 Diagnóstico (por que está vazio?)", expanded=True):
+        with st.expander("🔍 Diagnóstico (testando endpoint /v1/payments)", expanded=True):
             from datetime import datetime as _dt, timedelta as _td
             import zoneinfo as _zi
             _tz_d = _zi.ZoneInfo("America/Sao_Paulo")
             _h = _dt.now(_tz_d).date()
-            _from_d = (_h - _td(days=90)).strftime("%Y-%m-%dT00:00:00.000-03:00")
+            _from_d = (_h - _td(days=7)).strftime("%Y-%m-%dT00:00:00.000-03:00")
             _to_d   = (_h + _td(days=1)).strftime("%Y-%m-%dT00:00:00.000-03:00")
             _headers_d = {"Authorization": f"Bearer {token}"}
             _r_diag = requests.get(f"{ML_API_BASE}/orders/search",
@@ -1775,33 +1775,57 @@ elif st.session_state["aba_ativa"] == "caixa":
                         "order.date_created.from": _from_d,
                         "order.date_created.to": _to_d,
                         "sort": "date_desc",
-                        "offset": 0, "limit": 3},
+                        "offset": 0, "limit": 1},
                 timeout=30)
-            st.write(f"**Range da busca:** {_from_d[:10]} → {_to_d[:10]}")
-            st.write(f"**HTTP status:** {_r_diag.status_code}")
             if _r_diag.status_code == 200:
-                _dj = _r_diag.json()
-                st.write(f"**Total orders no período:** {_dj.get('paging', {}).get('total', 0)}")
-                _res_d = _dj.get("results", [])
+                _res_d = _r_diag.json().get("results", [])
                 if _res_d:
                     _o0 = _res_d[0]
-                    st.write("**Amostra da 1ª order:**")
                     _pays = _o0.get("payments", []) or []
-                    st.write(f"- Order id: {_o0.get('id')}")
-                    st.write(f"- Status: {_o0.get('status')}")
-                    st.write(f"- date_created: {_o0.get('date_created')}")
-                    st.write(f"- Nº payments: {len(_pays)}")
-                    for i, _p in enumerate(_pays):
-                        st.write(f"- Payment #{i+1}:")
-                        st.write(f"  - status: {_p.get('status')}")
-                        st.write(f"  - money_release_date: `{_p.get('money_release_date')}`")
-                        st.write(f"  - date_approved: `{_p.get('date_approved')}`")
-                        st.write(f"  - date_last_updated: `{_p.get('date_last_updated')}`")
-                        st.write(f"  - net_received_amount: `{_p.get('net_received_amount')}`")
-                        st.write(f"  - transaction_amount: `{_p.get('transaction_amount')}`")
-                        st.write(f"  - keys disponíveis: {list(_p.keys())}")
-            else:
-                st.error(f"Resposta HTTP: {_r_diag.text[:500]}")
+                    if _pays:
+                        _pid = _pays[0].get("id")
+                        st.write(f"**Payment ID de teste:** `{_pid}`")
+
+                        # Chamada 1: /v1/payments/{id} (Mercado Pago)
+                        st.write("### Teste 1: `/v1/payments/{id}`")
+                        _r1 = requests.get(f"https://api.mercadopago.com/v1/payments/{_pid}",
+                            headers=_headers_d, timeout=15)
+                        st.write(f"HTTP: {_r1.status_code}")
+                        if _r1.status_code == 200:
+                            _d1 = _r1.json()
+                            st.write(f"- money_release_date: `{_d1.get('money_release_date')}`")
+                            st.write(f"- net_received_amount: `{_d1.get('net_received_amount')}`")
+                            st.write(f"- transaction_amount: `{_d1.get('transaction_amount')}`")
+                            st.write(f"- status: `{_d1.get('status')}`")
+                            st.write(f"- keys: {list(_d1.keys())[:30]}")
+                        else:
+                            st.write(f"Resposta: `{_r1.text[:300]}`")
+
+                        # Chamada 2: /payments/{id} (ML)
+                        st.write("### Teste 2: `/payments/{id}` (ML)")
+                        _r2 = requests.get(f"{ML_API_BASE}/payments/{_pid}",
+                            headers=_headers_d, timeout=15)
+                        st.write(f"HTTP: {_r2.status_code}")
+                        if _r2.status_code == 200:
+                            _d2 = _r2.json()
+                            st.write(f"- money_release_date: `{_d2.get('money_release_date')}`")
+                            st.write(f"- net_received_amount: `{_d2.get('net_received_amount')}`")
+                            st.write(f"- keys: {list(_d2.keys())[:30]}")
+                        else:
+                            st.write(f"Resposta: `{_r2.text[:300]}`")
+
+                        # Chamada 3: /collections/{id}
+                        st.write("### Teste 3: `/collections/{id}`")
+                        _r3 = requests.get(f"{ML_API_BASE}/collections/{_pid}",
+                            headers=_headers_d, timeout=15)
+                        st.write(f"HTTP: {_r3.status_code}")
+                        if _r3.status_code == 200:
+                            _d3 = _r3.json()
+                            st.write(f"- money_release_date: `{_d3.get('money_release_date')}`")
+                            st.write(f"- net_received_amount: `{_d3.get('net_received_amount')}`")
+                            st.write(f"- keys: {list(_d3.keys())[:30]}")
+                        else:
+                            st.write(f"Resposta: `{_r3.text[:300]}`")
     else:
         from datetime import date, timedelta
         _hoje_d = date.today()
