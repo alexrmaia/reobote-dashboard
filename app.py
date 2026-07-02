@@ -326,6 +326,81 @@ def fetch_ads_cost(advertiser_id, token_hash, token, date_from_ymd, date_to_ymd)
     except Exception:
         return 0.0
 
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_recebimentos_futuros(user_id, token_hash, token):
+    """
+    Busca orders aprovadas dos últimos 90 dias e extrai money_release_date + net_received_amount
+    de cada payment. Retorna DataFrame com colunas: data (date), valor (float).
+    Só datas >= hoje (ou seja, dinheiro AINDA A LIBERAR).
+    """
+    from datetime import datetime, date, timedelta
+    import zoneinfo
+    _tz = zoneinfo.ZoneInfo("America/Sao_Paulo")
+    _hoje = datetime.now(_tz).date()
+    _from = (_hoje - timedelta(days=90)).strftime("%Y-%m-%dT00:00:00.000-03:00")
+    _to   = (_hoje + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00.000-03:00")
+
+    headers = {"Authorization": f"Bearer {token}"}
+    orders = []
+    offset, limit = 0, 50
+    while True:
+        try:
+            r = requests.get(f"{ML_API_BASE}/orders/search",
+                headers=headers,
+                params={"seller": user_id,
+                        "order.date_created.from": _from,
+                        "order.date_created.to": _to,
+                        "sort": "date_desc",
+                        "offset": offset, "limit": limit},
+                timeout=30)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            res = data.get("results", []) or []
+            orders.extend(res)
+            offset += limit
+            if offset >= data.get("paging", {}).get("total", 0) or not res:
+                break
+        except Exception:
+            break
+
+    # Extrair money_release_date de cada payment aprovado
+    rows = []
+    for order in orders:
+        if order.get("status") == "cancelled":
+            continue
+        for pay in (order.get("payments") or []):
+            status = (pay.get("status") or "").lower()
+            if status not in ("approved", "authorized", "in_process"):
+                continue
+            release_iso = pay.get("money_release_date") or pay.get("date_last_updated")
+            if not release_iso:
+                continue
+            try:
+                release_dt = pd.to_datetime(release_iso).tz_convert(_tz).date()
+            except Exception:
+                try:
+                    release_dt = pd.to_datetime(release_iso).date()
+                except Exception:
+                    continue
+            if release_dt < _hoje:
+                continue  # já foi liberado
+            valor_liq = float(pay.get("transaction_amount_refunded") or 0)
+            valor_bruto = float(pay.get("transaction_amount") or 0)
+            valor_taxa  = float(pay.get("marketplace_fee") or pay.get("fee_details", [{}])[0].get("amount", 0) or 0) if pay.get("fee_details") else 0
+            # net_received_amount é o valor líquido que cai na conta
+            valor_net   = float(pay.get("net_received_amount") or (valor_bruto - valor_taxa - valor_liq))
+            if valor_net <= 0:
+                continue
+            rows.append({"data": release_dt, "valor": valor_net})
+
+    if not rows:
+        return pd.DataFrame(columns=["data", "valor"])
+    df = pd.DataFrame(rows)
+    df = df.groupby("data", as_index=False)["valor"].sum().sort_values("data")
+    return df
+
 def parse_orders(orders, fretes=None, reembolsados=None, shipments_info=None):
     import requests
     import streamlit as st
@@ -1675,6 +1750,53 @@ elif st.session_state["aba_ativa"] == "caixa":
     k2.markdown(f"""<div class="kpi-card"><div class="kpi-title">Saídas</div><div class="kpi-value" style="color:#EF4444;">R$ {saidas:,.2f}</div></div>""", unsafe_allow_html=True)
     k3.markdown(f"""<div class="kpi-card"><div class="kpi-title">A Pagar</div><div class="kpi-value" style="color:#F59E0B;">R$ {a_pagar:,.2f}</div></div>""", unsafe_allow_html=True)
     k4.markdown(f"""<div class="kpi-card"><div class="kpi-title">Saldo após pagamentos</div><div class="kpi-value" style="color:#7C3AED;">R$ {saldo - a_pagar:,.2f}</div></div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Calendário de Recebimentos Futuros ──
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("**📅 Calendário de Recebimentos (Mercado Pago)**")
+    st.caption("Previsão de liberação do dinheiro das vendas dos últimos 90 dias, agrupado por dia.")
+    _rec_df = get_recebimentos_futuros(str(user_id), token[-8:] if token else "", token)
+    if _rec_df.empty:
+        st.info("Nenhum recebimento futuro previsto.")
+    else:
+        from datetime import date, timedelta
+        _hoje_d = date.today()
+        _total_futuro = float(_rec_df["valor"].sum())
+        _prox_7  = float(_rec_df[_rec_df["data"] <= _hoje_d + timedelta(days=7)]["valor"].sum())
+        _prox_30 = float(_rec_df[_rec_df["data"] <= _hoje_d + timedelta(days=30)]["valor"].sum())
+
+        r1, r2, r3 = st.columns(3)
+        r1.markdown(f"""<div class="kpi-card"><div class="kpi-title">Próximos 7 dias</div><div class="kpi-value" style="color:#16A34A;">R$ {_prox_7:,.2f}</div></div>""", unsafe_allow_html=True)
+        r2.markdown(f"""<div class="kpi-card"><div class="kpi-title">Próximos 30 dias</div><div class="kpi-value" style="color:#16A34A;">R$ {_prox_30:,.2f}</div></div>""", unsafe_allow_html=True)
+        r3.markdown(f"""<div class="kpi-card"><div class="kpi-title">Total a liberar</div><div class="kpi-value" style="color:#7C3AED;">R$ {_total_futuro:,.2f}</div></div>""", unsafe_allow_html=True)
+
+        st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+
+        # Timeline dia a dia
+        _rec_df_view = _rec_df.copy()
+        _rec_df_view["Acumulado"] = _rec_df_view["valor"].cumsum()
+        _rec_df_view["Data"] = _rec_df_view["data"].astype(str)
+        _chart_rec = alt.Chart(_rec_df_view).mark_bar(color="#16A34A", cornerRadius=3).encode(
+            x=alt.X("Data:N", title=None, axis=alt.Axis(labelAngle=-45, labelFontSize=10)),
+            y=alt.Y("valor:Q", title="R$ a liberar", axis=alt.Axis(format=",.0f")),
+            tooltip=[
+                alt.Tooltip("Data:N", title="Dia"),
+                alt.Tooltip("valor:Q", title="Libera", format=",.2f"),
+                alt.Tooltip("Acumulado:Q", title="Acumulado até aqui", format=",.2f"),
+            ]
+        ).properties(height=220)
+        st.altair_chart(_chart_rec, use_container_width=True)
+
+        # Tabela expandível
+        with st.expander(f"📋 Ver detalhamento dia a dia ({len(_rec_df)} datas)", expanded=False):
+            _rec_show = _rec_df.copy()
+            _rec_show["Data"]  = _rec_show["data"].apply(lambda d: d.strftime("%d/%m/%Y (%a)"))
+            _rec_show["Valor"] = _rec_show["valor"].apply(lambda v: f"R$ {v:,.2f}")
+            _rec_show["Acumulado"] = _rec_show["valor"].cumsum().apply(lambda v: f"R$ {v:,.2f}")
+            st.dataframe(_rec_show[["Data","Valor","Acumulado"]], hide_index=True, use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
