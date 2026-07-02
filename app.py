@@ -330,11 +330,13 @@ def fetch_ads_cost(advertiser_id, token_hash, token, date_from_ymd, date_to_ymd)
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_recebimentos_futuros(user_id, token_hash, token):
     """
-    Busca orders aprovadas dos últimos 90 dias e extrai money_release_date + net_received_amount
-    de cada payment. Retorna DataFrame com colunas: data (date), valor (float).
+    Busca orders aprovadas dos últimos 90 dias, coleta os payment IDs,
+    e chama /collections/{id} em paralelo pra pegar money_release_date + net_received_amount.
+    Retorna DataFrame com colunas: data (date), valor (float).
     Só datas >= hoje (ou seja, dinheiro AINDA A LIBERAR).
     """
     from datetime import datetime, date, timedelta
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     import zoneinfo
     _tz = zoneinfo.ZoneInfo("America/Sao_Paulo")
     _hoje = datetime.now(_tz).date()
@@ -342,7 +344,9 @@ def get_recebimentos_futuros(user_id, token_hash, token):
     _to   = (_hoje + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00.000-03:00")
 
     headers = {"Authorization": f"Bearer {token}"}
-    orders = []
+
+    # 1) Buscar orders + coletar payment IDs
+    payment_ids = []
     offset, limit = 0, 50
     while True:
         try:
@@ -358,42 +362,51 @@ def get_recebimentos_futuros(user_id, token_hash, token):
                 break
             data = r.json()
             res = data.get("results", []) or []
-            orders.extend(res)
+            for o in res:
+                if o.get("status") == "cancelled":
+                    continue
+                for pay in (o.get("payments") or []):
+                    if (pay.get("status") or "").lower() in ("approved", "authorized", "in_process"):
+                        payment_ids.append(pay.get("id"))
             offset += limit
             if offset >= data.get("paging", {}).get("total", 0) or not res:
                 break
         except Exception:
             break
 
-    # Extrair money_release_date de cada payment aprovado
-    rows = []
-    for order in orders:
-        if order.get("status") == "cancelled":
-            continue
-        for pay in (order.get("payments") or []):
-            status = (pay.get("status") or "").lower()
-            if status not in ("approved", "authorized", "in_process"):
-                continue
-            release_iso = pay.get("money_release_date") or pay.get("date_last_updated")
-            if not release_iso:
-                continue
+    payment_ids = list({p for p in payment_ids if p})
+
+    # 2) Buscar /collections/{id} em paralelo
+    def _fetch_one(pid):
+        try:
+            resp = requests.get(f"{ML_API_BASE}/collections/{pid}", headers=headers, timeout=15)
+            if resp.status_code != 200:
+                return None
+            d = resp.json()
+            release_iso = d.get("money_release_date")
+            net_val     = float(d.get("net_received_amount") or 0)
+            if not release_iso or net_val <= 0:
+                return None
             try:
                 release_dt = pd.to_datetime(release_iso).tz_convert(_tz).date()
             except Exception:
                 try:
                     release_dt = pd.to_datetime(release_iso).date()
                 except Exception:
-                    continue
+                    return None
             if release_dt < _hoje:
-                continue  # já foi liberado
-            valor_liq = float(pay.get("transaction_amount_refunded") or 0)
-            valor_bruto = float(pay.get("transaction_amount") or 0)
-            valor_taxa  = float(pay.get("marketplace_fee") or pay.get("fee_details", [{}])[0].get("amount", 0) or 0) if pay.get("fee_details") else 0
-            # net_received_amount é o valor líquido que cai na conta
-            valor_net   = float(pay.get("net_received_amount") or (valor_bruto - valor_taxa - valor_liq))
-            if valor_net <= 0:
-                continue
-            rows.append({"data": release_dt, "valor": valor_net})
+                return None
+            return (release_dt, net_val)
+        except Exception:
+            return None
+
+    rows = []
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs = {ex.submit(_fetch_one, pid): pid for pid in payment_ids}
+        for f in as_completed(futs):
+            r = f.result()
+            if r:
+                rows.append({"data": r[0], "valor": r[1]})
 
     if not rows:
         return pd.DataFrame(columns=["data", "valor"])
@@ -1759,73 +1772,7 @@ elif st.session_state["aba_ativa"] == "caixa":
     st.caption("Previsão de liberação do dinheiro das vendas dos últimos 90 dias, agrupado por dia.")
     _rec_df = get_recebimentos_futuros(str(user_id), token[-8:] if token else "", token)
     if _rec_df.empty:
-        # Diagnóstico
         st.info("Nenhum recebimento futuro previsto.")
-        with st.expander("🔍 Diagnóstico (testando endpoint /v1/payments)", expanded=True):
-            from datetime import datetime as _dt, timedelta as _td
-            import zoneinfo as _zi
-            _tz_d = _zi.ZoneInfo("America/Sao_Paulo")
-            _h = _dt.now(_tz_d).date()
-            _from_d = (_h - _td(days=7)).strftime("%Y-%m-%dT00:00:00.000-03:00")
-            _to_d   = (_h + _td(days=1)).strftime("%Y-%m-%dT00:00:00.000-03:00")
-            _headers_d = {"Authorization": f"Bearer {token}"}
-            _r_diag = requests.get(f"{ML_API_BASE}/orders/search",
-                headers=_headers_d,
-                params={"seller": user_id,
-                        "order.date_created.from": _from_d,
-                        "order.date_created.to": _to_d,
-                        "sort": "date_desc",
-                        "offset": 0, "limit": 1},
-                timeout=30)
-            if _r_diag.status_code == 200:
-                _res_d = _r_diag.json().get("results", [])
-                if _res_d:
-                    _o0 = _res_d[0]
-                    _pays = _o0.get("payments", []) or []
-                    if _pays:
-                        _pid = _pays[0].get("id")
-                        st.write(f"**Payment ID de teste:** `{_pid}`")
-
-                        # Chamada 1: /v1/payments/{id} (Mercado Pago)
-                        st.write("### Teste 1: `/v1/payments/{id}`")
-                        _r1 = requests.get(f"https://api.mercadopago.com/v1/payments/{_pid}",
-                            headers=_headers_d, timeout=15)
-                        st.write(f"HTTP: {_r1.status_code}")
-                        if _r1.status_code == 200:
-                            _d1 = _r1.json()
-                            st.write(f"- money_release_date: `{_d1.get('money_release_date')}`")
-                            st.write(f"- net_received_amount: `{_d1.get('net_received_amount')}`")
-                            st.write(f"- transaction_amount: `{_d1.get('transaction_amount')}`")
-                            st.write(f"- status: `{_d1.get('status')}`")
-                            st.write(f"- keys: {list(_d1.keys())[:30]}")
-                        else:
-                            st.write(f"Resposta: `{_r1.text[:300]}`")
-
-                        # Chamada 2: /payments/{id} (ML)
-                        st.write("### Teste 2: `/payments/{id}` (ML)")
-                        _r2 = requests.get(f"{ML_API_BASE}/payments/{_pid}",
-                            headers=_headers_d, timeout=15)
-                        st.write(f"HTTP: {_r2.status_code}")
-                        if _r2.status_code == 200:
-                            _d2 = _r2.json()
-                            st.write(f"- money_release_date: `{_d2.get('money_release_date')}`")
-                            st.write(f"- net_received_amount: `{_d2.get('net_received_amount')}`")
-                            st.write(f"- keys: {list(_d2.keys())[:30]}")
-                        else:
-                            st.write(f"Resposta: `{_r2.text[:300]}`")
-
-                        # Chamada 3: /collections/{id}
-                        st.write("### Teste 3: `/collections/{id}`")
-                        _r3 = requests.get(f"{ML_API_BASE}/collections/{_pid}",
-                            headers=_headers_d, timeout=15)
-                        st.write(f"HTTP: {_r3.status_code}")
-                        if _r3.status_code == 200:
-                            _d3 = _r3.json()
-                            st.write(f"- money_release_date: `{_d3.get('money_release_date')}`")
-                            st.write(f"- net_received_amount: `{_d3.get('net_received_amount')}`")
-                            st.write(f"- keys: {list(_d3.keys())[:30]}")
-                        else:
-                            st.write(f"Resposta: `{_r3.text[:300]}`")
     else:
         from datetime import date, timedelta
         _hoje_d = date.today()
