@@ -971,10 +971,53 @@ if st.session_state["aba_ativa"] == "financeiro":
     # Alinha o Financeiro com o Fechamento: vendas de junho canceladas em julho
     # aparecem como aprovadas em junho e prejuízo em julho.
     _competencia_recat = set()
-    if is_mes_completo(date_from, date_to):
+    _eh_mes_completo   = is_mes_completo(date_from, date_to)
+
+    # ─── DIAGNÓSTICO ───
+    from collections import Counter as _Counter
+    _status_orig = _Counter(o.get("status","?") for o in orders)
+    st.info(
+        f"🔍 **Diagnóstico competência**\n\n"
+        f"- `date_from` = `{date_from}` · `date_to` = `{date_to}`\n"
+        f"- `is_mes_completo` = **{_eh_mes_completo}**\n"
+        f"- Total orders buscadas: **{len(orders)}**\n"
+        f"- Status distribuição: `{dict(_status_orig)}`"
+    )
+
+    if _eh_mes_completo:
+        # Analisar quais orders são candidatas à recategorização
+        _candidatas = []
+        _mes_ini_d = pd.to_datetime(date_from)
+        _mes_fim_d = pd.to_datetime(date_to)
+        for o in orders:
+            if o.get("status") != "cancelled":
+                continue
+            _dc  = pd.to_datetime(o.get("date_created"), errors="coerce", utc=True)
+            _dcl_raw = o.get("date_closed") or o.get("date_last_updated")
+            _dcl = pd.to_datetime(_dcl_raw, errors="coerce", utc=True) if _dcl_raw else None
+            try:
+                _dc_local  = _dc.tz_convert(_mes_ini_d.tz)  if _dc  is not None and pd.notna(_dc)  else None
+                _dcl_local = _dcl.tz_convert(_mes_ini_d.tz) if _dcl is not None and pd.notna(_dcl) else None
+            except Exception:
+                _dc_local, _dcl_local = _dc, _dcl
+            _dc_str  = str(_dc_local)[:10]  if _dc_local  is not None else "None"
+            _dcl_str = str(_dcl_local)[:10] if _dcl_local is not None else "None"
+            _candidatas.append((str(o.get("id")), _dc_str, _dcl_str, _dcl_raw))
+        # mostrar amostra
+        st.info(
+            f"🔎 **Orders cancelled analisadas:** {len(_candidatas)}\n\n"
+            f"Sample (primeiras 8):\n" + "\n".join(
+                f"- id={c[0]} · date_created={c[1]} · date_closed_local={c[2]} · date_closed_raw=`{c[3]}`"
+                for c in _candidatas[:8]
+            )
+        )
+
         _competencia_recat = aplicar_regime_competencia(orders, date_from, date_to)
+        st.success(f"✅ Recategorizadas para 'paid': **{len(_competencia_recat)}** orders")
+
         # Não passar reembolso pras orders recategorizadas
         reembolsados = {oid: val for oid, val in reembolsados.items() if oid not in _competencia_recat}
+    # ─── FIM DIAGNÓSTICO ───
 
     df_raw = parse_orders(orders, fretes, reembolsados)
     if df_raw.empty:
