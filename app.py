@@ -508,6 +508,59 @@ def parse_orders(orders, fretes=None, reembolsados=None, shipments_info=None):
             
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
+
+def aplicar_regime_competencia(orders, date_from, date_to):
+    """
+    Aplica regime de competência mensal: uma order só é "cancelada/devolvida"
+    no período X se date_closed também caiu em X. Caso contrário, foi venda
+    aprovada em X (e o cancelamento entra no mês em que fechou).
+    
+    Modifica as orders in-place (seta status="paid" nas recategorizadas).
+    Retorna set com IDs das orders que foram recategorizadas.
+    """
+    _mes_ini = pd.to_datetime(date_from)
+    _mes_fim = pd.to_datetime(date_to)
+    _recategorizadas = set()
+    for o in orders:
+        if o.get("status") != "cancelled":
+            continue
+        _dc  = pd.to_datetime(o.get("date_created"), errors="coerce", utc=True)
+        # date_closed pode vir vazio pra cancelamentos recentes;
+        # fallback: date_last_updated (última mudança da order)
+        _dcl_raw = o.get("date_closed") or o.get("date_last_updated")
+        _dcl = pd.to_datetime(_dcl_raw, errors="coerce", utc=True) if _dcl_raw else None
+        # Normalizar para tz do range
+        try:
+            _dc_local  = _dc.tz_convert(_mes_ini.tz)  if _dc  is not None and pd.notna(_dc)  else None
+            _dcl_local = _dcl.tz_convert(_mes_ini.tz) if _dcl is not None and pd.notna(_dcl) else None
+        except Exception:
+            _dc_local, _dcl_local = _dc, _dcl
+        _criada_no_mes  = (_dc_local  is not None) and (_mes_ini <= _dc_local  <= _mes_fim)
+        _fechada_no_mes = (_dcl_local is not None) and (_mes_ini <= _dcl_local <= _mes_fim)
+        # Criada em X mas fechada fora de X → tratar como APROVADA em X
+        if _criada_no_mes and not _fechada_no_mes:
+            o["status"] = "paid"
+            _recategorizadas.add(str(o.get("id")))
+    return _recategorizadas
+
+
+def is_mes_completo(date_from, date_to):
+    """
+    Retorna True se o range vai do dia 01 até o último dia do MESMO mês.
+    date_from e date_to em formato 'YYYY-MM-DDTHH:MM:SS...' ou 'YYYY-MM-DD'.
+    """
+    try:
+        import calendar as _cal
+        _df = pd.to_datetime(date_from)
+        _dt = pd.to_datetime(date_to)
+        if _df.year != _dt.year or _df.month != _dt.month:
+            return False
+        _ultimo = _cal.monthrange(_df.year, _df.month)[1]
+        return _df.day == 1 and _dt.day == _ultimo
+    except Exception:
+        return False
+
+
 def apply_costs_online(df, user_id):
     if df.empty:
         return df
@@ -873,6 +926,39 @@ if st.session_state["aba_ativa"] == "financeiro":
         st.info("Nenhuma venda encontrada no período.")
         st.stop()
 
+    # ── Query 2 quando mês completo: canceladas fechadas no mês (independente de date_created) ──
+    # Traz devoluções de vendas de meses anteriores que fecharam no mês em análise
+    if is_mes_completo(date_from, date_to):
+        with st.spinner("Buscando cancelamentos fechados no mês..."):
+            _headers_ml = {"Authorization": f"Bearer {token}"}
+            _orders_dcl = []
+            _offset, _limit = 0, 50
+            while True:
+                _r = requests.get(f"{ML_API_BASE}/orders/search",
+                    headers=_headers_ml,
+                    params={"seller": user_id,
+                            "order.date_closed.from": date_from,
+                            "order.date_closed.to":   date_to,
+                            "order.status": "cancelled",
+                            "sort": "date_desc",
+                            "offset": _offset, "limit": _limit},
+                    timeout=30)
+                if _r.status_code != 200:
+                    break
+                _data = _r.json()
+                _res  = _data.get("results", []) or []
+                _orders_dcl.extend(_res)
+                _offset += _limit
+                if _offset >= _data.get("paging", {}).get("total", 0) or not _res:
+                    break
+            # Mesclar mantendo unicidade por order_id
+            _seen = {str(o.get("id")) for o in orders}
+            for o in _orders_dcl:
+                oid = str(o.get("id"))
+                if oid not in _seen:
+                    orders.append(o)
+                    _seen.add(oid)
+
     shipping_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in orders if o.get("shipping",{}).get("id")}))
     token_hash   = token[-8:] if token else ""
 
@@ -880,6 +966,15 @@ if st.session_state["aba_ativa"] == "financeiro":
         fretes       = fetch_fretes_batch(shipping_ids, token_hash, token)
     # Detecta reembolsos nas orders já buscadas — sem chamada extra à API
     reembolsados = get_orders_reembolsados(orders)
+
+    # ── Regime de competência (só quando o filtro é MÊS COMPLETO) ──
+    # Alinha o Financeiro com o Fechamento: vendas de junho canceladas em julho
+    # aparecem como aprovadas em junho e prejuízo em julho.
+    _competencia_recat = set()
+    if is_mes_completo(date_from, date_to):
+        _competencia_recat = aplicar_regime_competencia(orders, date_from, date_to)
+        # Não passar reembolso pras orders recategorizadas
+        reembolsados = {oid: val for oid, val in reembolsados.items() if oid not in _competencia_recat}
 
     df_raw = parse_orders(orders, fretes, reembolsados)
     if df_raw.empty:
@@ -1808,7 +1903,10 @@ elif st.session_state["aba_ativa"] == "caixa":
             _rec_show["Data"]  = _rec_show["data"].apply(lambda d: d.strftime("%d/%m/%Y (%a)"))
             _rec_show["Valor"] = _rec_show["valor"].apply(lambda v: f"R$ {v:,.2f}")
             _rec_show["Acumulado"] = _rec_show["valor"].cumsum().apply(lambda v: f"R$ {v:,.2f}")
-            st.dataframe(_rec_show[["Data","Valor","Acumulado"]], hide_index=True, use_container_width=True)
+            # altura dinâmica: ~35px por linha + header (mostra tudo sem rolagem)
+            _h = min(35 * (len(_rec_show) + 1) + 3, 1200)
+            st.dataframe(_rec_show[["Data","Valor","Acumulado"]],
+                         hide_index=True, use_container_width=True, height=_h)
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
@@ -2436,6 +2534,9 @@ elif st.session_state["aba_ativa"] == "fechamento":
                     _seen_ids.add(oid)
                     _all_orders.append(o)
 
+                # ── Regime de competência: aplica regra uniforme ──
+                _recategorizadas = aplicar_regime_competencia(_all_orders, _df_from, _df_to)
+
                 if _all_orders:
                     _ship_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in _all_orders if o.get("shipping",{}).get("id")}))
                     _tok_hash = token[-8:] if token else ""
@@ -2443,7 +2544,12 @@ elif st.session_state["aba_ativa"] == "fechamento":
                     _fretes   = {sid: info.get("cost", 0.0) for sid, info in _shipinfo.items()}
                     _reimb    = get_orders_reembolsados(_all_orders)
 
-                    _df_raw = parse_orders(_all_orders, _fretes, _reimb, _shipinfo)
+                    # Regime de competência: não passar reembolso pras orders recategorizadas
+                    # (elas serão tratadas como "aprovada" em X, sem reembolso; o reembolso
+                    # aparecerá no mês do date_closed)
+                    _reimb_ok = {oid: val for oid, val in _reimb.items() if oid not in _recategorizadas}
+
+                    _df_raw = parse_orders(_all_orders, _fretes, _reimb_ok, _shipinfo)
                     _df     = apply_costs_online(_df_raw, str(user_id))
 
                     _aprov  = _df[_df["Categoria"] == "aprovada"]
