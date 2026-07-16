@@ -296,19 +296,23 @@ def fetch_ads_cost(advertiser_id, token_hash, token, date_from_ymd, date_to_ymd)
     date_from_ymd / date_to_ymd no formato 'YYYY-MM-DD'.
     Range máximo da API: 90 dias.
     Retorna float (R$).
+    
+    NOTA: endpoint legado foi depreciado em 27/mai/2026. Novo path:
+    /marketplace/advertising/{SITE_ID}/advertisers/{advertiser_id}/product_ads/campaigns/search
     """
     if not advertiser_id:
         return 0.0
+    _SITE_ID = "MLB"  # Brasil
     try:
         resp = requests.get(
-            f"{ML_API_BASE}/advertising/advertisers/{advertiser_id}/product_ads/campaigns",
+            f"{ML_API_BASE}/marketplace/advertising/{_SITE_ID}/advertisers/{advertiser_id}/product_ads/campaigns/search",
             headers={"Authorization": f"Bearer {token}", "api-version": "2"},
             params={
                 "date_from": date_from_ymd,
                 "date_to": date_to_ymd,
                 "metrics": "cost",
                 "metrics_summary": "true",
-                "limit": 50,  # pegar todas as campanhas; summary só funciona certo com limit alto
+                "limit": 50,
                 "offset": 0,
             },
             timeout=20,
@@ -316,11 +320,9 @@ def fetch_ads_cost(advertiser_id, token_hash, token, date_from_ymd, date_to_ymd)
         if resp.status_code != 200:
             return 0.0
         data = resp.json()
-        # Preferir somar o cost de cada campanha (mais confiável que metrics_summary)
         results = data.get("results", []) or []
         if results:
             return float(sum((c.get("metrics", {}) or {}).get("cost", 0) or 0 for c in results))
-        # Fallback: metrics_summary
         summary = data.get("metrics_summary") or {}
         return float(summary.get("cost") or 0)
     except Exception:
@@ -908,7 +910,7 @@ if st.session_state["aba_ativa"] == "financeiro":
         st.write(f"advertiser_id: `{_adv_id_fin}` · from=`{_ads_from_fin}` · to=`{_ads_to_fin}` · **ads_cost calculado: R$ {ads_cost:,.2f}**")
         try:
             _resp_diag = requests.get(
-                f"{ML_API_BASE}/advertising/advertisers/{_adv_id_fin}/product_ads/campaigns",
+                f"{ML_API_BASE}/marketplace/advertising/MLB/advertisers/{_adv_id_fin}/product_ads/campaigns/search",
                 headers={"Authorization": f"Bearer {token}", "api-version": "2"},
                 params={
                     "date_from": _ads_from_fin,
