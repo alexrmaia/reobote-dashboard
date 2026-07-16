@@ -1206,6 +1206,198 @@ if st.session_state["aba_ativa"] == "financeiro":
 
     st.markdown("<br>", unsafe_allow_html=True)
 
+    # ─── QUADRO COMPARATIVO SEMANAL (só quando o filtro é mês completo) ───
+    if is_mes_completo(date_from, date_to):
+        _mes_ref = pd.to_datetime(date_from)
+        _ano_ref, _mes_num_ref = _mes_ref.year, _mes_ref.month
+        # Mês anterior
+        if _mes_num_ref == 1:
+            _ano_prev, _mes_prev = _ano_ref - 1, 12
+        else:
+            _ano_prev, _mes_prev = _ano_ref, _mes_num_ref - 1
+        import calendar as _cal_sw
+        _ultimo_prev = _cal_sw.monthrange(_ano_prev, _mes_prev)[1]
+        _from_prev = f"{_ano_prev}-{_mes_prev:02d}-01T00:00:00.000-03:00"
+        _to_prev   = f"{_ano_prev}-{_mes_prev:02d}-{_ultimo_prev:02d}T23:59:59.000-03:00"
+
+        with st.spinner("Buscando dados do mês anterior..."):
+            _orders_prev = get_orders(str(user_id), token, _from_prev, _to_prev)
+            # Aplicar mesma regra de competência no mês anterior
+            aplicar_regime_competencia(_orders_prev, _from_prev, _to_prev)
+            _ship_ids_prev = tuple(sorted({o.get("shipping",{}).get("id") for o in _orders_prev if o.get("shipping",{}).get("id")}))
+            _fretes_prev = fetch_fretes_batch(_ship_ids_prev, token[-8:] if token else "", token)
+            _reimb_prev  = get_orders_reembolsados(_orders_prev)
+            _df_raw_prev = parse_orders(_orders_prev, _fretes_prev, _reimb_prev)
+            _aprov_prev  = _df_raw_prev[~_df_raw_prev["Cancelada"]] if not _df_raw_prev.empty else _df_raw_prev
+
+        # Função auxiliar: agrega faturamento e unidades por semana (dias 1-7, 8-14, 15-21, 22-fim)
+        def _agrega_semanas(df_aprov, ano, mes):
+            _ult_dia = _cal_sw.monthrange(ano, mes)[1]
+            _semanas = [
+                ("Semana 1", 1, 7),
+                ("Semana 2", 8, 14),
+                ("Semana 3", 15, 21),
+                ("Semana 4", 22, _ult_dia),
+            ]
+            _out = []
+            for _label, _di, _df_dia in _semanas:
+                if df_aprov.empty:
+                    _out.append({"label": _label, "di": _di, "df": _df_dia, "fat": 0.0, "qtd": 0})
+                    continue
+                _df_s = df_aprov[
+                    (df_aprov["Data"].dt.year == ano) &
+                    (df_aprov["Data"].dt.month == mes) &
+                    (df_aprov["Data"].dt.day >= _di) &
+                    (df_aprov["Data"].dt.day <= _df_dia)
+                ]
+                _fat = float(_df_s["Receita Bruta"].sum())
+                _qtd = int(_df_s["Quantidade"].sum()) if "Quantidade" in _df_s.columns else len(_df_s)
+                _out.append({"label": _label, "di": _di, "df": _df_dia, "fat": _fat, "qtd": _qtd})
+            return _out
+
+        _semanas_atual = _agrega_semanas(aprovadas, _ano_ref, _mes_num_ref)
+        _semanas_prev  = _agrega_semanas(_aprov_prev, _ano_prev, _mes_prev)
+
+        # Data de hoje (para detectar semana parcial)
+        import zoneinfo as _zi_sw
+        _tz_sw = _zi_sw.ZoneInfo("America/Sao_Paulo")
+        _hoje_sw = pd.Timestamp.now(_tz_sw).date()
+        _mes_ref_completo = (_hoje_sw.year, _hoje_sw.month) != (_ano_ref, _mes_num_ref)  # ex: julho → junho já é completo
+
+        _meses_pt_sw = ["","jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"]
+        _rot_atual = f"{_meses_pt_sw[_mes_num_ref]}/{str(_ano_ref)[2:]}"
+        _rot_prev  = f"{_meses_pt_sw[_mes_prev]}/{str(_ano_prev)[2:]}"
+
+        # Monta os 4 cards
+        _cards_html = ""
+        for _s_at, _s_pr in zip(_semanas_atual, _semanas_prev):
+            _di, _df_dia = _s_at["di"], _s_at["df"]
+            _fat_at, _fat_pr = _s_at["fat"], _s_pr["fat"]
+            _qtd_at, _qtd_pr = _s_at["qtd"], _s_pr["qtd"]
+
+            # Detecta se a semana está em curso (mês ref é o mês corrente E hoje está dentro/antes do fim da semana)
+            _parcial = (not _mes_ref_completo) and (_hoje_sw.day <= _df_dia) and (_hoje_sw.day >= _di or _hoje_sw.month == _mes_num_ref)
+            # simplificar: parcial só se estamos DENTRO desta semana
+            _parcial = (not _mes_ref_completo) and (_di <= _hoje_sw.day <= _df_dia) and (_hoje_sw.month == _mes_num_ref)
+            # E também: semanas futuras completas do mês corrente (não faz sentido comparar)
+            _futura  = (not _mes_ref_completo) and (_hoje_sw.day < _di) and (_hoje_sw.month == _mes_num_ref)
+
+            # Delta faturamento
+            if _fat_pr > 0 and not _parcial and not _futura:
+                _delta_fat = (_fat_at - _fat_pr) / _fat_pr * 100
+            else:
+                _delta_fat = None
+            if _qtd_pr > 0 and not _parcial and not _futura:
+                _delta_qtd = (_qtd_at - _qtd_pr) / _qtd_pr * 100
+            else:
+                _delta_qtd = None
+
+            # Cores/estados
+            if _parcial:
+                _border_c = "#FCD34D"; _bg_c = "#FFFBEB"
+                _badge_bg = "#F59E0B"; _badge_txt = "parcial"
+            elif _futura:
+                _border_c = "#E2E8F0"; _bg_c = "#F8FAFC"
+                _badge_bg = "#94A3B8"; _badge_txt = "próxima"
+            elif _delta_fat is None:
+                _border_c = "#E2E8F0"; _bg_c = "#F8FAFC"
+                _badge_bg = "#94A3B8"; _badge_txt = "sem dados"
+            elif _delta_fat >= 0:
+                _border_c = "#86EFAC"; _bg_c = "#F0FDF4"
+                _badge_bg = "#16A34A"; _badge_txt = f"▲ {_delta_fat:.1f}%".replace(".",",")
+            else:
+                _border_c = "#FCA5A5"; _bg_c = "#FEF2F2"
+                _badge_bg = "#DC2626"; _badge_txt = f"▼ {abs(_delta_fat):.1f}%".replace(".",",")
+
+            # Barras proporcionais (largura relativa)
+            _max_fat = max(_fat_at, _fat_pr, 1)
+            _flex_at = _fat_at / _max_fat if _max_fat > 0 else 0
+            _flex_pr = _fat_pr / _max_fat if _max_fat > 0 else 0
+
+            # Delta qtd rótulo
+            if _delta_qtd is None:
+                _delta_qtd_html = ""
+            elif _delta_qtd >= 0:
+                _delta_qtd_html = f" · <span style='color:#16A34A;'>▲ {_delta_qtd:.1f}%".replace(".",",") + "</span>"
+            else:
+                _delta_qtd_html = f" · <span style='color:#DC2626;'>▼ {abs(_delta_qtd):.1f}%".replace(".",",") + "</span>"
+
+            _cards_html += f"""
+            <div style='border:1px solid {_border_c}; background:{_bg_c}; border-radius:12px; padding:14px 14px 12px;'>
+              <div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;'>
+                <div>
+                  <div style='font-size:13px; font-weight:800; color:#0F172A;'>{_s_at["label"]}</div>
+                  <div style='font-size:10px; color:#64748B; margin-top:1px;'>{_di:02d}–{_df_dia:02d} {_meses_pt_sw[_mes_num_ref]}</div>
+                </div>
+                <div style='background:{_badge_bg}; color:white; font-size:10px; font-weight:700; padding:3px 8px; border-radius:99px; white-space:nowrap;'>{_badge_txt}</div>
+              </div>
+              <div style='margin-bottom:10px;'>
+                <div style='font-size:10px; color:#64748B; text-transform:uppercase; letter-spacing:.3px; margin-bottom:3px;'>Faturamento</div>
+                <div style='font-size:16px; font-weight:800; color:#0F172A;'>R$ {_fat_at:,.0f}</div>
+                <div style='display:flex; gap:2px; height:4px; margin-top:6px;'>
+                  <div style='flex:{_flex_at:.3f}; background:#7C3AED; border-radius:2px; min-width:2px;'></div>
+                  <div style='flex:{_flex_pr:.3f}; background:#CBD5E1; border-radius:2px; min-width:2px;'></div>
+                </div>
+                <div style='font-size:10px; color:#94A3B8; margin-top:3px;'>vs R$ {_fat_pr:,.0f}</div>
+              </div>
+              <div>
+                <div style='font-size:10px; color:#64748B; text-transform:uppercase; letter-spacing:.3px; margin-bottom:3px;'>Unidades</div>
+                <div style='font-size:16px; font-weight:800; color:#0F172A;'>{_qtd_at}</div>
+                <div style='font-size:10px; color:#94A3B8; margin-top:2px;'>vs {_qtd_pr}{_delta_qtd_html}</div>
+              </div>
+            </div>
+            """
+
+        # Totais
+        _fat_tot_at = sum(s["fat"] for s in _semanas_atual)
+        _fat_tot_pr = sum(s["fat"] for s in _semanas_prev)
+        _qtd_tot_at = sum(s["qtd"] for s in _semanas_atual)
+        _qtd_tot_pr = sum(s["qtd"] for s in _semanas_prev)
+        _d_fat_tot = ((_fat_tot_at - _fat_tot_pr) / _fat_tot_pr * 100) if _fat_tot_pr > 0 else None
+        _d_qtd_tot = ((_qtd_tot_at - _qtd_tot_pr) / _qtd_tot_pr * 100) if _qtd_tot_pr > 0 else None
+
+        def _fmt_delta(d):
+            if d is None:
+                return "<span style='color:#94A3B8;'>—</span>"
+            if d >= 0:
+                return f"<span style='color:#16A34A; font-weight:700;'>▲ {d:.1f}%".replace(".",",") + "</span>"
+            return f"<span style='color:#DC2626; font-weight:700;'>▼ {abs(d):.1f}%".replace(".",",") + "</span>"
+
+        st.markdown(f"""
+        <div style='background:white; border:0.5px solid #E2E8F0; border-radius:12px; padding:20px 22px;'>
+          <div style='display:flex; justify-content:space-between; align-items:baseline; margin-bottom:20px;'>
+            <div>
+              <div style='font-size:15px; font-weight:800; color:#0F172A;'>Comparativo semanal</div>
+              <div style='font-size:12px; color:#64748B; margin-top:2px;'>{_rot_atual} <span style="color:#CBD5E1;">·</span> vs mesma semana de {_rot_prev}</div>
+            </div>
+            <div style='display:flex; gap:16px; font-size:11px; color:#64748B;'>
+              <span style='display:flex; align-items:center; gap:4px;'><span style='width:8px; height:8px; border-radius:2px; background:#7C3AED;'></span>atual</span>
+              <span style='display:flex; align-items:center; gap:4px;'><span style='width:8px; height:8px; border-radius:2px; background:#CBD5E1;'></span>anterior</span>
+            </div>
+          </div>
+          <div style='display:grid; grid-template-columns:repeat(4,1fr); gap:12px;'>
+            {_cards_html}
+          </div>
+          <div style='margin-top:14px; background:#F8FAFC; border-radius:10px; padding:14px 16px; display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; align-items:center;'>
+            <div>
+              <div style='font-size:11px; color:#64748B; text-transform:uppercase; letter-spacing:.3px;'>Total do mês</div>
+              <div style='font-size:11px; color:#94A3B8; margin-top:1px;'>{_rot_atual}</div>
+            </div>
+            <div>
+              <div style='font-size:16px; font-weight:800; color:#0F172A;'>R$ {_fat_tot_at:,.0f}</div>
+              <div style='font-size:10px; color:#94A3B8;'>vs R$ {_fat_tot_pr:,.0f} · {_fmt_delta(_d_fat_tot)}</div>
+            </div>
+            <div>
+              <div style='font-size:16px; font-weight:800; color:#0F172A;'>{_qtd_tot_at} unid.</div>
+              <div style='font-size:10px; color:#94A3B8;'>vs {_qtd_tot_pr} · {_fmt_delta(_d_qtd_tot)}</div>
+            </div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+    # ─── FIM QUADRO COMPARATIVO SEMANAL ───
+
     # GRÁFICO LUCRO POR DIA — gradiente verde + label de média
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown('<div class="small-title">Lucro real por dia (R$)</div><br>', unsafe_allow_html=True)
