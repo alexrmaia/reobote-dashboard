@@ -1219,6 +1219,8 @@ if st.session_state["aba_ativa"] == "financeiro":
     except Exception:
         _eh_mes_completo_sw = False
 
+    st.info(f"🔍 date_from=`{date_from}` · date_to=`{date_to}` · df.day={_df_dt.day if '_df_dt' in dir() else '?'} · dt.day={_dt_dt.day if '_dt_dt' in dir() else '?'} · ult_ref={_ult_ref if '_ult_ref' in dir() else '?'} · **mes_completo={_eh_mes_completo_sw}**")
+
     if _eh_mes_completo_sw:
         _ano_ref, _mes_num_ref = _df_dt.year, _df_dt.month
         # Mês anterior
