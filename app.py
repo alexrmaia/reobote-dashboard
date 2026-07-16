@@ -903,6 +903,40 @@ if st.session_state["aba_ativa"] == "financeiro":
     _ads_to_fin   = date_to[:10]
     ads_cost      = fetch_ads_cost(_adv_id_fin, token[-8:] if token else "", token, _ads_from_fin, _ads_to_fin)
 
+    # ─── DIAGNÓSTICO ADS TEMPORÁRIO ───
+    with st.expander("🔍 Diagnóstico ADS", expanded=True):
+        st.write(f"advertiser_id: `{_adv_id_fin}` · from=`{_ads_from_fin}` · to=`{_ads_to_fin}` · **ads_cost calculado: R$ {ads_cost:,.2f}**")
+        try:
+            _resp_diag = requests.get(
+                f"{ML_API_BASE}/advertising/advertisers/{_adv_id_fin}/product_ads/campaigns",
+                headers={"Authorization": f"Bearer {token}", "api-version": "2"},
+                params={
+                    "date_from": _ads_from_fin,
+                    "date_to": _ads_to_fin,
+                    "metrics": "cost,clicks,prints,direct_amount,total_amount",
+                    "metrics_summary": "true",
+                    "limit": 50,
+                    "offset": 0,
+                },
+                timeout=20,
+            )
+            st.write(f"**HTTP status:** {_resp_diag.status_code}")
+            if _resp_diag.status_code == 200:
+                _dd = _resp_diag.json()
+                _camps_d = _dd.get("results", []) or []
+                _summ_d  = _dd.get("metrics_summary", {}) or {}
+                st.write(f"**metrics_summary:** `{_summ_d}`")
+                st.write(f"**Campanhas retornadas:** {len(_camps_d)}")
+                for _c in _camps_d:
+                    _cm = _c.get("metrics", {}) or {}
+                    st.write(f"- **{_c.get('name','?')}** (status=`{_c.get('status')}`) — cost=R${_cm.get('cost',0):.2f} · clicks={_cm.get('clicks',0)}")
+                st.write(f"**Keys do JSON topo:** {list(_dd.keys())}")
+            else:
+                st.error(f"Body: `{_resp_diag.text[:500]}`")
+        except Exception as e:
+            st.error(f"Erro: {e}")
+    # ─── FIM DIAGNÓSTICO ───
+
     # Toggle ADS no lucro (clicável no card de ADS abaixo)
     if "ads_on" not in st.session_state:
         st.session_state["ads_on"] = True
