@@ -1219,8 +1219,6 @@ if st.session_state["aba_ativa"] == "financeiro":
     except Exception:
         _eh_mes_completo_sw = False
 
-    st.info(f"🔍 date_from=`{date_from}` · date_to=`{date_to}` · df.day={_df_dt.day if '_df_dt' in dir() else '?'} · dt.day={_dt_dt.day if '_dt_dt' in dir() else '?'} · ult_ref={_ult_ref if '_ult_ref' in dir() else '?'} · **mes_completo={_eh_mes_completo_sw}**")
-
     if _eh_mes_completo_sw:
         _ano_ref, _mes_num_ref = _df_dt.year, _df_dt.month
         # Mês anterior
@@ -1324,31 +1322,29 @@ if st.session_state["aba_ativa"] == "financeiro":
             else:
                 _delta_qtd_html = " · <span style='color:#DC2626;'>" + ("▼ %.1f%%" % abs(_delta_qtd)).replace(".",",") + "</span>"
 
-            _cards_html += f"""
-            <div style='border:1px solid {_border_c}; background:{_bg_c}; border-radius:12px; padding:14px 14px 12px;'>
-              <div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;'>
-                <div>
-                  <div style='font-size:13px; font-weight:800; color:#0F172A;'>{_s_at["label"]}</div>
-                  <div style='font-size:10px; color:#64748B; margin-top:1px;'>{_di:02d}–{_df_dia:02d} {_meses_pt_sw[_mes_num_ref]}</div>
-                </div>
-                <div style='background:{_badge_bg}; color:white; font-size:10px; font-weight:700; padding:3px 8px; border-radius:99px; white-space:nowrap;'>{_badge_txt}</div>
-              </div>
-              <div style='margin-bottom:10px;'>
-                <div style='font-size:10px; color:#64748B; text-transform:uppercase; letter-spacing:.3px; margin-bottom:3px;'>Faturamento</div>
-                <div style='font-size:16px; font-weight:800; color:#0F172A;'>R$ {_fat_at:,.0f}</div>
-                <div style='display:flex; gap:2px; height:4px; margin-top:6px;'>
-                  <div style='flex:{_flex_at:.3f}; background:#7C3AED; border-radius:2px; min-width:2px;'></div>
-                  <div style='flex:{_flex_pr:.3f}; background:#CBD5E1; border-radius:2px; min-width:2px;'></div>
-                </div>
-                <div style='font-size:10px; color:#94A3B8; margin-top:3px;'>vs R$ {_fat_pr:,.0f}</div>
-              </div>
-              <div>
-                <div style='font-size:10px; color:#64748B; text-transform:uppercase; letter-spacing:.3px; margin-bottom:3px;'>Unidades</div>
-                <div style='font-size:16px; font-weight:800; color:#0F172A;'>{_qtd_at}</div>
-                <div style='font-size:10px; color:#94A3B8; margin-top:2px;'>vs {_qtd_pr}{_delta_qtd_html}</div>
-              </div>
-            </div>
-            """
+            _cards_html += (
+                f"<div style='border:1px solid {_border_c};background:{_bg_c};border-radius:12px;padding:14px 14px 12px;'>"
+                f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;'>"
+                f"<div><div style='font-size:13px;font-weight:800;color:#0F172A;'>{_s_at['label']}</div>"
+                f"<div style='font-size:10px;color:#64748B;margin-top:1px;'>{_di:02d}–{_df_dia:02d} {_meses_pt_sw[_mes_num_ref]}</div></div>"
+                f"<div style='background:{_badge_bg};color:white;font-size:10px;font-weight:700;padding:3px 8px;border-radius:99px;white-space:nowrap;'>{_badge_txt}</div>"
+                f"</div>"
+                f"<div style='margin-bottom:10px;'>"
+                f"<div style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:.3px;margin-bottom:3px;'>Faturamento</div>"
+                f"<div style='font-size:16px;font-weight:800;color:#0F172A;'>R$ {_fat_at:,.0f}</div>"
+                f"<div style='display:flex;gap:2px;height:4px;margin-top:6px;'>"
+                f"<div style='flex:{_flex_at:.3f};background:#7C3AED;border-radius:2px;min-width:2px;'></div>"
+                f"<div style='flex:{_flex_pr:.3f};background:#CBD5E1;border-radius:2px;min-width:2px;'></div>"
+                f"</div>"
+                f"<div style='font-size:10px;color:#94A3B8;margin-top:3px;'>vs R$ {_fat_pr:,.0f}</div>"
+                f"</div>"
+                f"<div>"
+                f"<div style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:.3px;margin-bottom:3px;'>Unidades</div>"
+                f"<div style='font-size:16px;font-weight:800;color:#0F172A;'>{_qtd_at}</div>"
+                f"<div style='font-size:10px;color:#94A3B8;margin-top:2px;'>vs {_qtd_pr}{_delta_qtd_html}</div>"
+                f"</div>"
+                f"</div>"
+            )
 
         _fat_tot_at = sum(s["fat"] for s in _semanas_atual)
         _fat_tot_pr = sum(s["fat"] for s in _semanas_prev)
@@ -1364,37 +1360,38 @@ if st.session_state["aba_ativa"] == "financeiro":
                 return "<span style='color:#16A34A; font-weight:700;'>" + ("▲ %.1f%%" % d).replace(".",",") + "</span>"
             return "<span style='color:#DC2626; font-weight:700;'>" + ("▼ %.1f%%" % abs(d)).replace(".",",") + "</span>"
 
-        st.markdown(f"""
-        <div style='background:white; border:0.5px solid #E2E8F0; border-radius:12px; padding:20px 22px;'>
-          <div style='display:flex; justify-content:space-between; align-items:baseline; margin-bottom:20px;'>
-            <div>
-              <div style='font-size:15px; font-weight:800; color:#0F172A;'>Comparativo semanal</div>
-              <div style='font-size:12px; color:#64748B; margin-top:2px;'>{_rot_atual} <span style="color:#CBD5E1;">·</span> vs mesma semana de {_rot_prev}</div>
-            </div>
-            <div style='display:flex; gap:16px; font-size:11px; color:#64748B;'>
-              <span style='display:flex; align-items:center; gap:4px;'><span style='width:8px; height:8px; border-radius:2px; background:#7C3AED;'></span>atual</span>
-              <span style='display:flex; align-items:center; gap:4px;'><span style='width:8px; height:8px; border-radius:2px; background:#CBD5E1;'></span>anterior</span>
-            </div>
-          </div>
-          <div style='display:grid; grid-template-columns:repeat(4,1fr); gap:12px;'>
-            {_cards_html}
-          </div>
-          <div style='margin-top:14px; background:#F8FAFC; border-radius:10px; padding:14px 16px; display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; align-items:center;'>
-            <div>
-              <div style='font-size:11px; color:#64748B; text-transform:uppercase; letter-spacing:.3px;'>Total do mês</div>
-              <div style='font-size:11px; color:#94A3B8; margin-top:1px;'>{_rot_atual}</div>
-            </div>
-            <div>
-              <div style='font-size:16px; font-weight:800; color:#0F172A;'>R$ {_fat_tot_at:,.0f}</div>
-              <div style='font-size:10px; color:#94A3B8;'>vs R$ {_fat_tot_pr:,.0f} · {_fmt_delta(_d_fat_tot)}</div>
-            </div>
-            <div>
-              <div style='font-size:16px; font-weight:800; color:#0F172A;'>{_qtd_tot_at} unid.</div>
-              <div style='font-size:10px; color:#94A3B8;'>vs {_qtd_tot_pr} · {_fmt_delta(_d_qtd_tot)}</div>
-            </div>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(
+            "<div style='background:white;border:0.5px solid #E2E8F0;border-radius:12px;padding:20px 22px;'>"
+            "<div style='display:flex;justify-content:space-between;align-items:baseline;margin-bottom:20px;'>"
+            "<div>"
+            "<div style='font-size:15px;font-weight:800;color:#0F172A;'>Comparativo semanal</div>"
+            f"<div style='font-size:12px;color:#64748B;margin-top:2px;'>{_rot_atual} <span style='color:#CBD5E1;'>·</span> vs mesma semana de {_rot_prev}</div>"
+            "</div>"
+            "<div style='display:flex;gap:16px;font-size:11px;color:#64748B;'>"
+            "<span style='display:flex;align-items:center;gap:4px;'><span style='width:8px;height:8px;border-radius:2px;background:#7C3AED;'></span>atual</span>"
+            "<span style='display:flex;align-items:center;gap:4px;'><span style='width:8px;height:8px;border-radius:2px;background:#CBD5E1;'></span>anterior</span>"
+            "</div>"
+            "</div>"
+            "<div style='display:grid;grid-template-columns:repeat(4,1fr);gap:12px;'>"
+            f"{_cards_html}"
+            "</div>"
+            "<div style='margin-top:14px;background:#F8FAFC;border-radius:10px;padding:14px 16px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;align-items:center;'>"
+            "<div>"
+            "<div style='font-size:11px;color:#64748B;text-transform:uppercase;letter-spacing:.3px;'>Total do mês</div>"
+            f"<div style='font-size:11px;color:#94A3B8;margin-top:1px;'>{_rot_atual}</div>"
+            "</div>"
+            "<div>"
+            f"<div style='font-size:16px;font-weight:800;color:#0F172A;'>R$ {_fat_tot_at:,.0f}</div>"
+            f"<div style='font-size:10px;color:#94A3B8;'>vs R$ {_fat_tot_pr:,.0f} · {_fmt_delta(_d_fat_tot)}</div>"
+            "</div>"
+            "<div>"
+            f"<div style='font-size:16px;font-weight:800;color:#0F172A;'>{_qtd_tot_at} unid.</div>"
+            f"<div style='font-size:10px;color:#94A3B8;'>vs {_qtd_tot_pr} · {_fmt_delta(_d_qtd_tot)}</div>"
+            "</div>"
+            "</div>"
+            "</div>",
+            unsafe_allow_html=True
+        )
 
         st.markdown("<br>", unsafe_allow_html=True)
     # ─── FIM QUADRO COMPARATIVO SEMANAL ───
