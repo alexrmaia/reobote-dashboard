@@ -1206,24 +1206,32 @@ if st.session_state["aba_ativa"] == "financeiro":
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ─── QUADRO COMPARATIVO SEMANAL (só quando o filtro é mês completo) ───
-    if is_mes_completo(date_from, date_to):
-        _mes_ref = pd.to_datetime(date_from)
-        _ano_ref, _mes_num_ref = _mes_ref.year, _mes_ref.month
+    # ─── QUADRO COMPARATIVO SEMANAL (só quando filtro é mês completo) ───
+    import calendar as _cal_sw
+    try:
+        _df_dt = pd.to_datetime(date_from)
+        _dt_dt = pd.to_datetime(date_to)
+        _ult_ref = _cal_sw.monthrange(_df_dt.year, _df_dt.month)[1]
+        _eh_mes_completo_sw = (
+            _df_dt.year == _dt_dt.year and _df_dt.month == _dt_dt.month
+            and _df_dt.day == 1 and _dt_dt.day == _ult_ref
+        )
+    except Exception:
+        _eh_mes_completo_sw = False
+
+    if _eh_mes_completo_sw:
+        _ano_ref, _mes_num_ref = _df_dt.year, _df_dt.month
         # Mês anterior
         if _mes_num_ref == 1:
             _ano_prev, _mes_prev = _ano_ref - 1, 12
         else:
             _ano_prev, _mes_prev = _ano_ref, _mes_num_ref - 1
-        import calendar as _cal_sw
         _ultimo_prev = _cal_sw.monthrange(_ano_prev, _mes_prev)[1]
         _from_prev = f"{_ano_prev}-{_mes_prev:02d}-01T00:00:00.000-03:00"
         _to_prev   = f"{_ano_prev}-{_mes_prev:02d}-{_ultimo_prev:02d}T23:59:59.000-03:00"
 
         with st.spinner("Buscando dados do mês anterior..."):
             _orders_prev = get_orders(str(user_id), token, _from_prev, _to_prev)
-            # Aplicar mesma regra de competência no mês anterior
-            aplicar_regime_competencia(_orders_prev, _from_prev, _to_prev)
             _ship_ids_prev = tuple(sorted({o.get("shipping",{}).get("id") for o in _orders_prev if o.get("shipping",{}).get("id")}))
             _fretes_prev = fetch_fretes_batch(_ship_ids_prev, token[-8:] if token else "", token)
             _reimb_prev  = get_orders_reembolsados(_orders_prev)
@@ -1258,11 +1266,11 @@ if st.session_state["aba_ativa"] == "financeiro":
         _semanas_atual = _agrega_semanas(aprovadas, _ano_ref, _mes_num_ref)
         _semanas_prev  = _agrega_semanas(_aprov_prev, _ano_prev, _mes_prev)
 
-        # Data de hoje (para detectar semana parcial)
+        # Detecta se o mês de referência é o mês corrente (para marcar semana em curso)
         import zoneinfo as _zi_sw
         _tz_sw = _zi_sw.ZoneInfo("America/Sao_Paulo")
         _hoje_sw = pd.Timestamp.now(_tz_sw).date()
-        _mes_ref_completo = (_hoje_sw.year, _hoje_sw.month) != (_ano_ref, _mes_num_ref)  # ex: julho → junho já é completo
+        _mes_ref_completo = (_hoje_sw.year, _hoje_sw.month) != (_ano_ref, _mes_num_ref)
 
         _meses_pt_sw = ["","jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"]
         _rot_atual = f"{_meses_pt_sw[_mes_num_ref]}/{str(_ano_ref)[2:]}"
@@ -1275,14 +1283,9 @@ if st.session_state["aba_ativa"] == "financeiro":
             _fat_at, _fat_pr = _s_at["fat"], _s_pr["fat"]
             _qtd_at, _qtd_pr = _s_at["qtd"], _s_pr["qtd"]
 
-            # Detecta se a semana está em curso (mês ref é o mês corrente E hoje está dentro/antes do fim da semana)
-            _parcial = (not _mes_ref_completo) and (_hoje_sw.day <= _df_dia) and (_hoje_sw.day >= _di or _hoje_sw.month == _mes_num_ref)
-            # simplificar: parcial só se estamos DENTRO desta semana
             _parcial = (not _mes_ref_completo) and (_di <= _hoje_sw.day <= _df_dia) and (_hoje_sw.month == _mes_num_ref)
-            # E também: semanas futuras completas do mês corrente (não faz sentido comparar)
             _futura  = (not _mes_ref_completo) and (_hoje_sw.day < _di) and (_hoje_sw.month == _mes_num_ref)
 
-            # Delta faturamento
             if _fat_pr > 0 and not _parcial and not _futura:
                 _delta_fat = (_fat_at - _fat_pr) / _fat_pr * 100
             else:
@@ -1292,7 +1295,6 @@ if st.session_state["aba_ativa"] == "financeiro":
             else:
                 _delta_qtd = None
 
-            # Cores/estados
             if _parcial:
                 _border_c = "#FCD34D"; _bg_c = "#FFFBEB"
                 _badge_bg = "#F59E0B"; _badge_txt = "parcial"
@@ -1304,23 +1306,21 @@ if st.session_state["aba_ativa"] == "financeiro":
                 _badge_bg = "#94A3B8"; _badge_txt = "sem dados"
             elif _delta_fat >= 0:
                 _border_c = "#86EFAC"; _bg_c = "#F0FDF4"
-                _badge_bg = "#16A34A"; _badge_txt = f"▲ {_delta_fat:.1f}%".replace(".",",")
+                _badge_bg = "#16A34A"; _badge_txt = ("▲ %.1f%%" % _delta_fat).replace(".",",")
             else:
                 _border_c = "#FCA5A5"; _bg_c = "#FEF2F2"
-                _badge_bg = "#DC2626"; _badge_txt = f"▼ {abs(_delta_fat):.1f}%".replace(".",",")
+                _badge_bg = "#DC2626"; _badge_txt = ("▼ %.1f%%" % abs(_delta_fat)).replace(".",",")
 
-            # Barras proporcionais (largura relativa)
             _max_fat = max(_fat_at, _fat_pr, 1)
             _flex_at = _fat_at / _max_fat if _max_fat > 0 else 0
             _flex_pr = _fat_pr / _max_fat if _max_fat > 0 else 0
 
-            # Delta qtd rótulo
             if _delta_qtd is None:
                 _delta_qtd_html = ""
             elif _delta_qtd >= 0:
-                _delta_qtd_html = f" · <span style='color:#16A34A;'>▲ {_delta_qtd:.1f}%".replace(".",",") + "</span>"
+                _delta_qtd_html = " · <span style='color:#16A34A;'>" + ("▲ %.1f%%" % _delta_qtd).replace(".",",") + "</span>"
             else:
-                _delta_qtd_html = f" · <span style='color:#DC2626;'>▼ {abs(_delta_qtd):.1f}%".replace(".",",") + "</span>"
+                _delta_qtd_html = " · <span style='color:#DC2626;'>" + ("▼ %.1f%%" % abs(_delta_qtd)).replace(".",",") + "</span>"
 
             _cards_html += f"""
             <div style='border:1px solid {_border_c}; background:{_bg_c}; border-radius:12px; padding:14px 14px 12px;'>
@@ -1348,7 +1348,6 @@ if st.session_state["aba_ativa"] == "financeiro":
             </div>
             """
 
-        # Totais
         _fat_tot_at = sum(s["fat"] for s in _semanas_atual)
         _fat_tot_pr = sum(s["fat"] for s in _semanas_prev)
         _qtd_tot_at = sum(s["qtd"] for s in _semanas_atual)
@@ -1360,8 +1359,8 @@ if st.session_state["aba_ativa"] == "financeiro":
             if d is None:
                 return "<span style='color:#94A3B8;'>—</span>"
             if d >= 0:
-                return f"<span style='color:#16A34A; font-weight:700;'>▲ {d:.1f}%".replace(".",",") + "</span>"
-            return f"<span style='color:#DC2626; font-weight:700;'>▼ {abs(d):.1f}%".replace(".",",") + "</span>"
+                return "<span style='color:#16A34A; font-weight:700;'>" + ("▲ %.1f%%" % d).replace(".",",") + "</span>"
+            return "<span style='color:#DC2626; font-weight:700;'>" + ("▼ %.1f%%" % abs(d)).replace(".",",") + "</span>"
 
         st.markdown(f"""
         <div style='background:white; border:0.5px solid #E2E8F0; border-radius:12px; padding:20px 22px;'>
