@@ -1180,25 +1180,24 @@ if st.session_state["aba_ativa"] == "financeiro":
         _tags_html = ""
 
     # HERO
-    st.markdown(f"""
-    <div class="hero">
-      <div style="display:flex;justify-content:space-between;gap:30px;align-items:flex-start;">
-        <div>
-          <p class="hero-small">Resumo</p>
-          <h1 class="hero-title">Financeiro</h1>
-          <div style="background:rgba(255,255,255,.18);color:white;border:1px solid rgba(255,255,255,.35);
-                      border-radius:999px;padding:10px 16px;font-weight:900;width:fit-content;">
-              Período selecionado: {label_periodo}
-          </div>
-          {_tags_html}
-        </div>
-        <div style="min-width:320px;">
-          <div class="hero-value-label">Faturamento</div>
-          <div class="hero-value">R$ {faturamento:,.2f}</div>
-        </div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="hero">'
+        f'<div style="display:flex;justify-content:space-between;gap:30px;align-items:flex-start;">'
+        f'<div>'
+        f'<p class="hero-small">Resumo</p>'
+        f'<h1 class="hero-title">Financeiro</h1>'
+        f'<div style="background:rgba(255,255,255,.18);color:white;border:1px solid rgba(255,255,255,.35);'
+        f'border-radius:999px;padding:10px 16px;font-weight:900;width:fit-content;">'
+        f'Período selecionado: {label_periodo}</div>'
+        f'{_tags_html}'
+        f'</div>'
+        f'<div style="min-width:320px;">'
+        f'<div class="hero-value-label">Faturamento</div>'
+        f'<div class="hero-value">R$ {faturamento:,.2f}</div>'
+        f'</div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True)
 
     # diagnóstico opcional (mantido recolhido para conferência)
     if _diag is not None:
