@@ -1944,7 +1944,9 @@ elif st.session_state["aba_ativa"] == "caixa":
         "Transferência do ML", "Fornecedor", "Frete / Logística",
         "Mercado Ads", "Embalagem", "Operacional",
         "Impostos / Taxas", "Pró-labore / Retirada", "Outros",
+        "🚫 Ignorar (não conta no caixa)",
     ]
+    CAT_IGNORAR = "🚫 Ignorar (não conta no caixa)"
 
     # ── Supabase helpers para extrato Inter ──
     def load_extrato(uid):
@@ -2025,10 +2027,13 @@ elif st.session_state["aba_ativa"] == "caixa":
     agend_df      = load_agendamentos_inter(str(user_id))
 
     # ── Cards de resumo ──
-    entradas  = extrato_df["valor"].sum() if not extrato_df.empty and "valor" in extrato_df.columns else 0.0
-    entradas  = extrato_df[extrato_df["valor"] > 0]["valor"].sum() if not extrato_df.empty else 0.0
-    saidas    = extrato_df[extrato_df["valor"] < 0]["valor"].abs().sum() if not extrato_df.empty else 0.0
-    saldo     = extrato_df["valor"].sum() if not extrato_df.empty else 0.0
+    # Para os TOTAIS, ignora lançamentos marcados como "Ignorar" (continuam na lista abaixo).
+    _calc_df = extrato_df.copy()
+    if not _calc_df.empty and "categoria" in _calc_df.columns:
+        _calc_df = _calc_df[_calc_df["categoria"] != CAT_IGNORAR]
+    entradas  = _calc_df[_calc_df["valor"] > 0]["valor"].sum() if not _calc_df.empty else 0.0
+    saidas    = _calc_df[_calc_df["valor"] < 0]["valor"].abs().sum() if not _calc_df.empty else 0.0
+    saldo     = _calc_df["valor"].sum() if not _calc_df.empty else 0.0
     pendentes = extrato_df[~extrato_df["conciliado"]] if not extrato_df.empty and "conciliado" in extrato_df.columns else pd.DataFrame()
     a_pagar   = agend_df[~agend_df["pago"]]["valor"].abs().sum() if not agend_df.empty and "pago" in agend_df.columns else 0.0
 
