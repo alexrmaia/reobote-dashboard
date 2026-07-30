@@ -1956,6 +1956,13 @@ elif st.session_state["aba_ativa"] == "caixa":
         df["data"]       = pd.to_datetime(df["data"], errors="coerce")
         df["valor"]      = pd.to_numeric(df["valor"], errors="coerce").fillna(0)
         df["conciliado"] = df["conciliado"].astype(bool)
+        # Neutraliza transferências internas (porquinho/CDB): aplicação e resgate
+        # não são entrada nem saída de caixa — o dinheiro só muda de "quadrado",
+        # mas continua na mesma conta. Preserva rendimento (descrição diferente).
+        if "memo" in df.columns:
+            _m = df["memo"].fillna("").str.strip().str.lower()
+            _transf = _m.str.startswith("aplicacao") | _m.str.startswith("aplicação") | _m.str.startswith("resgate")
+            df = df[~_transf].copy()
         return df
 
     def save_lancamento(uid, row):
