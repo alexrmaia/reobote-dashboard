@@ -292,15 +292,19 @@ def montar_snapshot_sensores(mk):
 @st.cache_data(ttl=300, show_spinner=False)
 def get_saude_anuncios(user_id, token):
     """
-    Conta quantos anúncios estão em cada estado de saúde (reputation_health_gauge):
-    healthy / warning / unhealthy. Usa limit=1 e lê paging.total (rápido, não baixa itens).
-    Retorna dict com contagens e os IDs unhealthy/warning (para ação futura).
+    Conta anúncios por estado de saúde (reputation_health_gauge), MAS cruzando
+    com status=active — porque um anúncio pausado aparece como 'perdendo exposição'
+    por definição (não é problema, é intencional). Só interessa o que está ATIVO
+    E perdendo exposição ao mesmo tempo. Rápido: usa paging.total.
     """
     headers = {"Authorization": f"Bearer {token}"}
     resultado = {"healthy": None, "warning": None, "unhealthy": None,
-                 "ids_unhealthy": [], "ids_warning": [], "erro": None}
+                 "ids_unhealthy": [], "ids_warning": [], "erro": None,
+                 "unhealthy_ativos": None, "warning_ativos": None,
+                 "ids_unhealthy_ativos": [], "ids_warning_ativos": []}
     for gauge in ("healthy", "warning", "unhealthy"):
         try:
+            # total geral do gauge (inclui pausados)
             r = requests.get(f"{ML_API_BASE}/users/{user_id}/items/search",
                              headers=headers,
                              params={"reputation_health_gauge": gauge, "limit": 50, "offset": 0},
@@ -312,6 +316,16 @@ def get_saude_anuncios(user_id, token):
             resultado[gauge] = data.get("paging", {}).get("total", 0)
             if gauge in ("unhealthy", "warning"):
                 resultado[f"ids_{gauge}"] = data.get("results", [])[:50]
+                # agora só os ATIVOS desse gauge (o que realmente importa)
+                ra = requests.get(f"{ML_API_BASE}/users/{user_id}/items/search",
+                                  headers=headers,
+                                  params={"reputation_health_gauge": gauge,
+                                          "status": "active", "limit": 50, "offset": 0},
+                                  timeout=20)
+                if ra.status_code == 200:
+                    da = ra.json()
+                    resultado[f"{gauge}_ativos"] = da.get("paging", {}).get("total", 0)
+                    resultado[f"ids_{gauge}_ativos"] = da.get("results", [])[:50]
         except Exception as e:
             resultado["erro"] = str(e)
     return resultado
@@ -1291,17 +1305,23 @@ if st.session_state["aba_ativa"] == "financeiro":
     if _saude.get("erro"):
         st.warning(f"Saúde dos anúncios: {_saude['erro']}")
     if _saude:
+        # o que importa: ATIVOS perdendo exposição (pausados são intencionais)
+        _ua = _saude.get("unhealthy_ativos")
+        _wa = _saude.get("warning_ativos")
+        st.markdown("_Só anúncios ATIVOS (pausados perdem exposição por definição, não é problema):_")
+        aX, aY = st.columns(2)
+        aX.metric("🔴 Ativos perdendo exposição", _ua if _ua is not None else "—")
+        aY.metric("⚠️ Ativos em risco", _wa if _wa is not None else "—")
+        if _saude.get("ids_unhealthy_ativos"):
+            st.caption("IDs ATIVOS perdendo exposição (estes merecem ação):")
+            st.write(_saude["ids_unhealthy_ativos"][:20])
+        if _saude.get("ids_warning_ativos"):
+            st.caption("IDs ATIVOS em risco:")
+            st.write(_saude["ids_warning_ativos"][:20])
+
+        # totais gerais (inclui pausados) — só referência
         _h = _saude.get("healthy"); _w = _saude.get("warning"); _u = _saude.get("unhealthy")
-        sH, sW, sU = st.columns(3)
-        sH.metric("✅ Saudáveis", _h if _h is not None else "—")
-        sW.metric("⚠️ Em risco", _w if _w is not None else "—")
-        sU.metric("🔴 Perdendo exposição", _u if _u is not None else "—")
-        if _saude.get("ids_unhealthy"):
-            st.caption("IDs perdendo exposição (amostra):")
-            st.write(_saude["ids_unhealthy"][:20])
-        if _saude.get("ids_warning"):
-            st.caption("IDs em risco (amostra):")
-            st.write(_saude["ids_warning"][:20])
+        st.caption(f"Totais gerais (inclui pausados): saudáveis {_h} · em risco {_w} · perdendo exposição {_u}")
 
         # 3) Motivo dos anúncios penalizados
         st.markdown("**3) Motivo dos anúncios penalizados**")
