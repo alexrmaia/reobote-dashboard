@@ -140,6 +140,59 @@ def save_capital(user_id, row):
     else:
         sb.table("capital_investido").insert(row).execute()
 
+# --- Snapshots dos sensores ocultos da conta ML (para detectar mudanças) ---
+# Tabela sugerida no Supabase: sensores_conta
+#   colunas: user_id (text), data (date), snapshot (jsonb)
+#   chave única: (user_id, data)  -> 1 snapshot por dia
+def load_sensores_hist(user_id, limite=60):
+    sb = get_supabase()
+    resp = (sb.table("sensores_conta").select("*")
+            .eq("user_id", user_id).order("data", desc=True).limit(limite).execute())
+    if not resp.data:
+        return pd.DataFrame(columns=["data", "snapshot"])
+    df = pd.DataFrame(resp.data)
+    df["data"] = pd.to_datetime(df["data"], errors="coerce")
+    return df.sort_values("data")
+
+def salvar_snapshot_sensores(user_id, snapshot):
+    """Grava (ou atualiza) o snapshot de HOJE. Idempotente: upsert por (user_id, data)."""
+    from datetime import date as _date
+    import json as _json
+    sb = get_supabase()
+    hoje = _date.today().strftime("%Y-%m-%d")
+    try:
+        sb.table("sensores_conta").upsert(
+            {"user_id": user_id, "data": hoje, "snapshot": _json.dumps(snapshot, ensure_ascii=False)},
+            on_conflict="user_id,data").execute()
+    except Exception:
+        pass
+
+def detectar_mudancas_sensores(hist_df, snapshot_atual):
+    """
+    Compara o snapshot atual com o último snapshot DIFERENTE de hoje.
+    Retorna dict {campo: {"de": x, "para": y, "quando": data}} só dos que mudaram.
+    """
+    import json as _json
+    if hist_df is None or hist_df.empty:
+        return {}
+    from datetime import date as _date
+    hoje = pd.Timestamp(_date.today())
+    anteriores = hist_df[hist_df["data"] < hoje]
+    if anteriores.empty:
+        return {}
+    ultimo = anteriores.iloc[-1]
+    try:
+        prev = _json.loads(ultimo["snapshot"]) if isinstance(ultimo["snapshot"], str) else ultimo["snapshot"]
+    except Exception:
+        return {}
+    mudancas = {}
+    for k, v_atual in snapshot_atual.items():
+        v_ant = prev.get(k)
+        if v_ant != v_atual:
+            mudancas[k] = {"de": v_ant, "para": v_atual,
+                           "quando": ultimo["data"].strftime("%d/%m")}
+    return mudancas
+
 # =========================
 # OAUTH
 # =========================
@@ -194,6 +247,7 @@ def extrair_marcadores_conta(info):
     """
     rep = info.get("seller_reputation", {}) or {}
     metrics = rep.get("metrics", {}) or {}
+    credit = info.get("credit", {}) or {}
     return {
         "seller_experience": info.get("seller_experience"),      # ex.: NEWBIE, INTERMEDIATE, ADVANCED
         "level_id":          rep.get("level_id"),                # ex.: 5_green, None (=conta nova)
@@ -202,14 +256,51 @@ def extrair_marcadores_conta(info):
         "user_type":         info.get("user_type"),              # normal, brand, etc.
         "tags":              info.get("tags", []) or [],         # brand_new, mshops, normal...
         "site_status":       (info.get("status", {}) or {}).get("site_status"),
+        "credit_rank":       credit.get("rank"),                 # newbie... (motor de crédito)
+        "credit_level_id":   credit.get("credit_level_id"),      # ex.: MLB5
         "transactions_total": (rep.get("transactions", {}) or {}).get("total"),
         "claims_rate":       (metrics.get("claims", {}) or {}).get("rate"),
         "delayed_rate":      (metrics.get("delayed_handling_time", {}) or {}).get("rate"),
         "cancel_rate":       (metrics.get("cancellations", {}) or {}).get("rate"),
     }
 
+def montar_snapshot_sensores(mk):
+    """Só os sensores que valem vigiar ao longo do tempo (invisíveis na plataforma)."""
+    return {
+        "seller_experience": mk.get("seller_experience"),
+        "credit_rank":       mk.get("credit_rank"),
+        "credit_level_id":   mk.get("credit_level_id"),
+        "claims_rate":       mk.get("claims_rate"),
+        "delayed_rate":      mk.get("delayed_rate"),
+        "cancel_rate":       mk.get("cancel_rate"),
+    }
+
 @st.cache_data(ttl=300, show_spinner=False)
-def get_orders(user_id, token, date_from, date_to):
+def get_saude_anuncios(user_id, token):
+    """
+    Conta quantos anúncios estão em cada estado de saúde (reputation_health_gauge):
+    healthy / warning / unhealthy. Usa limit=1 e lê paging.total (rápido, não baixa itens).
+    Retorna dict com contagens e os IDs unhealthy/warning (para ação futura).
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    resultado = {"healthy": None, "warning": None, "unhealthy": None,
+                 "ids_unhealthy": [], "ids_warning": [], "erro": None}
+    for gauge in ("healthy", "warning", "unhealthy"):
+        try:
+            r = requests.get(f"{ML_API_BASE}/users/{user_id}/items/search",
+                             headers=headers,
+                             params={"reputation_health_gauge": gauge, "limit": 50, "offset": 0},
+                             timeout=20)
+            if r.status_code != 200:
+                resultado["erro"] = f"HTTP {r.status_code} em {gauge}"
+                continue
+            data = r.json()
+            resultado[gauge] = data.get("paging", {}).get("total", 0)
+            if gauge in ("unhealthy", "warning"):
+                resultado[f"ids_{gauge}"] = data.get("results", [])[:50]
+        except Exception as e:
+            resultado["erro"] = str(e)
+    return resultado
     headers = {"Authorization": f"Bearer {token}"}
     orders, offset, limit = [], 0, 50
     while True:
@@ -1042,37 +1133,48 @@ if st.session_state["aba_ativa"] == "financeiro":
     if "lucro_acumulado" not in st.session_state or periodo == "Personalizar":
         st.session_state["lucro_acumulado"] = lucro_total
 
-    # ── [TESTE] Raio-x da conta ML — marcadores internos ──
-    with st.expander("🔬 [teste] Marcadores internos da conta (raio-x)"):
+    # ── Sensores ocultos da conta (invisíveis na plataforma) ──
+    _tags_html = ""
+    _diag = None
+    try:
         _info = get_user_info(str(user_id), token) if token else {}
-        if not _info:
-            st.warning("Não foi possível carregar /users/{id}. Verifique o token.")
-        else:
+        if _info:
             _mk = extrair_marcadores_conta(_info)
-            st.caption("O que a SUA conta retorna hoje. Campos vazios não existem para o seu tipo de conta.")
-            cA, cB = st.columns(2)
-            with cA:
-                st.markdown("**Classificação da conta**")
-                st.write({
-                    "seller_experience": _mk["seller_experience"],
-                    "level_id (cor)":    _mk["level_id"],
-                    "MercadoLíder":      _mk["power_seller_status"],
-                    "points":            _mk["points"],
-                    "user_type":         _mk["user_type"],
-                    "status":            _mk["site_status"],
-                })
-            with cB:
-                st.markdown("**Métricas de qualidade**")
-                st.write({
-                    "total_transações": _mk["transactions_total"],
-                    "reclamações (rate)": _mk["claims_rate"],
-                    "atraso envio (rate)": _mk["delayed_rate"],
-                    "cancelamentos (rate)": _mk["cancel_rate"],
-                })
-            st.markdown("**Tags (marcadores brutos)**")
-            st.write(_mk["tags"])
-            with st.expander("Ver JSON completo de /users/{id}"):
-                st.json(_info)
+            _snap = montar_snapshot_sensores(_mk)
+            _hist = load_sensores_hist(str(user_id))
+            _mud = detectar_mudancas_sensores(_hist, _snap)
+            salvar_snapshot_sensores(str(user_id), _snap)   # grava o de hoje (idempotente)
+            _diag = (_mk, _snap, _mud, _info)
+
+            # tradução amigável + formatação das taxas em %
+            def _pct(v):
+                try: return f"{float(v)*100:.2f}%"
+                except: return "—"
+            _sensores = [
+                ("Experiência", (_mk.get("seller_experience") or "—").title(), "seller_experience"),
+                ("Crédito", (_mk.get("credit_rank") or "—").title(), "credit_rank"),
+                ("Faixa", _mk.get("credit_level_id") or "—", "credit_level_id"),
+                ("Reclamações", _pct(_mk.get("claims_rate")), "claims_rate"),
+                ("Atraso envio", _pct(_mk.get("delayed_rate")), "delayed_rate"),
+                ("Cancelam.", _pct(_mk.get("cancel_rate")), "cancel_rate"),
+            ]
+            _chips = []
+            for rotulo, valor, chave in _sensores:
+                mudou = chave in _mud
+                seta = ""
+                if mudou:
+                    de = _mud[chave]["de"]; quando = _mud[chave]["quando"]
+                    seta = (f"<span style='color:#FDE047;font-weight:900;' "
+                            f"title='Mudou em {quando} (era: {de})'> ▲</span>")
+                borda = "2px solid #FDE047" if mudou else "1px solid rgba(255,255,255,.30)"
+                _chips.append(
+                    f"<span style='background:rgba(255,255,255,.14);border:{borda};border-radius:999px;"
+                    f"padding:5px 11px;font-size:11px;font-weight:800;color:#fff;white-space:nowrap;'>"
+                    f"{rotulo}: {valor}{seta}</span>")
+            _tags_html = ("<div style='display:flex;flex-wrap:wrap;gap:7px;margin-top:12px;'>"
+                          + "".join(_chips) + "</div>")
+    except Exception:
+        _tags_html = ""
 
     # HERO
     st.markdown(f"""
@@ -1085,6 +1187,7 @@ if st.session_state["aba_ativa"] == "financeiro":
                       border-radius:999px;padding:10px 16px;font-weight:900;width:fit-content;">
               Período selecionado: {label_periodo}
           </div>
+          {_tags_html}
         </div>
         <div style="min-width:320px;">
           <div class="hero-value-label">Faturamento</div>
@@ -1093,6 +1196,40 @@ if st.session_state["aba_ativa"] == "financeiro":
       </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # diagnóstico opcional (mantido recolhido para conferência)
+    if _diag is not None:
+        _mk, _snap, _mud, _info = _diag
+        with st.expander("🔬 Detalhe dos sensores da conta"):
+            if _mud:
+                st.markdown("**Mudanças detectadas desde o último registro:**")
+                for k, v in _mud.items():
+                    st.markdown(f"- `{k}`: {v['de']} → **{v['para']}** (em {v['quando']})")
+            else:
+                st.caption("Nenhuma mudança desde o último snapshot.")
+            st.write(_snap)
+
+            # ── [descoberta] Saúde dos anúncios (reputation_health_gauge) ──
+            st.markdown("---")
+            st.markdown("**🩺 Saúde dos anúncios (posicionamento)**")
+            _saude = get_saude_anuncios(str(user_id), token) if token else {}
+            if _saude.get("erro"):
+                st.warning(f"Não foi possível ler a saúde dos anúncios: {_saude['erro']}")
+            if _saude:
+                _h = _saude.get("healthy"); _w = _saude.get("warning"); _u = _saude.get("unhealthy")
+                cH, cW, cU = st.columns(3)
+                cH.metric("✅ Saudáveis", _h if _h is not None else "—")
+                cW.metric("⚠️ Em risco (warning)", _w if _w is not None else "—")
+                cU.metric("🔴 Perdendo exposição", _u if _u is not None else "—")
+                if _saude.get("ids_unhealthy"):
+                    st.caption("IDs perdendo exposição (amostra):")
+                    st.write(_saude["ids_unhealthy"][:20])
+                if _saude.get("ids_warning"):
+                    st.caption("IDs em risco (amostra):")
+                    st.write(_saude["ids_warning"][:20])
+
+            with st.expander("Ver JSON completo de /users/{id}"):
+                st.json(_info)
 
     # KPIs — metric-card estilo local (dashed border + barra colorida)
     def metric_card(col, title, value, sub, color):
