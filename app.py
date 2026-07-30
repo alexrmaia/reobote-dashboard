@@ -319,22 +319,51 @@ def get_saude_anuncios(user_id, token):
 @st.cache_data(ttl=300, show_spinner=False)
 def get_performance_item(item_id, token):
     """
-    Detalha a qualidade/saúde de UM anúncio. Tenta /performance (nova) e cai
-    para /health (antiga) enquanto a migração do ML não se estabiliza.
-    Retorna dict cru + de onde veio, para inspeção no painel de descoberta.
+    Detalha a qualidade/saúde de UM anúncio. A rota mudou ao longo do tempo,
+    então tenta várias variações e retorna a primeira que responder.
     """
     headers = {"Authorization": f"Bearer {token}"}
-    # 1) API nova: /performance
-    for url in (f"{ML_API_BASE}/items/{item_id}/performance",
-                f"{ML_API_BASE}/items/{item_id}/health"):
+    urls = [
+        f"{ML_API_BASE}/items/{item_id}/performance",
+        f"{ML_API_BASE}/items/{item_id}/health",
+        f"{ML_API_BASE}/reputation/items/{item_id}",
+        f"{ML_API_BASE}/items/{item_id}/health?attributes=all",
+    ]
+    tentativas = []
+    for url in urls:
         try:
             r = requests.get(url, headers=headers, timeout=15)
+            tentativas.append(f"{url.split(ML_API_BASE)[-1]} → {r.status_code}")
             if r.status_code == 200:
-                return {"item_id": item_id, "fonte": url.split("/")[-1], "dados": r.json(), "erro": None}
+                return {"item_id": item_id, "fonte": url.split("/")[-1],
+                        "dados": r.json(), "erro": None, "tentativas": tentativas}
         except Exception as e:
-            _last = str(e)
+            tentativas.append(f"{url.split(ML_API_BASE)[-1]} → ERRO {e}")
     return {"item_id": item_id, "fonte": None, "dados": None,
-            "erro": "Nenhum endpoint respondeu (/performance nem /health)"}
+            "erro": "Nenhuma rota respondeu 200", "tentativas": tentativas}
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_itens_por_tag_qualidade(user_id, token):
+    """
+    Identifica anúncios penalizados por motivos específicos, via tags de qualidade.
+    incomplete_technical_specs = ficha técnica/atributos incompletos (causa mais comum
+    de perda de exposição para quem tem boas métricas de atendimento).
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    achados = {}
+    for tag in ("incomplete_technical_specs",):
+        try:
+            r = requests.get(f"{ML_API_BASE}/users/{user_id}/items/search",
+                             headers=headers, params={"tags": tag, "limit": 50}, timeout=20)
+            if r.status_code == 200:
+                data = r.json()
+                achados[tag] = {"total": data.get("paging", {}).get("total", 0),
+                                "ids": data.get("results", [])[:50]}
+            else:
+                achados[tag] = {"erro": f"HTTP {r.status_code}"}
+        except Exception as e:
+            achados[tag] = {"erro": str(e)}
+    return achados
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_orders(user_id, token, date_from, date_to):
@@ -1272,16 +1301,31 @@ if st.session_state["aba_ativa"] == "financeiro":
             st.caption("IDs em risco (amostra):")
             st.write(_saude["ids_warning"][:20])
 
-        # 3) Motivo de cada anúncio problemático (/performance)
+        # 3) Motivo dos anúncios penalizados
+        st.markdown("**3) Motivo dos anúncios penalizados**")
+
+        # 3a) Via tag de qualidade (mais confiável): ficha técnica incompleta
+        _tags_q = get_itens_por_tag_qualidade(str(user_id), token) if token else {}
+        _its = _tags_q.get("incomplete_technical_specs", {})
+        if _its.get("erro"):
+            st.caption(f"Tag incomplete_technical_specs: {_its['erro']}")
+        else:
+            st.metric("📋 Ficha técnica incompleta", _its.get("total", 0))
+            if _its.get("ids"):
+                st.caption("IDs com ficha técnica incompleta:")
+                st.write(_its["ids"][:20])
+
+        # 3b) Detalhe por anúncio via /performance (testa rotas e mostra o status de cada)
         _ids_prob = (_saude.get("ids_unhealthy") or []) + (_saude.get("ids_warning") or [])
         if _ids_prob and token:
-            st.markdown("**3) Motivo por anúncio (/performance)**")
+            st.caption("Tentativas de rota /performance por anúncio (para achar a URL certa):")
             for _iid in _ids_prob[:5]:
                 _perf = get_performance_item(_iid, token)
                 st.markdown(f"**{_iid}** — fonte: `{_perf.get('fonte') or '—'}`")
-                if _perf.get("erro"):
-                    st.caption(f"  ↳ {_perf['erro']}")
-                else:
+                if _perf.get("tentativas"):
+                    for _t in _perf["tentativas"]:
+                        st.caption(f"  ↳ {_t}")
+                if _perf.get("dados"):
                     st.json(_perf.get("dados"))
 
     with st.expander("Ver JSON completo de /users/{id}"):
