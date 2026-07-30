@@ -235,9 +235,23 @@ def save_token(data):
 # =========================
 @st.cache_data(ttl=300, show_spinner=False)
 def get_user_info(user_id, token):
-    resp = requests.get(f"{ML_API_BASE}/users/{user_id}",
-                        headers={"Authorization": f"Bearer {token}"}, timeout=15)
-    return resp.json() if resp.status_code == 200 else {}
+    headers = {"Authorization": f"Bearer {token}"}
+    # 1) tenta pelo id informado, se houver
+    if user_id:
+        try:
+            resp = requests.get(f"{ML_API_BASE}/users/{user_id}", headers=headers, timeout=15)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+    # 2) fallback: /users/me retorna a conta dona do token (não depende do user_id da sessão)
+    try:
+        resp = requests.get(f"{ML_API_BASE}/users/me", headers=headers, timeout=15)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return {}
 
 def extrair_marcadores_conta(info):
     """
@@ -1136,48 +1150,22 @@ if st.session_state["aba_ativa"] == "financeiro":
     if "lucro_acumulado" not in st.session_state or periodo == "Personalizar":
         st.session_state["lucro_acumulado"] = lucro_total
 
-    # ── Sensores ocultos da conta (invisíveis na plataforma) ──
-    _tags_html = ""
+    # ── Descoberta: buscar dados dos sensores (exibidos no painel de diagnóstico abaixo) ──
     _diag = None
+    _sensor_erro = None
     try:
         _info = get_user_info(str(user_id), token) if token else {}
+        if not _info:
+            _sensor_erro = f"get_user_info retornou vazio (user_id={user_id}, token_ok={bool(token)})"
         if _info:
             _mk = extrair_marcadores_conta(_info)
             _snap = montar_snapshot_sensores(_mk)
             _hist = load_sensores_hist(str(user_id))
             _mud = detectar_mudancas_sensores(_hist, _snap)
-            salvar_snapshot_sensores(str(user_id), _snap)   # grava o de hoje (idempotente)
+            salvar_snapshot_sensores(str(user_id), _snap)
             _diag = (_mk, _snap, _mud, _info)
-
-            # tradução amigável + formatação das taxas em %
-            def _pct(v):
-                try: return f"{float(v)*100:.2f}%"
-                except: return "—"
-            _sensores = [
-                ("Experiência", (_mk.get("seller_experience") or "—").title(), "seller_experience"),
-                ("Crédito", (_mk.get("credit_rank") or "—").title(), "credit_rank"),
-                ("Faixa", _mk.get("credit_level_id") or "—", "credit_level_id"),
-                ("Reclamações", _pct(_mk.get("claims_rate")), "claims_rate"),
-                ("Atraso envio", _pct(_mk.get("delayed_rate")), "delayed_rate"),
-                ("Cancelam.", _pct(_mk.get("cancel_rate")), "cancel_rate"),
-            ]
-            _chips = []
-            for rotulo, valor, chave in _sensores:
-                mudou = chave in _mud
-                seta = ""
-                if mudou:
-                    de = _mud[chave]["de"]; quando = _mud[chave]["quando"]
-                    seta = (f"<span style='color:#FDE047;font-weight:900;' "
-                            f"title='Mudou em {quando} (era: {de})'> ▲</span>")
-                borda = "2px solid #FDE047" if mudou else "1px solid rgba(255,255,255,.30)"
-                _chips.append(
-                    f"<span style='background:rgba(255,255,255,.14);border:{borda};border-radius:999px;"
-                    f"padding:5px 11px;font-size:11px;font-weight:800;color:#fff;white-space:nowrap;'>"
-                    f"{rotulo}: {valor}{seta}</span>")
-            _tags_html = ("<div style='display:flex;flex-wrap:wrap;gap:7px;margin-top:12px;'>"
-                          + "".join(_chips) + "</div>")
-    except Exception:
-        _tags_html = ""
+    except Exception as _e:
+        _sensor_erro = f"Exceção ao montar sensores: {type(_e).__name__}: {_e}"
 
     # HERO
     st.markdown(
@@ -1189,7 +1177,6 @@ if st.session_state["aba_ativa"] == "financeiro":
         f'<div style="background:rgba(255,255,255,.18);color:white;border:1px solid rgba(255,255,255,.35);'
         f'border-radius:999px;padding:10px 16px;font-weight:900;width:fit-content;">'
         f'Período selecionado: {label_periodo}</div>'
-        f'{_tags_html}'
         f'</div>'
         f'<div style="min-width:320px;">'
         f'<div class="hero-value-label">Faturamento</div>'
@@ -1199,39 +1186,69 @@ if st.session_state["aba_ativa"] == "financeiro":
         f'</div>',
         unsafe_allow_html=True)
 
-    # diagnóstico opcional (mantido recolhido para conferência)
+    # ═══════════════════════════════════════════════════════════════
+    # PAINEL DE DESCOBERTA (temporário) — para identificar os dados.
+    # Depois de validar, este bloco sai e vira o painel oficial.
+    # ═══════════════════════════════════════════════════════════════
+    st.markdown("### 🔬 [descoberta] Dados das APIs do ML")
+    if _sensor_erro:
+        st.warning(f"⚠️ Sensores da conta: {_sensor_erro}")
+
     if _diag is not None:
         _mk, _snap, _mud, _info = _diag
-        with st.expander("🔬 Detalhe dos sensores da conta"):
-            if _mud:
-                st.markdown("**Mudanças detectadas desde o último registro:**")
-                for k, v in _mud.items():
-                    st.markdown(f"- `{k}`: {v['de']} → **{v['para']}** (em {v['quando']})")
-            else:
-                st.caption("Nenhuma mudança desde o último snapshot.")
-            st.write(_snap)
 
-            # ── [descoberta] Saúde dos anúncios (reputation_health_gauge) ──
-            st.markdown("---")
-            st.markdown("**🩺 Saúde dos anúncios (posicionamento)**")
-            _saude = get_saude_anuncios(str(user_id), token) if token else {}
-            if _saude.get("erro"):
-                st.warning(f"Não foi possível ler a saúde dos anúncios: {_saude['erro']}")
-            if _saude:
-                _h = _saude.get("healthy"); _w = _saude.get("warning"); _u = _saude.get("unhealthy")
-                cH, cW, cU = st.columns(3)
-                cH.metric("✅ Saudáveis", _h if _h is not None else "—")
-                cW.metric("⚠️ Em risco (warning)", _w if _w is not None else "—")
-                cU.metric("🔴 Perdendo exposição", _u if _u is not None else "—")
-                if _saude.get("ids_unhealthy"):
-                    st.caption("IDs perdendo exposição (amostra):")
-                    st.write(_saude["ids_unhealthy"][:20])
-                if _saude.get("ids_warning"):
-                    st.caption("IDs em risco (amostra):")
-                    st.write(_saude["ids_warning"][:20])
+        def _pct(v):
+            try: return f"{float(v)*100:.4f}%"
+            except: return "—"
 
-            with st.expander("Ver JSON completo de /users/{id}"):
-                st.json(_info)
+        st.markdown("**1) Sensores da conta (de /users/{id})**")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Experiência", str(_mk.get("seller_experience") or "—"))
+        c2.metric("Crédito (rank)", str(_mk.get("credit_rank") or "—"))
+        c3.metric("Faixa crédito", str(_mk.get("credit_level_id") or "—"))
+        c4, c5, c6 = st.columns(3)
+        c4.metric("Reclamações", _pct(_mk.get("claims_rate")))
+        c5.metric("Atraso envio", _pct(_mk.get("delayed_rate")))
+        c6.metric("Cancelamentos", _pct(_mk.get("cancel_rate")))
+        c7, c8, c9 = st.columns(3)
+        c7.metric("Reputação (cor)", str(_mk.get("level_id") or "—"))
+        c8.metric("MercadoLíder", str(_mk.get("power_seller_status") or "—"))
+        c9.metric("Transações", str(_mk.get("transactions_total") or "—"))
+
+        if _mud:
+            st.markdown("**Mudanças detectadas desde o último snapshot:**")
+            for k, v in _mud.items():
+                st.markdown(f"- `{k}`: {v['de']} → **{v['para']}** (em {v['quando']})")
+        else:
+            st.caption("Nenhuma mudança desde o último snapshot (ou primeiro dia de histórico).")
+
+        st.markdown("**Tags brutas da conta:**")
+        st.write(_info.get("tags", []))
+
+    # 2) Saúde dos anúncios
+    st.markdown("**2) Saúde dos anúncios (reputation_health_gauge)**")
+    _saude = get_saude_anuncios(str(user_id), token) if token else {}
+    if _saude.get("erro"):
+        st.warning(f"Saúde dos anúncios: {_saude['erro']}")
+    if _saude:
+        _h = _saude.get("healthy"); _w = _saude.get("warning"); _u = _saude.get("unhealthy")
+        sH, sW, sU = st.columns(3)
+        sH.metric("✅ Saudáveis", _h if _h is not None else "—")
+        sW.metric("⚠️ Em risco", _w if _w is not None else "—")
+        sU.metric("🔴 Perdendo exposição", _u if _u is not None else "—")
+        if _saude.get("ids_unhealthy"):
+            st.caption("IDs perdendo exposição (amostra):")
+            st.write(_saude["ids_unhealthy"][:20])
+        if _saude.get("ids_warning"):
+            st.caption("IDs em risco (amostra):")
+            st.write(_saude["ids_warning"][:20])
+
+    with st.expander("Ver JSON completo de /users/{id}"):
+        st.json(_diag[3] if _diag else {})
+    st.markdown("---")
+    # ═══════════════════════════════════════════════════════════════
+    # FIM DO PAINEL DE DESCOBERTA
+    # ═══════════════════════════════════════════════════════════════
 
     # KPIs — metric-card estilo local (dashed border + barra colorida)
     def metric_card(col, title, value, sub, color):
