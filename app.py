@@ -186,6 +186,28 @@ def get_user_info(user_id, token):
                         headers={"Authorization": f"Bearer {token}"}, timeout=15)
     return resp.json() if resp.status_code == 200 else {}
 
+def extrair_marcadores_conta(info):
+    """
+    Extrai da resposta de /users/{id} os marcadores internos de classificação
+    da conta no ML. Retorna dict pronto para exibir como tags.
+    Campos podem vir ausentes dependendo do tipo/país da conta.
+    """
+    rep = info.get("seller_reputation", {}) or {}
+    metrics = rep.get("metrics", {}) or {}
+    return {
+        "seller_experience": info.get("seller_experience"),      # ex.: NEWBIE, INTERMEDIATE, ADVANCED
+        "level_id":          rep.get("level_id"),                # ex.: 5_green, None (=conta nova)
+        "power_seller_status": rep.get("power_seller_status"),   # Silver/Gold/Platinum (MercadoLíder)
+        "points":            info.get("points"),                 # placar interno
+        "user_type":         info.get("user_type"),              # normal, brand, etc.
+        "tags":              info.get("tags", []) or [],         # brand_new, mshops, normal...
+        "site_status":       (info.get("status", {}) or {}).get("site_status"),
+        "transactions_total": (rep.get("transactions", {}) or {}).get("total"),
+        "claims_rate":       (metrics.get("claims", {}) or {}).get("rate"),
+        "delayed_rate":      (metrics.get("delayed_handling_time", {}) or {}).get("rate"),
+        "cancel_rate":       (metrics.get("cancellations", {}) or {}).get("rate"),
+    }
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_orders(user_id, token, date_from, date_to):
     headers = {"Authorization": f"Bearer {token}"}
@@ -1019,6 +1041,38 @@ if st.session_state["aba_ativa"] == "financeiro":
     # Salva lucro no session_state para uso no ROI do Caixa
     if "lucro_acumulado" not in st.session_state or periodo == "Personalizar":
         st.session_state["lucro_acumulado"] = lucro_total
+
+    # ── [TESTE] Raio-x da conta ML — marcadores internos ──
+    with st.expander("🔬 [teste] Marcadores internos da conta (raio-x)"):
+        _info = get_user_info(str(user_id), token) if token else {}
+        if not _info:
+            st.warning("Não foi possível carregar /users/{id}. Verifique o token.")
+        else:
+            _mk = extrair_marcadores_conta(_info)
+            st.caption("O que a SUA conta retorna hoje. Campos vazios não existem para o seu tipo de conta.")
+            cA, cB = st.columns(2)
+            with cA:
+                st.markdown("**Classificação da conta**")
+                st.write({
+                    "seller_experience": _mk["seller_experience"],
+                    "level_id (cor)":    _mk["level_id"],
+                    "MercadoLíder":      _mk["power_seller_status"],
+                    "points":            _mk["points"],
+                    "user_type":         _mk["user_type"],
+                    "status":            _mk["site_status"],
+                })
+            with cB:
+                st.markdown("**Métricas de qualidade**")
+                st.write({
+                    "total_transações": _mk["transactions_total"],
+                    "reclamações (rate)": _mk["claims_rate"],
+                    "atraso envio (rate)": _mk["delayed_rate"],
+                    "cancelamentos (rate)": _mk["cancel_rate"],
+                })
+            st.markdown("**Tags (marcadores brutos)**")
+            st.write(_mk["tags"])
+            with st.expander("Ver JSON completo de /users/{id}"):
+                st.json(_info)
 
     # HERO
     st.markdown(f"""
