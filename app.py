@@ -1153,6 +1153,7 @@ if st.session_state["aba_ativa"] == "financeiro":
     # ── Descoberta: buscar dados dos sensores (exibidos no painel de diagnóstico abaixo) ──
     _diag = None
     _sensor_erro = None
+    _hist_erro = None
     try:
         _info = get_user_info(str(user_id), token) if token else {}
         if not _info:
@@ -1160,12 +1161,18 @@ if st.session_state["aba_ativa"] == "financeiro":
         if _info:
             _mk = extrair_marcadores_conta(_info)
             _snap = montar_snapshot_sensores(_mk)
-            _hist = load_sensores_hist(str(user_id))
-            _mud = detectar_mudancas_sensores(_hist, _snap)
-            salvar_snapshot_sensores(str(user_id), _snap)
+            # histórico e persistência são OPCIONAIS: se a tabela não existir,
+            # os sensores atuais continuam aparecendo (só não há detecção de mudança).
+            _mud = {}
+            try:
+                _hist = load_sensores_hist(str(user_id))
+                _mud = detectar_mudancas_sensores(_hist, _snap)
+                salvar_snapshot_sensores(str(user_id), _snap)
+            except Exception as _he:
+                _hist_erro = f"{type(_he).__name__}: {_he}"
             _diag = (_mk, _snap, _mud, _info)
     except Exception as _e:
-        _sensor_erro = f"Exceção ao montar sensores: {type(_e).__name__}: {_e}"
+        _sensor_erro = f"Exceção ao ler /users/id: {type(_e).__name__}: {_e}"
 
     # HERO
     st.markdown(
@@ -1219,6 +1226,8 @@ if st.session_state["aba_ativa"] == "financeiro":
             st.markdown("**Mudanças detectadas desde o último snapshot:**")
             for k, v in _mud.items():
                 st.markdown(f"- `{k}`: {v['de']} → **{v['para']}** (em {v['quando']})")
+        elif _hist_erro:
+            st.info(f"ℹ️ Histórico ainda não ativo (crie a tabela `sensores_conta` no Supabase para detectar mudanças). Detalhe: {_hist_erro}")
         else:
             st.caption("Nenhuma mudança desde o último snapshot (ou primeiro dia de histórico).")
 
