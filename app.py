@@ -416,6 +416,109 @@ def get_recebimentos_futuros(user_id, token_hash, token):
     df = df.groupby("data", as_index=False)["valor"].sum().sort_values("data")
     return df
 
+def get_repasses_passados(user_id, token_hash, token, dias=15):
+    """
+    Repasses (net_received_amount) que JÁ foram liberados nos últimos `dias`.
+    Mesma mecânica de get_recebimentos_futuros, mas com money_release_date no
+    passado. Base para a média móvel usada no Caixa Projetado.
+    Retorna DataFrame: data (date), valor (float), agrupado por dia.
+    """
+    from datetime import datetime, timedelta
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import zoneinfo
+    _tz = zoneinfo.ZoneInfo("America/Sao_Paulo")
+    _hoje = datetime.now(_tz).date()
+    _ini  = _hoje - timedelta(days=dias)
+    _from = (_hoje - timedelta(days=dias + 20)).strftime("%Y-%m-%dT00:00:00.000-03:00")
+    _to   = (_hoje + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00.000-03:00")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    payment_ids = []
+    offset, limit = 0, 50
+    while True:
+        try:
+            r = requests.get(f"{ML_API_BASE}/orders/search", headers=headers,
+                params={"seller": user_id, "order.date_created.from": _from,
+                        "order.date_created.to": _to, "sort": "date_desc",
+                        "offset": offset, "limit": limit}, timeout=30)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            res = data.get("results", []) or []
+            for o in res:
+                if o.get("status") == "cancelled":
+                    continue
+                for pay in (o.get("payments") or []):
+                    if (pay.get("status") or "").lower() in ("approved", "authorized"):
+                        payment_ids.append(pay.get("id"))
+            offset += limit
+            if offset >= data.get("paging", {}).get("total", 0) or not res:
+                break
+        except Exception:
+            break
+
+    payment_ids = list({p for p in payment_ids if p})
+
+    def _fetch_one(pid):
+        try:
+            resp = requests.get(f"{ML_API_BASE}/collections/{pid}", headers=headers, timeout=15)
+            if resp.status_code != 200:
+                return None
+            d = resp.json()
+            release_iso = d.get("money_release_date")
+            net_val     = float(d.get("net_received_amount") or 0)
+            status      = (d.get("status") or "").lower()
+            # só repasses de venda liberados (ignora estornos/chargebacks/reembolsos)
+            if not release_iso or net_val <= 0 or status not in ("approved", "accredited"):
+                return None
+            try:
+                release_dt = pd.to_datetime(release_iso).tz_convert(_tz).date()
+            except Exception:
+                release_dt = pd.to_datetime(release_iso).date()
+            if release_dt < _ini or release_dt >= _hoje:   # só os últimos `dias`, no passado
+                return None
+            return (release_dt, net_val)
+        except Exception:
+            return None
+
+    rows = []
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs = {ex.submit(_fetch_one, pid): pid for pid in payment_ids}
+        for f in as_completed(futs):
+            res = f.result()
+            if res:
+                rows.append({"data": res[0], "valor": res[1]})
+
+    if not rows:
+        return pd.DataFrame(columns=["data", "valor"])
+    df = pd.DataFrame(rows).groupby("data", as_index=False)["valor"].sum().sort_values("data")
+    return df
+
+
+def projetar_caixa(caixa_inicial, piso_diario, saidas_por_dia=None, horizonte_dias=30):
+    """
+    Projeção de PISO: aplica um mesmo valor diário conservador (piso_diario) para
+    todos os dias do horizonte, somando ao caixa e descontando as contas datadas.
+    É a linha 'minimamente garantida' — na prática tende a vir mais que o projetado.
+
+    caixa_inicial : saldo em conta hoje.
+    piso_diario   : média móvel dos últimos 15 dias corridos x haircut (ex.: 78%).
+    saidas_por_dia: dict {date: valor} com parcelas, DAS, etc.
+    Retorna DataFrame com entra, sai, fluxo e saldo por dia.
+    """
+    from datetime import date as _date, timedelta
+    saidas_por_dia = saidas_por_dia or {}
+    hoje = _date.today()
+    linhas, saldo = [], float(caixa_inicial)
+    for i in range(horizonte_dias):
+        d = hoje + timedelta(days=i)
+        entra = float(piso_diario)
+        sai   = float(saidas_por_dia.get(d, 0.0))
+        saldo += entra - sai
+        linhas.append({"data": d, "entra": entra, "sai": sai,
+                       "fluxo": entra - sai, "saldo": saldo})
+    return pd.DataFrame(linhas)
+
 def parse_orders(orders, fretes=None, reembolsados=None, shipments_info=None):
     import requests
     import streamlit as st
@@ -2001,6 +2104,83 @@ elif st.session_state["aba_ativa"] == "caixa":
             _rec_show["Valor"] = _rec_show["valor"].apply(lambda v: f"R$ {v:,.2f}")
             _rec_show["Acumulado"] = _rec_show["valor"].cumsum().apply(lambda v: f"R$ {v:,.2f}")
             st.dataframe(_rec_show[["Data","Valor","Acumulado"]], hide_index=True, use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Caixa Projetado (piso conservador) ──
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("**🔮 Caixa Projetado (piso conservador)**")
+    st.caption("Linha minimamente garantida: média móvel dos repasses dos últimos 15 dias × fator conservador, "
+               "projetada para os próximos 30 dias e descontando as contas agendadas. Tende a vir mais que o previsto.")
+
+    cfg1, cfg2 = st.columns([1, 1])
+    with cfg1:
+        caixa_inicial = st.number_input("💰 Caixa hoje (R$)", min_value=0.0, value=10000.0, step=500.0, key="cx_ini")
+    with cfg2:
+        haircut = st.slider("🛡️ Conservadorismo (% da média)", 50, 100, 78, key="cx_hair") / 100.0
+
+    _df_pass = get_repasses_passados(str(user_id), token[-8:] if token else "", token, dias=15)
+    if _df_pass.empty:
+        st.info("Ainda não há repasses liberados nos últimos 15 dias para calcular a média.")
+    else:
+        # média sobre 15 dias CORRIDOS (zeros dos dias sem repasse já embutidos na projeção futura)
+        media_15d_corridos = float(_df_pass["valor"].sum()) / 15.0
+        p25 = float(_df_pass["valor"].quantile(0.25))
+        piso_diario = media_15d_corridos * haircut
+
+        # saídas datadas — vêm dos agendamentos do Inter, se houver
+        saidas = {}
+        try:
+            _ag = load_agendamentos_inter(str(user_id))
+            for _, a in _ag.iterrows():
+                dt = pd.to_datetime(a["data"]).date()
+                saidas[dt] = saidas.get(dt, 0.0) + abs(float(a["valor"]))
+        except Exception:
+            pass
+
+        proj = projetar_caixa(caixa_inicial, piso_diario, saidas_por_dia=saidas, horizonte_dias=30)
+
+        saldo_min = float(proj["saldo"].min())
+        dia_min   = proj.loc[proj["saldo"].idxmin(), "data"]
+        saldo_fim = float(proj["saldo"].iloc[-1])
+        cor_min   = "#16A34A" if saldo_min >= 0 else "#DC2626"
+
+        k1, k2, k3 = st.columns(3)
+        k1.markdown(f"""<div class="kpi-card"><div class="kpi-title">Piso de entrada/dia</div><div class="kpi-value">R$ {piso_diario:,.0f}</div></div>""", unsafe_allow_html=True)
+        k2.markdown(f"""<div class="kpi-card"><div class="kpi-title">Menor saldo (30d)</div><div class="kpi-value" style="color:{cor_min};">R$ {saldo_min:,.0f}</div><div class="kpi-title">em {dia_min.strftime('%d/%m')}</div></div>""", unsafe_allow_html=True)
+        k3.markdown(f"""<div class="kpi-card"><div class="kpi-title">Saldo em 30 dias</div><div class="kpi-value">R$ {saldo_fim:,.0f}</div></div>""", unsafe_allow_html=True)
+
+        if saldo_min < 0:
+            st.error(f"⚠️ No piso conservador, o caixa fica negativo em {dia_min.strftime('%d/%m')} "
+                     f"(R$ {saldo_min:,.0f}). Vale antecipar recebíveis ou renegociar uma conta desse dia.")
+
+        st.caption(f"💡 Média 15d (corridos): R$ {media_15d_corridos:,.0f}/dia · "
+                   f"seu P25 (dia ruim típico) é R$ {p25:,.0f}. Se o P25 ficar perto do piso, seus {int(haircut*100)}% estão calibrados pelos seus dados.")
+
+        # gráfico: curva do piso nos 30 dias + linha do zero
+        _pv = proj.copy()
+        _pv["Data"] = _pv["data"].astype(str)
+        _linha_zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#DC2626", strokeDash=[4, 4]).encode(y="y:Q")
+        _area = alt.Chart(_pv).mark_area(opacity=0.22, color="#7C3AED").encode(
+            x=alt.X("Data:N", title=None, axis=alt.Axis(labelAngle=-45, labelFontSize=9)),
+            y=alt.Y("saldo:Q", title="Saldo mínimo projetado (R$)", axis=alt.Axis(format=",.0f")),
+            tooltip=[alt.Tooltip("Data:N"), alt.Tooltip("entra:Q", title="Entra (piso)", format=",.0f"),
+                     alt.Tooltip("sai:Q", title="Sai", format=",.0f"),
+                     alt.Tooltip("saldo:Q", title="Saldo", format=",.0f")]
+        ).properties(height=240)
+        st.altair_chart(_area + _linha_zero, use_container_width=True)
+
+        # tabela dia a dia em portlet com scroll (altura fixa)
+        with st.expander("📋 Ver projeção dia a dia", expanded=False):
+            _show = proj.copy()
+            _show["Data"] = _show["data"].apply(lambda d: d.strftime("%d/%m/%Y (%a)"))
+            for c in ["entra", "sai", "saldo"]:
+                _show[c] = _show[c].apply(lambda v: f"R$ {v:,.2f}")
+            st.dataframe(
+                _show[["Data", "entra", "sai", "saldo"]].rename(
+                    columns={"entra": "Entra (piso)", "sai": "Sai", "saldo": "Saldo"}),
+                hide_index=True, use_container_width=True, height=320)
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
