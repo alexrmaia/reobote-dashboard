@@ -301,6 +301,9 @@ def get_saude_anuncios(user_id, token):
         except Exception as e:
             resultado["erro"] = str(e)
     return resultado
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_orders(user_id, token, date_from, date_to):
     headers = {"Authorization": f"Bearer {token}"}
     orders, offset, limit = [], 0, 50
     while True:
