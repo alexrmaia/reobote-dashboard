@@ -289,6 +289,74 @@ def montar_snapshot_sensores(mk):
         "cancel_rate":       mk.get("cancel_rate"),
     }
 
+def _mapa_cor(level_id):
+    """Traduz o level_id do ML (ex.: 5_green) para o rótulo do velocímetro de cor."""
+    m = {
+        "1_red": "1 Red", "2_orange": "2 Orange", "3_yellow": "3 Yellow",
+        "4_light_green": "4 L.Green", "5_green": "5 Green",
+    }
+    return m.get(str(level_id), "—")
+
+def _svg_estagios(titulo, estagios, atual, mudou=False):
+    """Velocímetro de estágios (régua ordinal): trilha com paradas, a atual destacada."""
+    n = len(estagios)
+    try:
+        idx = [e.upper() for e in estagios].index(str(atual).upper()) if atual else -1
+    except ValueError:
+        idx = -1
+    W, H, pad = 300, 74, 16
+    step = (W - 2 * pad) / max(n - 1, 1)
+    dots = ""
+    for i, nome in enumerate(estagios):
+        cx = pad + i * step
+        ativo = (i == idx)
+        cor = "#7C3AED" if ativo else "#D9D5E8"
+        r = 11 if ativo else 7
+        dots += f'<circle cx="{cx:.0f}" cy="30" r="{r}" fill="{cor}"/>'
+        peso = "800" if ativo else "500"
+        corT = "#4C1D95" if ativo else "#9CA3AF"
+        dots += (f'<text x="{cx:.0f}" y="62" text-anchor="middle" '
+                 f'font-size="10" font-weight="{peso}" fill="{corT}">{nome}</text>')
+    linha = f'<line x1="{pad}" y1="30" x2="{W-pad}" y2="30" stroke="#E5E1F0" stroke-width="3"/>'
+    if idx > 0:
+        xfim = pad + idx * step
+        linha += f'<line x1="{pad}" y1="30" x2="{xfim:.0f}" y2="30" stroke="#7C3AED" stroke-width="3"/>'
+    seta = ""
+    if mudou:
+        seta = f'<text x="{W-pad}" y="14" text-anchor="end" font-size="11" fill="#D97706" font-weight="800">▲ mudou</text>'
+    return (f'<div style="background:#fff;border:1px solid #EEE;border-radius:14px;padding:10px 6px 4px;">'
+            f'<div style="font-size:11px;font-weight:800;color:#6B7280;padding-left:12px;">{titulo}</div>'
+            f'<svg viewBox="0 0 {W} {H}" width="100%" height="{H}">{linha}{dots}{seta}</svg></div>')
+
+def _svg_gauge_meta(titulo, valor_rate, teto_verde, teto_amarelo):
+    """
+    Barra com zona verde/amarela/vermelha e ponteiro. valor_rate e tetos em fração (0-1).
+    Mostra o fôlego: quanto você usa do limite antes de cair de faixa.
+    """
+    try:
+        v = float(valor_rate or 0)
+    except Exception:
+        v = 0.0
+    escala = max(teto_amarelo * 1.4, v * 1.2, 0.0001)
+    W, H = 300, 58
+    pad = 12
+    largura = W - 2 * pad
+    def x(frac): return pad + min(frac / escala, 1.0) * largura
+    xv = x(teto_verde); xa = x(teto_amarelo); xp = x(v)
+    barra = (f'<rect x="{pad}" y="20" width="{largura}" height="12" rx="6" fill="#FEE2E2"/>'
+             f'<rect x="{pad}" y="20" width="{xa-pad:.0f}" height="12" rx="6" fill="#FEF3C7"/>'
+             f'<rect x="{pad}" y="20" width="{xv-pad:.0f}" height="12" rx="6" fill="#DCFCE7"/>')
+    ponteiro = (f'<line x1="{xp:.0f}" y1="14" x2="{xp:.0f}" y2="38" stroke="#111827" stroke-width="2.5"/>'
+                f'<circle cx="{xp:.0f}" cy="14" r="3.5" fill="#111827"/>')
+    pct = f"{v*100:.2f}%"
+    dentro_verde = v <= teto_verde
+    cor_val = "#16A34A" if dentro_verde else ("#D97706" if v <= teto_amarelo else "#DC2626")
+    return (f'<div style="background:#fff;border:1px solid #EEE;border-radius:14px;padding:10px 6px 6px;">'
+            f'<div style="display:flex;justify-content:space-between;padding:0 12px;">'
+            f'<span style="font-size:11px;font-weight:800;color:#6B7280;">{titulo}</span>'
+            f'<span style="font-size:13px;font-weight:900;color:{cor_val};">{pct}</span></div>'
+            f'<svg viewBox="0 0 {W} {H}" width="100%" height="{H}">{barra}{ponteiro}</svg></div>')
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_saude_anuncios(user_id, token):
     """
@@ -1259,109 +1327,92 @@ if st.session_state["aba_ativa"] == "financeiro":
         unsafe_allow_html=True)
 
     # ═══════════════════════════════════════════════════════════════
-    # PAINEL DE DESCOBERTA (temporário) — para identificar os dados.
-    # Depois de validar, este bloco sai e vira o painel oficial.
+    # PAINEL DE SAÚDE DA CONTA
     # ═══════════════════════════════════════════════════════════════
-    st.markdown("### 🔬 [descoberta] Dados das APIs do ML")
+    st.markdown("### 🏥 Saúde da Conta")
     if _sensor_erro:
-        st.warning(f"⚠️ Sensores da conta: {_sensor_erro}")
+        st.warning(f"⚠️ {_sensor_erro}")
 
     if _diag is not None:
         _mk, _snap, _mud, _info = _diag
+        _exp = _mk.get("seller_experience")
 
-        def _pct(v):
-            try: return f"{float(v)*100:.4f}%"
-            except: return "—"
+        # Alerta do Programa Decola: enquanto NEWBIE, exposição é protegida.
+        if str(_exp).upper() == "NEWBIE":
+            st.info("🛡️ **Programa Decola ativo.** Enquanto sua experiência for NEWBIE, seus anúncios "
+                    "não perdem exposição por notas baixas. O momento crítico é quando você **sair do NEWBIE** — "
+                    "aí as notas de experiência passam a valer exposição de verdade. Vigie essa mudança.")
 
-        st.markdown("**1) Sensores da conta (de /users/{id})**")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Experiência", str(_mk.get("seller_experience") or "—"))
-        c2.metric("Crédito (rank)", str(_mk.get("credit_rank") or "—"))
-        c3.metric("Faixa crédito", str(_mk.get("credit_level_id") or "—"))
-        c4, c5, c6 = st.columns(3)
-        c4.metric("Reclamações", _pct(_mk.get("claims_rate")))
-        c5.metric("Atraso envio", _pct(_mk.get("delayed_rate")))
-        c6.metric("Cancelamentos", _pct(_mk.get("cancel_rate")))
-        c7, c8, c9 = st.columns(3)
-        c7.metric("Reputação (cor)", str(_mk.get("level_id") or "—"))
-        c8.metric("MercadoLíder", str(_mk.get("power_seller_status") or "—"))
-        c9.metric("Transações", str(_mk.get("transactions_total") or "—"))
+        # ── Linha 1: velocímetros de estágio (régua ordinal real) ──
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown(_svg_estagios("Experiência da conta",
+                        ["Newbie", "Intermediate", "Advanced"], _exp,
+                        mudou=("seller_experience" in _mud)), unsafe_allow_html=True)
+        with col2:
+            _cor = (_mk.get("level_id") or "").replace("_", " ").title() or "—"
+            st.markdown(_svg_estagios("Reputação (cor)",
+                        ["1 Red", "2 Orange", "3 Yellow", "4 L.Green", "5 Green"],
+                        _mapa_cor(_mk.get("level_id")), mudou=False), unsafe_allow_html=True)
+        with col3:
+            st.markdown(_svg_estagios("MercadoLíder",
+                        ["—", "Silver", "Gold", "Platinum"],
+                        (_mk.get("power_seller_status") or "—").title(), mudou=False),
+                        unsafe_allow_html=True)
 
+        # ── Linha 2: métricas com zona de perigo (o fôlego que você tem) ──
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        st.caption("Métricas de qualidade — ponteiro na zona verde = saudável. "
+                   "⚠️ Tetos são configuráveis (confirme os limites oficiais no seu Seller Central).")
+        m1, m2, m3 = st.columns(3)
+        # tetos conservadores (fração). Ajustáveis quando confirmar os oficiais.
+        with m1:
+            st.markdown(_svg_gauge_meta("Reclamações", _mk.get("claims_rate"), 0.02, 0.07),
+                        unsafe_allow_html=True)
+        with m2:
+            st.markdown(_svg_gauge_meta("Atraso no envio", _mk.get("delayed_rate"), 0.15, 0.25),
+                        unsafe_allow_html=True)
+        with m3:
+            st.markdown(_svg_gauge_meta("Cancelamentos", _mk.get("cancel_rate"), 0.01, 0.03),
+                        unsafe_allow_html=True)
+
+        # ── Linha 3: cartões informativos (sem régua honesta) ──
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        i1, i2, i3, i4 = st.columns(4)
+        i1.metric("Crédito (rank)", (_mk.get("credit_rank") or "—").title())
+        i2.metric("Faixa de crédito", _mk.get("credit_level_id") or "—")
+        i3.metric("Transações", f"{_mk.get('transactions_total') or 0:,}".replace(",", "."))
+        _neg = ((_info.get("seller_reputation", {}) or {}).get("transactions", {}) or {}).get("ratings", {}) or {}
+        i4.metric("Avaliações negativas", _neg.get("negative", "—"))
+
+        # ── Mudanças detectadas (histórico) ──
         if _mud:
-            st.markdown("**Mudanças detectadas desde o último snapshot:**")
-            for k, v in _mud.items():
-                st.markdown(f"- `{k}`: {v['de']} → **{v['para']}** (em {v['quando']})")
+            _linhas = " · ".join(f"{k}: {v['de']}→{v['para']} ({v['quando']})" for k, v in _mud.items())
+            st.success(f"📈 Mudanças desde o último registro: {_linhas}")
         elif _hist_erro:
-            st.info(f"ℹ️ Histórico ainda não ativo (crie a tabela `sensores_conta` no Supabase para detectar mudanças). Detalhe: {_hist_erro}")
-        else:
-            st.caption("Nenhuma mudança desde o último snapshot (ou primeiro dia de histórico).")
+            st.caption("ℹ️ Detecção de mudança inativa — crie a tabela `sensores_conta` no Supabase para ligar o histórico.")
 
-        st.markdown("**Tags brutas da conta:**")
-        st.write(_info.get("tags", []))
-
-    # 2) Saúde dos anúncios
-    st.markdown("**2) Saúde dos anúncios (reputation_health_gauge)**")
+    # ── Saúde dos anúncios ATIVOS (validado: só ativos importam) ──
     _saude = get_saude_anuncios(str(user_id), token) if token else {}
-    if _saude.get("erro"):
-        st.warning(f"Saúde dos anúncios: {_saude['erro']}")
-    if _saude:
-        # o que importa: ATIVOS perdendo exposição (pausados são intencionais)
-        _ua = _saude.get("unhealthy_ativos")
-        _wa = _saude.get("warning_ativos")
-        st.markdown("_Só anúncios ATIVOS (pausados perdem exposição por definição, não é problema):_")
-        aX, aY = st.columns(2)
-        aX.metric("🔴 Ativos perdendo exposição", _ua if _ua is not None else "—")
-        aY.metric("⚠️ Ativos em risco", _wa if _wa is not None else "—")
+    if _saude and not _saude.get("erro"):
+        _ua = _saude.get("unhealthy_ativos"); _wa = _saude.get("warning_ativos")
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+        s1, s2 = st.columns(2)
+        _cor_u = "#DC2626" if (_ua or 0) > 0 else "#16A34A"
+        s1.markdown(f"""<div style="background:#fff;border:1px solid #EEE;border-radius:14px;padding:12px 16px;">
+<div style="font-size:11px;font-weight:800;color:#6B7280;">🔴 Anúncios ATIVOS perdendo exposição</div>
+<div style="font-size:26px;font-weight:900;color:{_cor_u};">{_ua if _ua is not None else '—'}</div></div>""",
+                    unsafe_allow_html=True)
+        s2.markdown(f"""<div style="background:#fff;border:1px solid #EEE;border-radius:14px;padding:12px 16px;">
+<div style="font-size:11px;font-weight:800;color:#6B7280;">⚠️ Anúncios ATIVOS em risco</div>
+<div style="font-size:26px;font-weight:900;color:#D97706;">{_wa if _wa is not None else '—'}</div></div>""",
+                    unsafe_allow_html=True)
         if _saude.get("ids_unhealthy_ativos"):
-            st.caption("IDs ATIVOS perdendo exposição (estes merecem ação):")
-            st.write(_saude["ids_unhealthy_ativos"][:20])
-        if _saude.get("ids_warning_ativos"):
-            st.caption("IDs ATIVOS em risco:")
-            st.write(_saude["ids_warning_ativos"][:20])
-
-        # totais gerais (inclui pausados) — só referência
-        _h = _saude.get("healthy"); _w = _saude.get("warning"); _u = _saude.get("unhealthy")
-        st.caption(f"Totais gerais (inclui pausados): saudáveis {_h} · em risco {_w} · perdendo exposição {_u}")
-
-        # 3) Motivo dos anúncios penalizados
-        st.markdown("**3) Motivo dos anúncios penalizados**")
-
-        # 3a) Filtros de qualidade (recursos que funcionam nesta conta)
-        _filtros = get_itens_por_filtro_qualidade(str(user_id), token) if token else {}
-        fc1, fc2 = st.columns(2)
-        _ftec = _filtros.get("incomplete_technical_specs", {})
-        _fpid = _filtros.get("missing_product_identifiers", {})
-        fc1.metric("📋 Ficha técnica incompleta",
-                   _ftec.get("total", "—") if not _ftec.get("erro") else "erro")
-        fc2.metric("🔖 Sem identificador de produto",
-                   _fpid.get("total", "—") if not _fpid.get("erro") else "erro")
-        if _fpid.get("ids"):
-            st.caption("IDs sem identificador de produto (GTIN/EAN):")
-            st.write(_fpid["ids"][:20])
-
-        # 3b) Leitura crua de cada anúncio problemático (/items/{id} — existe sempre)
-        _ids_prob = (_saude.get("ids_unhealthy") or []) + (_saude.get("ids_warning") or [])
-        if _ids_prob and token:
-            st.caption("Estado bruto de cada anúncio (status / sub_status / tags / health):")
-            for _iid in _ids_prob[:5]:
-                _it = get_item_cru(_iid, token)
-                if _it.get("erro"):
-                    st.markdown(f"**{_iid}** — erro: {_it['erro']}")
-                else:
-                    st.markdown(f"**{_iid}** — {_it.get('title') or ''}")
-                    st.json({
-                        "status": _it.get("status"),
-                        "sub_status": _it.get("sub_status"),
-                        "tags": _it.get("tags"),
-                        "health": _it.get("health"),
-                        "catalog_listing": _it.get("catalog_listing"),
-                    })
-
-    with st.expander("Ver JSON completo de /users/{id}"):
-        st.json(_diag[3] if _diag else {})
+            st.caption("Perdendo exposição (revise no Seller Central → Experiência de compra): "
+                       + ", ".join(_saude["ids_unhealthy_ativos"][:10]))
     st.markdown("---")
     # ═══════════════════════════════════════════════════════════════
-    # FIM DO PAINEL DE DESCOBERTA
+    # FIM DO PAINEL DE SAÚDE DA CONTA
     # ═══════════════════════════════════════════════════════════════
 
     # KPIs — metric-card estilo local (dashed border + barra colorida)
