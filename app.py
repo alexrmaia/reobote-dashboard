@@ -2370,6 +2370,10 @@ elif st.session_state["aba_ativa"] == "caixa":
         sb = get_supabase()
         sb.table("agendamentos_inter").insert({"user_id": uid, **row}).execute()
 
+    def excluir_agendamento(uid, ag_id):
+        sb = get_supabase()
+        sb.table("agendamentos_inter").delete().eq("user_id", uid).eq("id", str(ag_id)).execute()
+
     def parse_ofx(content_bytes):
         """Extrai lançamentos de um arquivo OFX/QFX."""
         import re
@@ -2516,13 +2520,17 @@ elif st.session_state["aba_ativa"] == "caixa":
         p25 = float(_df_pass["valor"].quantile(0.25))
         piso_diario = media_15d_corridos * haircut
 
-        # saídas datadas — vêm dos agendamentos do Inter, se houver
+        # saídas datadas — vêm dos agendamentos do Inter, se houver.
+        # IMPORTANTE: só os NÃO pagos. Um agendamento pago já saiu do caixa;
+        # descontá-lo de novo no futuro contaria a saída em dobro.
         saidas = {}
         try:
             _ag = load_agendamentos_inter(str(user_id))
-            for _, a in _ag.iterrows():
-                dt = pd.to_datetime(a["data"]).date()
-                saidas[dt] = saidas.get(dt, 0.0) + abs(float(a["valor"]))
+            if not _ag.empty:
+                _ag_pend = _ag[~_ag["pago"]] if "pago" in _ag.columns else _ag
+                for _, a in _ag_pend.iterrows():
+                    dt = pd.to_datetime(a["data"]).date()
+                    saidas[dt] = saidas.get(dt, 0.0) + abs(float(a["valor"]))
         except Exception:
             pass
 
@@ -2712,6 +2720,26 @@ elif st.session_state["aba_ativa"] == "caixa":
                     st.rerun()
     else:
         st.info("Nenhum agendamento pendente.")
+
+    # Agendamentos JÁ PAGOS — ficam ocultos da lista principal, mas podem ser
+    # excluídos aqui (ex.: lançamento duplicado marcado como pago por engano).
+    if not agend_df.empty and "pago" in agend_df.columns:
+        _pagos = agend_df[agend_df["pago"] == True]
+        if not _pagos.empty:
+            with st.expander(f"✅ Agendamentos pagos ({len(_pagos)}) — clique para ver ou excluir"):
+                for _, ag in _pagos.iterrows():
+                    venc = pd.to_datetime(ag["data"])
+                    pc1, pc2, pc3, pc4 = st.columns([1.5, 3, 1.5, 1])
+                    with pc1:
+                        st.markdown(f"<div style='color:#64748B;font-size:13px;padding:6px 0;'>{venc.strftime('%d/%m/%Y')}</div>", unsafe_allow_html=True)
+                    with pc2:
+                        st.markdown(f"<div style='padding:6px 0;font-size:13px;'>{ag['descricao']} <span style='color:#94A3B8;'>{ag['categoria']}</span></div>", unsafe_allow_html=True)
+                    with pc3:
+                        st.markdown(f"<div style='color:#16A34A;font-weight:800;padding:6px 0;'>R$ {abs(ag['valor']):,.2f} ✓</div>", unsafe_allow_html=True)
+                    with pc4:
+                        if st.button("🗑️ Excluir", key=f"del_{ag['id']}"):
+                            excluir_agendamento(str(user_id), ag["id"])
+                            st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
     # ── Capital Investido ──
