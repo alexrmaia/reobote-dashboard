@@ -1326,94 +1326,6 @@ if st.session_state["aba_ativa"] == "financeiro":
         f'</div>',
         unsafe_allow_html=True)
 
-    # ═══════════════════════════════════════════════════════════════
-    # PAINEL DE SAÚDE DA CONTA
-    # ═══════════════════════════════════════════════════════════════
-    st.markdown("### 🏥 Saúde da Conta")
-    if _sensor_erro:
-        st.warning(f"⚠️ {_sensor_erro}")
-
-    if _diag is not None:
-        _mk, _snap, _mud, _info = _diag
-        _exp = _mk.get("seller_experience")
-
-        # Alerta do Programa Decola: enquanto NEWBIE, exposição é protegida.
-        if str(_exp).upper() == "NEWBIE":
-            st.info("🛡️ **Programa Decola ativo.** Enquanto sua experiência for NEWBIE, seus anúncios "
-                    "não perdem exposição por notas baixas. O momento crítico é quando você **sair do NEWBIE** — "
-                    "aí as notas de experiência passam a valer exposição de verdade. Vigie essa mudança.")
-
-        # ── Linha 1: velocímetros de estágio (régua ordinal real) ──
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown(_svg_estagios("Experiência da conta",
-                        ["Newbie", "Intermediate", "Advanced"], _exp,
-                        mudou=("seller_experience" in _mud)), unsafe_allow_html=True)
-        with col2:
-            _cor = (_mk.get("level_id") or "").replace("_", " ").title() or "—"
-            st.markdown(_svg_estagios("Reputação (cor)",
-                        ["1 Red", "2 Orange", "3 Yellow", "4 L.Green", "5 Green"],
-                        _mapa_cor(_mk.get("level_id")), mudou=False), unsafe_allow_html=True)
-        with col3:
-            st.markdown(_svg_estagios("MercadoLíder",
-                        ["—", "Silver", "Gold", "Platinum"],
-                        (_mk.get("power_seller_status") or "—").title(), mudou=False),
-                        unsafe_allow_html=True)
-
-        # ── Linha 2: métricas com zona de perigo (o fôlego que você tem) ──
-        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-        st.caption("Métricas de qualidade — ponteiro na zona verde = saudável. "
-                   "⚠️ Tetos são configuráveis (confirme os limites oficiais no seu Seller Central).")
-        m1, m2, m3 = st.columns(3)
-        # tetos conservadores (fração). Ajustáveis quando confirmar os oficiais.
-        with m1:
-            st.markdown(_svg_gauge_meta("Reclamações", _mk.get("claims_rate"), 0.02, 0.07),
-                        unsafe_allow_html=True)
-        with m2:
-            st.markdown(_svg_gauge_meta("Atraso no envio", _mk.get("delayed_rate"), 0.15, 0.25),
-                        unsafe_allow_html=True)
-        with m3:
-            st.markdown(_svg_gauge_meta("Cancelamentos", _mk.get("cancel_rate"), 0.01, 0.03),
-                        unsafe_allow_html=True)
-
-        # ── Linha 3: cartões informativos (sem régua honesta) ──
-        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-        i1, i2, i3, i4 = st.columns(4)
-        i1.metric("Crédito (rank)", (_mk.get("credit_rank") or "—").title())
-        i2.metric("Faixa de crédito", _mk.get("credit_level_id") or "—")
-        i3.metric("Transações", f"{_mk.get('transactions_total') or 0:,}".replace(",", "."))
-        _neg = ((_info.get("seller_reputation", {}) or {}).get("transactions", {}) or {}).get("ratings", {}) or {}
-        i4.metric("Avaliações negativas", _neg.get("negative", "—"))
-
-        # ── Mudanças detectadas (histórico) ──
-        if _mud:
-            _linhas = " · ".join(f"{k}: {v['de']}→{v['para']} ({v['quando']})" for k, v in _mud.items())
-            st.success(f"📈 Mudanças desde o último registro: {_linhas}")
-        elif _hist_erro:
-            st.caption("ℹ️ Detecção de mudança inativa — crie a tabela `sensores_conta` no Supabase para ligar o histórico.")
-
-    # ── Saúde dos anúncios ATIVOS (validado: só ativos importam) ──
-    _saude = get_saude_anuncios(str(user_id), token) if token else {}
-    if _saude and not _saude.get("erro"):
-        _ua = _saude.get("unhealthy_ativos"); _wa = _saude.get("warning_ativos")
-        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-        s1, s2 = st.columns(2)
-        _cor_u = "#DC2626" if (_ua or 0) > 0 else "#16A34A"
-        s1.markdown(f"""<div style="background:#fff;border:1px solid #EEE;border-radius:14px;padding:12px 16px;">
-<div style="font-size:11px;font-weight:800;color:#6B7280;">🔴 Anúncios ATIVOS perdendo exposição</div>
-<div style="font-size:26px;font-weight:900;color:{_cor_u};">{_ua if _ua is not None else '—'}</div></div>""",
-                    unsafe_allow_html=True)
-        s2.markdown(f"""<div style="background:#fff;border:1px solid #EEE;border-radius:14px;padding:12px 16px;">
-<div style="font-size:11px;font-weight:800;color:#6B7280;">⚠️ Anúncios ATIVOS em risco</div>
-<div style="font-size:26px;font-weight:900;color:#D97706;">{_wa if _wa is not None else '—'}</div></div>""",
-                    unsafe_allow_html=True)
-        if _saude.get("ids_unhealthy_ativos"):
-            st.caption("Perdendo exposição (revise no Seller Central → Experiência de compra): "
-                       + ", ".join(_saude["ids_unhealthy_ativos"][:10]))
-    st.markdown("---")
-    # ═══════════════════════════════════════════════════════════════
-    # FIM DO PAINEL DE SAÚDE DA CONTA
-    # ═══════════════════════════════════════════════════════════════
 
     # KPIs — metric-card estilo local (dashed border + barra colorida)
     def metric_card(col, title, value, sub, color):
@@ -2077,6 +1989,96 @@ if st.session_state["aba_ativa"] == "financeiro":
                         st.rerun()
 
     st.markdown('</div>', unsafe_allow_html=True)
+
+
+    # ═══════════════════════════════════════════════════════════════
+    # PAINEL DE SAÚDE DA CONTA
+    # ═══════════════════════════════════════════════════════════════
+    st.markdown("### 🏥 Saúde da Conta")
+    if _sensor_erro:
+        st.warning(f"⚠️ {_sensor_erro}")
+
+    if _diag is not None:
+        _mk, _snap, _mud, _info = _diag
+        _exp = _mk.get("seller_experience")
+
+        # Alerta do Programa Decola: enquanto NEWBIE, exposição é protegida.
+        if str(_exp).upper() == "NEWBIE":
+            st.info("🛡️ **Programa Decola ativo.** Enquanto sua experiência for NEWBIE, seus anúncios "
+                    "não perdem exposição por notas baixas. O momento crítico é quando você **sair do NEWBIE** — "
+                    "aí as notas de experiência passam a valer exposição de verdade. Vigie essa mudança.")
+
+        # ── Linha 1: velocímetros de estágio (régua ordinal real) ──
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown(_svg_estagios("Experiência da conta",
+                        ["Newbie", "Intermediate", "Advanced"], _exp,
+                        mudou=("seller_experience" in _mud)), unsafe_allow_html=True)
+        with col2:
+            _cor = (_mk.get("level_id") or "").replace("_", " ").title() or "—"
+            st.markdown(_svg_estagios("Reputação (cor)",
+                        ["1 Red", "2 Orange", "3 Yellow", "4 L.Green", "5 Green"],
+                        _mapa_cor(_mk.get("level_id")), mudou=False), unsafe_allow_html=True)
+        with col3:
+            st.markdown(_svg_estagios("MercadoLíder",
+                        ["—", "Silver", "Gold", "Platinum"],
+                        (_mk.get("power_seller_status") or "—").title(), mudou=False),
+                        unsafe_allow_html=True)
+
+        # ── Linha 2: métricas com zona de perigo (o fôlego que você tem) ──
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        st.caption("Métricas de qualidade — ponteiro na zona verde = saudável. "
+                   "⚠️ Tetos são configuráveis (confirme os limites oficiais no seu Seller Central).")
+        m1, m2, m3 = st.columns(3)
+        # tetos conservadores (fração). Ajustáveis quando confirmar os oficiais.
+        with m1:
+            st.markdown(_svg_gauge_meta("Reclamações", _mk.get("claims_rate"), 0.02, 0.07),
+                        unsafe_allow_html=True)
+        with m2:
+            st.markdown(_svg_gauge_meta("Atraso no envio", _mk.get("delayed_rate"), 0.15, 0.25),
+                        unsafe_allow_html=True)
+        with m3:
+            st.markdown(_svg_gauge_meta("Cancelamentos", _mk.get("cancel_rate"), 0.01, 0.03),
+                        unsafe_allow_html=True)
+
+        # ── Linha 3: cartões informativos (sem régua honesta) ──
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        i1, i2, i3, i4 = st.columns(4)
+        i1.metric("Crédito (rank)", (_mk.get("credit_rank") or "—").title())
+        i2.metric("Faixa de crédito", _mk.get("credit_level_id") or "—")
+        i3.metric("Transações", f"{_mk.get('transactions_total') or 0:,}".replace(",", "."))
+        _neg = ((_info.get("seller_reputation", {}) or {}).get("transactions", {}) or {}).get("ratings", {}) or {}
+        i4.metric("Avaliações negativas", _neg.get("negative", "—"))
+
+        # ── Mudanças detectadas (histórico) ──
+        if _mud:
+            _linhas = " · ".join(f"{k}: {v['de']}→{v['para']} ({v['quando']})" for k, v in _mud.items())
+            st.success(f"📈 Mudanças desde o último registro: {_linhas}")
+        elif _hist_erro:
+            st.caption("ℹ️ Detecção de mudança inativa — crie a tabela `sensores_conta` no Supabase para ligar o histórico.")
+
+    # ── Saúde dos anúncios ATIVOS (validado: só ativos importam) ──
+    _saude = get_saude_anuncios(str(user_id), token) if token else {}
+    if _saude and not _saude.get("erro"):
+        _ua = _saude.get("unhealthy_ativos"); _wa = _saude.get("warning_ativos")
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+        s1, s2 = st.columns(2)
+        _cor_u = "#DC2626" if (_ua or 0) > 0 else "#16A34A"
+        s1.markdown(f"""<div style="background:#fff;border:1px solid #EEE;border-radius:14px;padding:12px 16px;">
+<div style="font-size:11px;font-weight:800;color:#6B7280;">🔴 Anúncios ATIVOS perdendo exposição</div>
+<div style="font-size:26px;font-weight:900;color:{_cor_u};">{_ua if _ua is not None else '—'}</div></div>""",
+                    unsafe_allow_html=True)
+        s2.markdown(f"""<div style="background:#fff;border:1px solid #EEE;border-radius:14px;padding:12px 16px;">
+<div style="font-size:11px;font-weight:800;color:#6B7280;">⚠️ Anúncios ATIVOS em risco</div>
+<div style="font-size:26px;font-weight:900;color:#D97706;">{_wa if _wa is not None else '—'}</div></div>""",
+                    unsafe_allow_html=True)
+        if _saude.get("ids_unhealthy_ativos"):
+            st.caption("Perdendo exposição (revise no Seller Central → Experiência de compra): "
+                       + ", ".join(_saude["ids_unhealthy_ativos"][:10]))
+    st.markdown("---")
+    # ═══════════════════════════════════════════════════════════════
+    # FIM DO PAINEL DE SAÚDE DA CONTA
+    # ═══════════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════
 # ABA: CADASTRO DE CUSTOS
