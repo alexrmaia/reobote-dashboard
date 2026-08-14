@@ -1019,7 +1019,7 @@ def montar_ranking_reclamacoes(orders, claims_por_pedido, min_vendas=15):
     df = pd.DataFrame(linhas)
     if not df.empty:
         df = df.sort_values(by=["Reclamações", "Taxa (%)"], ascending=[False, False]).reset_index(drop=True)
-    return df, nao_atribuidas
+    return df
 
 def apply_costs_online(df, user_id):
     if df.empty:
