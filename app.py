@@ -488,43 +488,50 @@ def get_orders_reembolsados(orders):
     return reembolsadas
 
 @st.cache_data(ttl=300, show_spinner=False)
-def get_claims(user_id, token, date_from, date_to):
+def get_claims_por_pedidos(order_ids_tuple, token_hash, token):
     """
-    Busca as reclamações (claims) em que o vendedor é parte, no período informado.
-    Endpoint: /post-purchase/v1/claims/search.
+    Busca as reclamações (claims) de uma lista de pedidos — uma chamada por pedido,
+    em paralelo (mesmo padrão de fetch_shipments_batch: ThreadPoolExecutor, cache 5 min).
 
-    IMPORTANTE: a documentação oficial do ML não é 100% consistente entre os espelhos
-    regionais sobre o nome exato dos parâmetros de data/participante nessa API
-    específica (diferente de /orders/search, que é bem documentado). Por isso, se a
-    chamada falhar, devolvemos o erro HTTP bruto em 'erro' em vez de mascarar —
-    é o primeiro lugar a olhar/ajustar ao testar com uma conta real.
+    Por quê pedido a pedido em vez de um filtro único por vendedor+período?
+    Testamos /post-purchase/v1/claims/search com players.role + players.user_id +
+    date_created.from/.to (parâmetros documentados em espelhos regionais do dev center)
+    e a API devolveu "atLeastOneFilterProvided" — ou seja, nenhum desses nomes foi
+    reconhecido como filtro válido. O par resource=order + resource_id={pedido} é a
+    combinação mais consistente entre as fontes oficiais, e como já temos a lista de
+    pedidos do período (via /orders/search), não precisamos de um filtro por data aqui.
+
+    Retorna: (dict {order_id: [claims]}, erro_amostra) — erro_amostra é o texto bruto
+    da primeira falha encontrada (se houver), útil pra debug sem travar a tela inteira
+    se só algumas chamadas falharem.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    if not order_ids_tuple:
+        return {}, None
     headers = {"Authorization": f"Bearer {token}"}
-    claims, offset, limit = [], 0, 50
-    erro = None
-    while True:
+
+    def fetch_one(oid):
         try:
             resp = requests.get(f"{ML_API_BASE}/post-purchase/v1/claims/search", headers=headers, params={
-                "players.role":       "respondent",   # o vendedor é o lado que responde à reclamação
-                "players.user_id":    user_id,
-                "date_created.from":  date_from,
-                "date_created.to":    date_to,
-                "offset": offset, "limit": limit,
-            }, timeout=30)
+                "resource": "order", "resource_id": oid, "limit": 50, "offset": 0,
+            }, timeout=15)
+            if resp.status_code != 200:
+                return oid, [], f"HTTP {resp.status_code} (pedido {oid}): {resp.text[:300]}"
+            data    = resp.json()
+            results = data.get("data") or data.get("results") or []
+            return oid, results, None
         except Exception as e:
-            erro = f"Falha de conexão: {e}"
-            break
-        if resp.status_code != 200:
-            erro = f"HTTP {resp.status_code} em /post-purchase/v1/claims/search: {resp.text[:500]}"
-            break
-        data    = resp.json()
-        results = data.get("data") or data.get("results") or []
-        claims.extend(results)
-        paging = data.get("paging", {}) or {}
-        offset += limit
-        if offset >= paging.get("total", 0) or not results:
-            break
-    return {"claims": claims, "erro": erro}
+            return oid, [], f"Falha de conexão (pedido {oid}): {e}"
+
+    out, erro_amostra = {}, None
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        for future in as_completed({ex.submit(fetch_one, oid): oid for oid in order_ids_tuple}):
+            oid, results, erro = future.result()
+            if results:
+                out[oid] = results
+            if erro and not erro_amostra:
+                erro_amostra = erro
+    return out, erro_amostra
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
@@ -928,22 +935,19 @@ def _motivo_amigavel(reason_id):
     prefixo = "".join(c for c in str(reason_id) if c.isalpha())
     return _MOTIVOS_RECLAMACAO.get(prefixo, str(reason_id))
 
-def montar_ranking_reclamacoes(orders, claims_data, min_vendas=15):
+def montar_ranking_reclamacoes(orders, claims_por_pedido, min_vendas=15):
     """
     Cruza as reclamações (claims) com os pedidos pra construir o índice de
     reclamação por anúncio: reclamações ÷ vendas aprovadas × 100.
 
-    A API de claims não devolve item_id — só resource_id (id do pedido, quando
-    resource == "order"). Por isso o cruzamento é: claim -> resource_id (order_id)
-    -> order_items do pedido (já temos, sem chamada extra) -> item_id.
+    claims_por_pedido vem de get_claims_por_pedidos: dict {order_id: [claims]}.
+    Como cada claim já chegou associada ao pedido que a gente mesmo pediu
+    (resource_id={pedido} na busca), o cruzamento é direto: order_id -> order_items
+    do pedido (já temos, sem chamada extra) -> item_id.
 
     Se um pedido tiver mais de um anúncio (carrinho com itens diferentes do mesmo
     vendedor), a reclamação é contada pra todos os itens daquele pedido — é raro,
     mas fica sinalizado no motivo pra você saber que pode ser ambíguo.
-
-    Claims com resource != "order" (shipment/payment/purchase avulsos) não têm
-    como ser atribuídas a um anúncio específico e ficam fora da tabela, mas
-    contam no total "não atribuídas" devolvido junto.
     """
     from collections import Counter
 
@@ -976,24 +980,20 @@ def montar_ranking_reclamacoes(orders, claims_data, min_vendas=15):
 
     # 3) Reclamações por anúncio
     reclamacoes = {}
-    nao_atribuidas = 0
-    for c in claims_data.get("claims", []):
-        if c.get("resource") != "order":
-            nao_atribuidas += 1
-            continue
-        oid  = str(c.get("resource_id", ""))
+    for oid, claims in claims_por_pedido.items():
+        oid  = str(oid)
         info = ordem_itens.get(oid)
         if not info or not info["itens"]:
-            nao_atribuidas += 1
             continue
-        motivo = _motivo_amigavel(c.get("reason_id"))
-        for it in info["itens"]:
-            iid = it["item_id"]
-            if not iid:
-                continue
-            r = reclamacoes.setdefault(iid, {"n": 0, "motivos": Counter()})
-            r["n"] += 1
-            r["motivos"][motivo] += 1
+        for c in claims:
+            motivo = _motivo_amigavel(c.get("reason_id"))
+            for it in info["itens"]:
+                iid = it["item_id"]
+                if not iid:
+                    continue
+                r = reclamacoes.setdefault(iid, {"n": 0, "motivos": Counter()})
+                r["n"] += 1
+                r["motivos"][motivo] += 1
 
     # 4) Monta a tabela final
     linhas = []
@@ -2233,17 +2233,21 @@ if st.session_state["aba_ativa"] == "financeiro":
 
     with st.spinner("Calculando experiência de compra por anúncio..."):
         _orders_60 = get_orders(str(user_id), token, _d60_from, _d60_to)
-        _claims_60 = get_claims(str(user_id), token, _d60_from, _d60_to)
+        _order_ids_60 = tuple(sorted({str(o.get("id")) for o in _orders_60 if o.get("id")}))
+        _token_hash_claims = token[-8:] if token else ""
+        _claims_por_pedido, _erro_claims = get_claims_por_pedidos(_order_ids_60, _token_hash_claims, token)
 
-    if _claims_60.get("erro"):
-        st.warning("⚠️ Não consegui buscar as reclamações (claims) agora — provavelmente é um ajuste de "
-                   "parâmetro na chamada à API (endpoint novo, ainda não testado com uma conta real).")
-        with st.expander("Ver erro técnico (pra ajustarmos juntos)"):
-            st.code(_claims_60["erro"])
-    elif not _orders_60:
+    if not _orders_60:
         st.info("Sem vendas nos últimos 60 dias pra calcular a experiência de compra por anúncio.")
+    elif _erro_claims and not _claims_por_pedido:
+        st.warning("⚠️ Não consegui buscar as reclamações (claims) agora — provavelmente é mais um ajuste "
+                   "de parâmetro na chamada à API (endpoint ainda em ajuste).")
+        with st.expander("Ver erro técnico (pra ajustarmos juntos)"):
+            st.code(_erro_claims)
     else:
-        _df_reclamacoes, _nao_atribuidas = montar_ranking_reclamacoes(_orders_60, _claims_60, min_vendas=15)
+        _df_reclamacoes = montar_ranking_reclamacoes(_orders_60, _claims_por_pedido, min_vendas=15)
+        if _erro_claims:
+            st.caption(f"⚠️ Algumas chamadas de reclamação falharam e podem estar faltando no total abaixo. Exemplo: {_erro_claims}")
         if _df_reclamacoes.empty:
             st.info("Nenhuma venda encontrada nos últimos 60 dias pra montar o ranking por anúncio.")
         else:
@@ -2288,10 +2292,6 @@ if st.session_state["aba_ativa"] == "financeiro":
                 <tbody>{_linhas_html}</tbody>
             </table></div>"""
             st.markdown(_tabela_reclamacoes_html, unsafe_allow_html=True)
-
-            if _nao_atribuidas:
-                st.caption(f"ℹ️ {_nao_atribuidas} reclamação(ões) no período não puderam ser atribuídas a um "
-                           "anúncio específico (não vinculadas diretamente a um pedido) e não entram na tabela acima.")
 
     st.markdown("---")
     # ═══════════════════════════════════════════════════════════════
