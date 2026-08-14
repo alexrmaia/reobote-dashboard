@@ -487,6 +487,45 @@ def get_orders_reembolsados(orders):
             reembolsadas[order_id] = reembolsado
     return reembolsadas
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_claims(user_id, token, date_from, date_to):
+    """
+    Busca as reclamações (claims) em que o vendedor é parte, no período informado.
+    Endpoint: /post-purchase/v1/claims/search.
+
+    IMPORTANTE: a documentação oficial do ML não é 100% consistente entre os espelhos
+    regionais sobre o nome exato dos parâmetros de data/participante nessa API
+    específica (diferente de /orders/search, que é bem documentado). Por isso, se a
+    chamada falhar, devolvemos o erro HTTP bruto em 'erro' em vez de mascarar —
+    é o primeiro lugar a olhar/ajustar ao testar com uma conta real.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    claims, offset, limit = [], 0, 50
+    erro = None
+    while True:
+        try:
+            resp = requests.get(f"{ML_API_BASE}/post-purchase/v1/claims/search", headers=headers, params={
+                "players.role":       "respondent",   # o vendedor é o lado que responde à reclamação
+                "players.user_id":    user_id,
+                "date_created.from":  date_from,
+                "date_created.to":    date_to,
+                "offset": offset, "limit": limit,
+            }, timeout=30)
+        except Exception as e:
+            erro = f"Falha de conexão: {e}"
+            break
+        if resp.status_code != 200:
+            erro = f"HTTP {resp.status_code} em /post-purchase/v1/claims/search: {resp.text[:500]}"
+            break
+        data    = resp.json()
+        results = data.get("data") or data.get("results") or []
+        claims.extend(results)
+        paging = data.get("paging", {}) or {}
+        offset += limit
+        if offset >= paging.get("total", 0) or not results:
+            break
+    return {"claims": claims, "erro": erro}
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
     """
@@ -873,8 +912,114 @@ def parse_orders(orders, fretes=None, reembolsados=None, shipments_info=None):
                 "Categoria": categoria,
                 "Reembolsado": reemb_val,
             })
-            
+
     return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+_MOTIVOS_RECLAMACAO = {
+    "PNR": "Produto não recebido",
+    "PDD": "Produto diferente / com defeito",
+    "CS":  "Compra cancelada",
+}
+
+def _motivo_amigavel(reason_id):
+    """Traduz o reason_id da claim (ex.: PDD9528) pro rótulo amigável da categoria."""
+    if not reason_id:
+        return "—"
+    prefixo = "".join(c for c in str(reason_id) if c.isalpha())
+    return _MOTIVOS_RECLAMACAO.get(prefixo, str(reason_id))
+
+def montar_ranking_reclamacoes(orders, claims_data, min_vendas=15):
+    """
+    Cruza as reclamações (claims) com os pedidos pra construir o índice de
+    reclamação por anúncio: reclamações ÷ vendas aprovadas × 100.
+
+    A API de claims não devolve item_id — só resource_id (id do pedido, quando
+    resource == "order"). Por isso o cruzamento é: claim -> resource_id (order_id)
+    -> order_items do pedido (já temos, sem chamada extra) -> item_id.
+
+    Se um pedido tiver mais de um anúncio (carrinho com itens diferentes do mesmo
+    vendedor), a reclamação é contada pra todos os itens daquele pedido — é raro,
+    mas fica sinalizado no motivo pra você saber que pode ser ambíguo.
+
+    Claims com resource != "order" (shipment/payment/purchase avulsos) não têm
+    como ser atribuídas a um anúncio específico e ficam fora da tabela, mas
+    contam no total "não atribuídas" devolvido junto.
+    """
+    from collections import Counter
+
+    # 1) Mapa order_id -> itens do pedido + se a venda foi aprovada
+    ordem_itens = {}
+    for o in orders:
+        oid      = str(o.get("id", ""))
+        aprovada = o.get("status") not in ("cancelled",)
+        itens = []
+        for it in o.get("order_items", []):
+            item = it.get("item", {}) or {}
+            itens.append({
+                "item_id": item.get("id"),
+                "titulo":  (item.get("title") or "")[:60],
+                "sku":     (item.get("seller_sku") or "").strip(),
+            })
+        ordem_itens[oid] = {"aprovada": aprovada, "itens": itens}
+
+    # 2) Vendas aprovadas por anúncio (em nº de pedidos — mesma base usada na taxa)
+    vendas = {}
+    for info in ordem_itens.values():
+        if not info["aprovada"]:
+            continue
+        for it in info["itens"]:
+            iid = it["item_id"]
+            if not iid:
+                continue
+            v = vendas.setdefault(iid, {"pedidos": 0, "titulo": it["titulo"], "sku": it["sku"]})
+            v["pedidos"] += 1
+
+    # 3) Reclamações por anúncio
+    reclamacoes = {}
+    nao_atribuidas = 0
+    for c in claims_data.get("claims", []):
+        if c.get("resource") != "order":
+            nao_atribuidas += 1
+            continue
+        oid  = str(c.get("resource_id", ""))
+        info = ordem_itens.get(oid)
+        if not info or not info["itens"]:
+            nao_atribuidas += 1
+            continue
+        motivo = _motivo_amigavel(c.get("reason_id"))
+        for it in info["itens"]:
+            iid = it["item_id"]
+            if not iid:
+                continue
+            r = reclamacoes.setdefault(iid, {"n": 0, "motivos": Counter()})
+            r["n"] += 1
+            r["motivos"][motivo] += 1
+
+    # 4) Monta a tabela final
+    linhas = []
+    for iid in set(vendas.keys()) | set(reclamacoes.keys()):
+        v = vendas.get(iid, {"pedidos": 0, "titulo": "—", "sku": "—"})
+        r = reclamacoes.get(iid, {"n": 0, "motivos": Counter()})
+        pedidos       = v["pedidos"]
+        n_reclamacoes = r["n"]
+        taxa      = (n_reclamacoes / pedidos * 100) if pedidos else None
+        motivo_top = r["motivos"].most_common(1)[0][0] if r["motivos"] else "—"
+        linhas.append({
+            "item_id": iid,
+            "Anúncio": v["titulo"] or "—",
+            "SKU": v["sku"] or "—",
+            "Vendas (pedidos)": pedidos,
+            "Reclamações": n_reclamacoes,
+            "Taxa (%)": round(taxa, 2) if taxa is not None else None,
+            "Vendas por reclamação": round(pedidos / n_reclamacoes, 1) if n_reclamacoes else None,
+            "Motivo predominante": motivo_top,
+            "Amostra suficiente": pedidos >= min_vendas,
+        })
+
+    df = pd.DataFrame(linhas)
+    if not df.empty:
+        df = df.sort_values(by=["Reclamações", "Taxa (%)"], ascending=[False, False]).reset_index(drop=True)
+    return df, nao_atribuidas
 
 def apply_costs_online(df, user_id):
     if df.empty:
@@ -2075,6 +2220,79 @@ if st.session_state["aba_ativa"] == "financeiro":
         if _saude.get("ids_unhealthy_ativos"):
             st.caption("Perdendo exposição (revise no Seller Central → Experiência de compra): "
                        + ", ".join(_saude["ids_unhealthy_ativos"][:10]))
+
+    # ── Experiência de compra por anúncio: reclamações a cada X vendas ──
+    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+    st.markdown("#### 🎯 Experiência de Compra por Anúncio (últimos 60 dias)")
+    st.caption("Reclamações abertas no período cruzadas com os pedidos de cada anúncio — mesma janela de "
+               "60 dias que o próprio Mercado Livre usa pro claims_rate da conta. Anúncios com menos de "
+               "15 vendas no período mostram só a contagem bruta: amostra pequena demais pra virar %.")
+
+    _d60_from = (agora_br - timedelta(days=60)).strftime("%Y-%m-%dT00:00:00.000-03:00")
+    _d60_to   = agora_br.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+
+    with st.spinner("Calculando experiência de compra por anúncio..."):
+        _orders_60 = get_orders(str(user_id), token, _d60_from, _d60_to)
+        _claims_60 = get_claims(str(user_id), token, _d60_from, _d60_to)
+
+    if _claims_60.get("erro"):
+        st.warning("⚠️ Não consegui buscar as reclamações (claims) agora — provavelmente é um ajuste de "
+                   "parâmetro na chamada à API (endpoint novo, ainda não testado com uma conta real).")
+        with st.expander("Ver erro técnico (pra ajustarmos juntos)"):
+            st.code(_claims_60["erro"])
+    elif not _orders_60:
+        st.info("Sem vendas nos últimos 60 dias pra calcular a experiência de compra por anúncio.")
+    else:
+        _df_reclamacoes, _nao_atribuidas = montar_ranking_reclamacoes(_orders_60, _claims_60, min_vendas=15)
+        if _df_reclamacoes.empty:
+            st.info("Nenhuma venda encontrada nos últimos 60 dias pra montar o ranking por anúncio.")
+        else:
+            def _badge_taxa(row):
+                if row["Amostra suficiente"] and row["Taxa (%)"] is not None:
+                    taxa = row["Taxa (%)"]
+                    bg, txt = ("#DCFCE7", "#15803D") if taxa <= 2 else ("#FEF9C3", "#854D0E") if taxa <= 7 else ("#FEE2E2", "#DC2626")
+                    taxa_html = (f'<span style="background:{bg};color:{txt};border-radius:999px;'
+                                 f'padding:2px 9px;font-size:12px;font-weight:800;">{taxa:.1f}%</span>')
+                    vpr = row["Vendas por reclamação"]
+                    vpr_html = f"1 a cada {vpr:.0f}" if vpr else "—"
+                else:
+                    taxa_html = ('<span style="background:#F1F5F9;color:#64748B;border-radius:999px;'
+                                 'padding:2px 9px;font-size:11px;font-weight:800;">amostra pequena</span>')
+                    vpr_html = "—"
+                return taxa_html, vpr_html
+
+            _linhas_html = ""
+            for _, _row in _df_reclamacoes.iterrows():
+                _taxa_html, _vpr_html = _badge_taxa(_row)
+                _linhas_html += f"""<tr style="border-bottom:1px solid #F1F5F9;">
+                    <td style="padding:10px 8px;font-weight:700;">{_row['Anúncio']}</td>
+                    <td style="padding:10px 8px;color:#94A3B8;font-size:12px;white-space:nowrap;">{_row['SKU']}</td>
+                    <td style="padding:10px 8px;text-align:center;">{_row['Vendas (pedidos)']}</td>
+                    <td style="padding:10px 8px;text-align:center;font-weight:700;">{_row['Reclamações']}</td>
+                    <td style="padding:10px 8px;text-align:center;">{_taxa_html}</td>
+                    <td style="padding:10px 8px;text-align:center;color:#64748B;font-size:12px;">{_vpr_html}</td>
+                    <td style="padding:10px 8px;color:#64748B;font-size:12px;">{_row['Motivo predominante']}</td>
+                </tr>"""
+
+            _tabela_reclamacoes_html = f"""<div style="overflow-x:auto;">
+            <table style="width:100%;border-collapse:collapse;font-family:'Inter',sans-serif;font-size:13px;">
+                <thead><tr style="background:#F8FAFC;border-bottom:2px solid #E2E8F0;">
+                    <th style="padding:10px 8px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Anúncio</th>
+                    <th style="padding:10px 8px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">SKU</th>
+                    <th style="padding:10px 8px;text-align:center;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Vendas</th>
+                    <th style="padding:10px 8px;text-align:center;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Reclamações</th>
+                    <th style="padding:10px 8px;text-align:center;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Taxa</th>
+                    <th style="padding:10px 8px;text-align:center;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Vendas / reclamação</th>
+                    <th style="padding:10px 8px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Motivo predominante</th>
+                </tr></thead>
+                <tbody>{_linhas_html}</tbody>
+            </table></div>"""
+            st.markdown(_tabela_reclamacoes_html, unsafe_allow_html=True)
+
+            if _nao_atribuidas:
+                st.caption(f"ℹ️ {_nao_atribuidas} reclamação(ões) no período não puderam ser atribuídas a um "
+                           "anúncio específico (não vinculadas diretamente a um pedido) e não entram na tabela acima.")
+
     st.markdown("---")
     # ═══════════════════════════════════════════════════════════════
     # FIM DO PAINEL DE SAÚDE DA CONTA
