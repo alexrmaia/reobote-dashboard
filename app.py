@@ -487,11 +487,11 @@ def get_orders_reembolsados(orders):
             reembolsadas[order_id] = reembolsado
     return reembolsadas
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_claims_por_pedidos(order_ids_tuple, token_hash, token):
     """
     Busca as reclamações (claims) de uma lista de pedidos — uma chamada por pedido,
-    em paralelo (mesmo padrão de fetch_shipments_batch: ThreadPoolExecutor, cache 5 min).
+    em paralelo (mesmo padrão de fetch_shipments_batch: ThreadPoolExecutor).
 
     Por quê pedido a pedido em vez de um filtro único por vendedor+período?
     Testamos /post-purchase/v1/claims/search com players.role + players.user_id +
@@ -501,37 +501,57 @@ def get_claims_por_pedidos(order_ids_tuple, token_hash, token):
     combinação mais consistente entre as fontes oficiais, e como já temos a lista de
     pedidos do período (via /orders/search), não precisamos de um filtro por data aqui.
 
-    Retorna: (dict {order_id: [claims]}, erro_amostra) — erro_amostra é o texto bruto
-    da primeira falha encontrada (se houver), útil pra debug sem travar a tela inteira
-    se só algumas chamadas falharem.
+    Cache de 30 min (em vez de 5) porque reclamação é evento raro e isso corta bastante
+    o volume de chamadas repetidas — o principal motivo de bater rate limit (429) era
+    refazer todas essas centenas de chamadas a cada 5 min de recarregamento da página.
+
+    Rate limit (429): tenta de novo até 3x por pedido, com espera progressiva
+    (respeitando o header Retry-After da API quando ele vem, senão 1s/2s/4s), e reduz
+    a concorrência pra não estourar de novo.
+
+    Retorna: (dict {order_id: [claims]}, erro_amostra, n_falhas) — erro_amostra é o
+    texto bruto de uma falha (a última encontrada) pra debug, e n_falhas é a contagem
+    exata de pedidos que não puderam ser verificados, mesmo depois das tentativas.
     """
+    import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
     if not order_ids_tuple:
-        return {}, None
+        return {}, None, 0
     headers = {"Authorization": f"Bearer {token}"}
 
     def fetch_one(oid):
-        try:
-            resp = requests.get(f"{ML_API_BASE}/post-purchase/v1/claims/search", headers=headers, params={
-                "resource": "order", "resource_id": oid, "limit": 50, "offset": 0,
-            }, timeout=15)
+        ultimo_erro = None
+        for tentativa in range(3):
+            try:
+                resp = requests.get(f"{ML_API_BASE}/post-purchase/v1/claims/search", headers=headers, params={
+                    "resource": "order", "resource_id": oid, "limit": 50, "offset": 0,
+                }, timeout=15)
+            except Exception as e:
+                ultimo_erro = f"Falha de conexão (pedido {oid}): {e}"
+                time.sleep(2 ** tentativa)
+                continue
+            if resp.status_code == 429:
+                ultimo_erro = f"HTTP 429 (pedido {oid}): rate limit"
+                espera = float(resp.headers.get("Retry-After", 2 ** tentativa))
+                time.sleep(espera)
+                continue
             if resp.status_code != 200:
                 return oid, [], f"HTTP {resp.status_code} (pedido {oid}): {resp.text[:300]}"
             data    = resp.json()
             results = data.get("data") or data.get("results") or []
             return oid, results, None
-        except Exception as e:
-            return oid, [], f"Falha de conexão (pedido {oid}): {e}"
+        return oid, [], ultimo_erro
 
-    out, erro_amostra = {}, None
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    out, erro_amostra, n_falhas = {}, None, 0
+    with ThreadPoolExecutor(max_workers=4) as ex:
         for future in as_completed({ex.submit(fetch_one, oid): oid for oid in order_ids_tuple}):
             oid, results, erro = future.result()
-            if results:
-                out[oid] = results
-            if erro and not erro_amostra:
+            if erro:
+                n_falhas += 1
                 erro_amostra = erro
-    return out, erro_amostra
+            elif results:
+                out[oid] = results
+    return out, erro_amostra, n_falhas
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
@@ -2233,21 +2253,26 @@ if st.session_state["aba_ativa"] == "financeiro":
 
     with st.spinner("Calculando experiência de compra por anúncio..."):
         _orders_60 = get_orders(str(user_id), token, _d60_from, _d60_to)
-        _order_ids_60 = tuple(sorted({str(o.get("id")) for o in _orders_60 if o.get("id")}))
+        # Só consulta reclamação de pedidos aprovados — cancelado não entra no
+        # denominador de vendas mesmo, então nem vale gastar chamada com ele.
+        _order_ids_60 = tuple(sorted({str(o.get("id")) for o in _orders_60
+                                       if o.get("id") and o.get("status") != "cancelled"}))
         _token_hash_claims = token[-8:] if token else ""
-        _claims_por_pedido, _erro_claims = get_claims_por_pedidos(_order_ids_60, _token_hash_claims, token)
+        _claims_por_pedido, _erro_claims, _n_falhas_claims = get_claims_por_pedidos(_order_ids_60, _token_hash_claims, token)
 
     if not _orders_60:
         st.info("Sem vendas nos últimos 60 dias pra calcular a experiência de compra por anúncio.")
-    elif _erro_claims and not _claims_por_pedido:
-        st.warning("⚠️ Não consegui buscar as reclamações (claims) agora — provavelmente é mais um ajuste "
-                   "de parâmetro na chamada à API (endpoint ainda em ajuste).")
+    elif _n_falhas_claims and not _claims_por_pedido:
+        st.warning(f"⚠️ Não consegui buscar as reclamações (claims) agora — {_n_falhas_claims} de "
+                   f"{len(_order_ids_60)} pedido(s) falharam mesmo após 3 tentativas.")
         with st.expander("Ver erro técnico (pra ajustarmos juntos)"):
             st.code(_erro_claims)
     else:
         _df_reclamacoes = montar_ranking_reclamacoes(_orders_60, _claims_por_pedido, min_vendas=15)
-        if _erro_claims:
-            st.caption(f"⚠️ Algumas chamadas de reclamação falharam e podem estar faltando no total abaixo. Exemplo: {_erro_claims}")
+        if _n_falhas_claims:
+            st.caption(f"⚠️ {_n_falhas_claims} de {len(_order_ids_60)} pedido(s) não puderam ser verificados "
+                       f"(rate limit, mesmo após 3 tentativas) — os números abaixo podem estar levemente "
+                       f"subestimados. Recarregue em alguns minutos pra tentar de novo com esses pedidos.")
         if _df_reclamacoes.empty:
             st.info("Nenhuma venda encontrada nos últimos 60 dias pra montar o ranking por anúncio.")
         else:
