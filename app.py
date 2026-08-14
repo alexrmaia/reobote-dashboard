@@ -1545,7 +1545,7 @@ if st.session_state["aba_ativa"] == "financeiro":
 
             area_qty = base_qty.mark_area(interpolate="monotone", opacity=0.18, line=True).encode(
                 x=alt.X("Dia:T", title=None, axis=alt.Axis(format="%d/%m", labelFontSize=10)),
-                y=alt.Y("Quantidade:Q", title="Quantidade vendida", axis=alt.Axis(labelFontSize=10)),
+                y=alt.Y("Quantidade:Q", title="Quantidade vendida", stack=None, axis=alt.Axis(labelFontSize=10)),
                 color=alt.Color("SKU:N", scale=alt.Scale(domain=skus, range=[cor_map[s] for s in skus]), legend=None),
             )
             pontos_qty = base_qty.mark_point(filled=True, size=70).encode(
