@@ -6,6 +6,10 @@ from datetime import datetime, timedelta, date
 import urllib.parse
 from supabase import create_client, Client
 from st_click_detector import click_detector
+import hashlib
+import hmac
+import time
+from typing import Any, Callable, Iterable
 
 # =========================
 # CONFIG
@@ -1133,6 +1137,677 @@ def apply_costs_online(df, user_id):
 
     return df_sorted.sort_values("Data", ascending=False).reset_index(drop=True)
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ███  SHOPEE — bloco isolado  ██████████████████████████████████████████████
+# ═══════════════════════════════════════════════════════════════════════════
+# Tudo que diz respeito à Shopee vive entre este cabeçalho e o marcador
+# "FIM DO BLOCO SHOPEE". Nada aqui escreve nas tabelas do fluxo Mercado Livre:
+# a única leitura compartilhada é `custos_sku` (somente leitura) e a única
+# escrita é em `shopee_tokens`.
+#
+# Referências da API:
+#   Host ............: https://partner.shopeemobile.com
+#   Assinatura ......: HMAC-SHA256 do partner_key sobre uma base string
+#   access_token ....: ~4 horas (renovado automaticamente)
+#   refresh_token ...: ~30 dias sem uso (aí precisa reautorizar a loja)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class ShopeeError(RuntimeError):
+    """Erro devolvido pela API da Shopee (campo `error` preenchido na resposta)."""
+
+    def __init__(self, error: str, message: str, path: str):
+        self.error = error
+        self.message = message
+        self.path = path
+        super().__init__(f"[{path}] {error}: {message}")
+
+
+HOST = "https://partner.shopeemobile.com"
+
+# Limites impostos pela própria API — não são escolhas nossas.
+MAX_JANELA_DIAS = 15      # get_order_list aceita no máximo ~15 dias por chamada
+MAX_ORDER_SN_LOTE = 50    # get_order_detail aceita no máximo 50 order_sn por chamada
+MAX_PAGE_SIZE = 100
+
+TIMEOUT = 20
+
+
+# =========================================================
+# ASSINATURA
+# =========================================================
+def _assinar(partner_key: str, base_string: str) -> str:
+    return hmac.new(
+        partner_key.encode("utf-8"),
+        base_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _sign_public(partner_id: int, partner_key: str, path: str, ts: int) -> str:
+    """Endpoints públicos (auth): partner_id + path + timestamp."""
+    return _assinar(partner_key, f"{partner_id}{path}{ts}")
+
+
+def _sign_shop(
+    partner_id: int, partner_key: str, path: str, ts: int, access_token: str, shop_id: int
+) -> str:
+    """Endpoints de loja: partner_id + path + timestamp + access_token + shop_id."""
+    return _assinar(partner_key, f"{partner_id}{path}{ts}{access_token}{shop_id}")
+
+
+# =========================================================
+# CLIENTE
+# =========================================================
+class ShopeeClient:
+    """
+    Uso típico:
+
+        cli = ShopeeClient(partner_id, partner_key, shop_id,
+                           access_token=tok, refresh_token=ref,
+                           on_token_refresh=salvar_no_supabase)
+        pedidos = cli.listar_pedidos(inicio, fim)
+
+    `on_token_refresh(access_token, refresh_token, expira_em)` é chamado sempre
+    que o cliente renova o token sozinho. É por ali que você persiste — o módulo
+    não grava nada por conta própria.
+    """
+
+    def __init__(
+        self,
+        partner_id: int,
+        partner_key: str,
+        shop_id: int | None = None,
+        access_token: str = "",
+        refresh_token: str = "",
+        on_token_refresh: Callable[[str, str, int], None] | None = None,
+    ):
+        self.partner_id = int(partner_id)
+        self.partner_key = partner_key
+        self.shop_id = int(shop_id) if shop_id else None
+        self.access_token = access_token or ""
+        self.refresh_token = refresh_token or ""
+        self.on_token_refresh = on_token_refresh
+        self._sess = requests.Session()
+
+    # ---------- infraestrutura de request ----------
+    def _request(
+        self,
+        path: str,
+        params: dict | None = None,
+        body: dict | None = None,
+        publico: bool = False,
+        _retentativa: bool = False,
+    ) -> dict:
+        ts = int(time.time())
+        query: dict[str, Any] = {"partner_id": self.partner_id, "timestamp": ts}
+
+        if publico:
+            query["sign"] = _sign_public(self.partner_id, self.partner_key, path, ts)
+        else:
+            if not (self.access_token and self.shop_id):
+                raise ShopeeError("no_auth", "Loja não autorizada (falta access_token/shop_id).", path)
+            query["sign"] = _sign_shop(
+                self.partner_id, self.partner_key, path, ts, self.access_token, self.shop_id
+            )
+            query["access_token"] = self.access_token
+            query["shop_id"] = self.shop_id
+
+        if params:
+            query.update(params)
+
+        url = f"{HOST}{path}"
+        if body is None:
+            resp = self._sess.get(url, params=query, timeout=TIMEOUT)
+        else:
+            resp = self._sess.post(url, params=query, json=body, timeout=TIMEOUT)
+
+        try:
+            data = resp.json()
+        except ValueError:
+            raise ShopeeError("resposta_invalida", resp.text[:300], path)
+
+        erro = (data.get("error") or "").strip()
+        if erro:
+            # Token vencido: renova uma vez e repete. Se falhar de novo, propaga.
+            if not _retentativa and not publico and _token_expirado(erro):
+                self.renovar_token()
+                return self._request(path, params, body, publico, _retentativa=True)
+            raise ShopeeError(erro, data.get("message", ""), path)
+
+        return data
+
+    # ---------- autorização ----------
+    def url_autorizacao(self, redirect_uri: str) -> str:
+        """URL para o vendedor autorizar a loja. Abre no navegador, ele aprova,
+        e a Shopee redireciona pro redirect_uri com ?code=...&shop_id=..."""
+        path = "/api/v2/shop/auth_partner"
+        ts = int(time.time())
+        sign = _sign_public(self.partner_id, self.partner_key, path, ts)
+        return (
+            f"{HOST}{path}?partner_id={self.partner_id}&timestamp={ts}"
+            f"&sign={sign}&redirect={redirect_uri}"
+        )
+
+    def trocar_code_por_token(self, code: str, shop_id: int) -> dict:
+        """Troca o `code` do redirect pelos tokens iniciais."""
+        path = "/api/v2/auth/token/get"
+        data = self._request(
+            path,
+            body={"code": code, "shop_id": int(shop_id), "partner_id": self.partner_id},
+            publico=True,
+        )
+        self.shop_id = int(shop_id)
+        return self._guardar_tokens(data)
+
+    def renovar_token(self) -> dict:
+        """Usa o refresh_token para obter um access_token novo."""
+        if not self.refresh_token or not self.shop_id:
+            raise ShopeeError("no_refresh", "Sem refresh_token ou shop_id para renovar.", "refresh")
+        path = "/api/v2/auth/access_token/get"
+        data = self._request(
+            path,
+            body={
+                "refresh_token": self.refresh_token,
+                "shop_id": self.shop_id,
+                "partner_id": self.partner_id,
+            },
+            publico=True,
+        )
+        return self._guardar_tokens(data)
+
+    def _guardar_tokens(self, data: dict) -> dict:
+        self.access_token = data.get("access_token", "") or self.access_token
+        self.refresh_token = data.get("refresh_token", "") or self.refresh_token
+        expira_em = int(time.time()) + int(data.get("expire_in", 14400) or 14400)
+        if self.on_token_refresh:
+            try:
+                self.on_token_refresh(self.access_token, self.refresh_token, expira_em)
+            except Exception:
+                # Persistir é responsabilidade de quem chamou; falha ali não
+                # pode derrubar a requisição que está em andamento.
+                pass
+        return {
+            "access_token": self.access_token,
+            "refresh_token": self.refresh_token,
+            "expira_em": expira_em,
+        }
+
+    # ---------- pedidos ----------
+    def listar_order_sn(
+        self,
+        inicio: datetime,
+        fim: datetime,
+        status: str = "",
+        campo_data: str = "create_time",
+    ) -> list[str]:
+        """
+        Lista os order_sn do período. Fatiar em janelas de 15 dias é obrigatório:
+        a API rejeita intervalos maiores, então isso não é otimização, é requisito.
+        """
+        path = "/api/v2/order/get_order_list"
+        encontrados: list[str] = []
+
+        for jan_ini, jan_fim in _janelas(inicio, fim, MAX_JANELA_DIAS):
+            cursor = ""
+            while True:
+                params = {
+                    "time_range_field": campo_data,
+                    "time_from": int(jan_ini.timestamp()),
+                    "time_to": int(jan_fim.timestamp()),
+                    "page_size": MAX_PAGE_SIZE,
+                    "cursor": cursor,
+                }
+                if status:
+                    params["order_status"] = status
+
+                resp = self._request(path, params=params).get("response", {}) or {}
+                for o in resp.get("order_list", []) or []:
+                    sn = o.get("order_sn")
+                    if sn:
+                        encontrados.append(sn)
+
+                if not resp.get("more"):
+                    break
+                cursor = resp.get("next_cursor", "") or ""
+                if not cursor:
+                    break
+
+        # A mesma venda pode reaparecer na borda de duas janelas.
+        return list(dict.fromkeys(encontrados))
+
+    def detalhar_pedidos(self, order_sns: Iterable[str]) -> list[dict]:
+        """
+        Detalhe dos pedidos, em lotes de 50 (limite da API).
+
+        Só pedimos campos NÃO sensíveis. O app está com "Access to Sensitive
+        Data: No access" no console, então `buyer_username` e
+        `recipient_address` fariam a chamada falhar ou voltar vazios — e a v1
+        não precisa de dado do comprador para calcular margem.
+        """
+        path = "/api/v2/order/get_order_detail"
+        campos = ",".join(
+            [
+                "item_list",
+                "pay_time",
+                "total_amount",
+                "shipping_carrier",
+                "actual_shipping_fee",
+                "order_status",
+                "cancel_reason",
+            ]
+        )
+        saida: list[dict] = []
+        for lote in _lotes(list(order_sns), MAX_ORDER_SN_LOTE):
+            resp = self._request(
+                path,
+                params={"order_sn_list": ",".join(lote), "response_optional_fields": campos},
+            ).get("response", {}) or {}
+            saida.extend(resp.get("order_list", []) or [])
+        return saida
+
+    def escrow_por_pedido(self, order_sns: Iterable[str]) -> dict[str, dict]:
+        """
+        Detalhe financeiro (comissão, taxa de serviço, frete, valor líquido).
+        É aqui que moram as taxas — o get_order_detail sozinho não traz isso.
+
+        Existe um endpoint em lote (get_escrow_detail_batch) em algumas versões;
+        como a disponibilidade varia por região, aqui vai o unitário, que sempre
+        funciona. Se a sua conta tiver o batch liberado, dá pra trocar depois.
+        """
+        path = "/api/v2/payment/get_escrow_detail"
+        saida: dict[str, dict] = {}
+        for sn in order_sns:
+            try:
+                resp = self._request(path, params={"order_sn": sn}).get("response", {}) or {}
+                saida[sn] = resp
+            except ShopeeError:
+                # Pedido muito novo ou cancelado pode não ter escrow ainda.
+                saida[sn] = {}
+        return saida
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+def _token_expirado(erro: str) -> bool:
+    e = (erro or "").lower()
+    return "token" in e and ("expire" in e or "invalid" in e)
+
+
+def _janelas(inicio: datetime, fim: datetime, dias: int):
+    """Fatia [inicio, fim] em pedaços de no máximo `dias`."""
+    atual = inicio
+    while atual < fim:
+        prox = min(atual + timedelta(days=dias), fim)
+        yield atual, prox
+        atual = prox
+
+
+def _lotes(itens: list, tamanho: int):
+    for i in range(0, len(itens), tamanho):
+        yield itens[i : i + tamanho]
+
+
+# =========================================================
+# NORMALIZAÇÃO -> formato canônico do dashboard
+# =========================================================
+def _num(v) -> float:
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def parse_orders_shopee(pedidos: list[dict], escrow: dict[str, dict] | None = None) -> list[dict]:
+    """
+    Converte a resposta da Shopee para o mesmo formato de linha que o
+    `parse_orders` do Mercado Livre produz — uma linha por item vendido.
+
+    Assim a aba Shopee fala a mesma língua do resto do dashboard, mesmo
+    rodando isolada. Se um dia você quiser consolidar os dois canais, o
+    trabalho já está feito.
+    """
+    escrow = escrow or {}
+    linhas: list[dict] = []
+
+    for p in pedidos:
+        sn = p.get("order_sn", "")
+        status = (p.get("order_status", "") or "").upper()
+        criado = p.get("create_time") or p.get("pay_time") or 0
+        data = datetime.fromtimestamp(criado) if criado else None
+
+        cancelada = status in {"CANCELLED", "UNPAID"}
+        devolvida = status in {"TO_RETURN", "RETURNED"}
+        categoria = "cancelada" if cancelada else ("devolvida" if devolvida else "aprovada")
+
+        # --- taxas do pedido inteiro, vindas do escrow ---
+        renda = (escrow.get(sn, {}) or {}).get("order_income", {}) or {}
+        comissao = _num(renda.get("commission_fee"))
+        servico = _num(renda.get("service_fee"))
+        transacao = _num(renda.get("seller_transaction_fee"))
+        taxas_pedido = comissao + servico + transacao
+
+        # Frete que efetivamente sai do seu bolso: custo real menos o que o
+        # comprador pagou e menos o subsídio da Shopee. Nunca negativo.
+        frete_real = _num(renda.get("actual_shipping_fee"))
+        frete_comprador = _num(renda.get("buyer_paid_shipping_fee"))
+        rebate = _num(renda.get("shopee_shipping_rebate"))
+        frete_pedido = max(frete_real - frete_comprador - rebate, 0.0)
+
+        itens = p.get("item_list", []) or []
+        # Rateia taxas e frete (que vêm por pedido) entre os itens, proporcional
+        # à receita de cada um. Sem isso, pedido com 2+ itens distorce a margem.
+        receitas = [
+            _num(i.get("model_discounted_price") or i.get("model_original_price"))
+            * int(i.get("model_quantity_purchased", 1) or 1)
+            for i in itens
+        ]
+        receita_total = sum(receitas) or 1.0
+
+        for item, receita in zip(itens, receitas):
+            peso = receita / receita_total
+            qtd = int(item.get("model_quantity_purchased", 1) or 1)
+            sku = (item.get("model_sku") or item.get("item_sku") or "").strip()
+
+            if cancelada:
+                # Espelha a regra do ML: mantém a receita para o card de
+                # canceladas não zerar, mas zera taxas.
+                taxas_item, frete_item = 0.0, 0.0
+                liquido = 0.0
+            else:
+                taxas_item = taxas_pedido * peso
+                frete_item = frete_pedido * peso
+                liquido = receita - taxas_item - frete_item
+
+            linhas.append(
+                {
+                    "Venda": sn,
+                    "Data": data,
+                    "Status": status,
+                    "SKU": sku,
+                    "Produto": (item.get("item_name", "") or "")[:50],
+                    "Quantidade": qtd,
+                    "Receita Bruta": receita,
+                    "Taxas Shopee": taxas_item,
+                    "Frete": frete_item,
+                    "Total Shopee": liquido,
+                    "Cancelada": cancelada,
+                    "Categoria": categoria,
+                    "Escrow": _num(renda.get("escrow_amount")) * peso,
+                }
+            )
+
+    return linhas
+
+
+TABELA_TOKENS = "shopee_tokens"
+
+
+# =========================================================
+# TOKENS (única escrita deste módulo)
+# =========================================================
+def carregar_token(sb, user_id: str) -> dict | None:
+    try:
+        r = sb.table(TABELA_TOKENS).select("*").eq("user_id", user_id).limit(1).execute()
+        return (r.data or [None])[0]
+    except Exception:
+        return None
+
+
+def salvar_token(sb, user_id: str, shop_id: int, access_token: str, refresh_token: str, expira_em: int):
+    sb.table(TABELA_TOKENS).upsert(
+        {
+            "user_id": user_id,
+            "shop_id": int(shop_id),
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expira_em": int(expira_em),
+            "atualizado_em": datetime.now().isoformat(),
+        },
+        on_conflict="user_id",
+    ).execute()
+
+
+# =========================================================
+# CUSTOS — leitura apenas
+# =========================================================
+@st.cache_data(ttl=300, show_spinner=False)
+def _custo_vigente_por_sku(_sb, user_id: str) -> dict[str, float]:
+    """
+    Custo unitário vigente de cada SKU (custo do produto + frete do fornecedor
+    + embalagem + outros). Pega o registro de vigência mais recente por SKU.
+
+    Read-only por design: não grava consumo, não altera qtd_disponivel.
+    """
+    try:
+        r = _sb.table("custos_sku").select("*").eq("user_id", user_id).execute()
+    except Exception:
+        return {}
+    if not r.data:
+        return {}
+
+    df = pd.DataFrame(r.data)
+    df["vigencia"] = pd.to_datetime(df.get("vigencia"), errors="coerce")
+    df = df.sort_values("vigencia").drop_duplicates(subset=["sku"], keep="last")
+
+    custos = {}
+    for _, l in df.iterrows():
+        total = sum(
+            float(l.get(c) or 0)
+            for c in ("custo_produto", "frete_fornecedor", "embalagem", "outros_custos")
+        )
+        custos[str(l.get("sku", "")).strip()] = total
+    return custos
+
+
+# =========================================================
+# BUSCA DE PEDIDOS
+# =========================================================
+@st.cache_data(ttl=600, show_spinner=False)
+def _buscar_vendas(_cli: ShopeeClient, inicio: datetime, fim: datetime, _cache_key: str) -> pd.DataFrame:
+    """_cache_key existe só para invalidar o cache quando o token muda."""
+    sns = _cli.listar_order_sn(inicio, fim)
+    if not sns:
+        return pd.DataFrame()
+    pedidos = _cli.detalhar_pedidos(sns)
+    escrow = _cli.escrow_por_pedido(sns)
+    linhas = parse_orders_shopee(pedidos, escrow)
+    return pd.DataFrame(linhas) if linhas else pd.DataFrame()
+
+
+def _kpi(titulo: str, valor: str, cor: str = "#1F2937") -> str:
+    return (
+        f'<div class="kpi-card"><div class="kpi-title">{titulo}</div>'
+        f'<div class="kpi-value" style="color:{cor};">{valor}</div></div>'
+    )
+
+
+def _moeda(v: float) -> str:
+    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+# =========================================================
+# RENDER
+# =========================================================
+def render_shopee(sb, user_id: str):
+    st.markdown('<h1 class="hero-title">Shopee</h1>', unsafe_allow_html=True)
+
+    # ---------- credenciais ----------
+    try:
+        partner_id = st.secrets["SHOPEE_PARTNER_ID"]
+        partner_key = st.secrets["SHOPEE_PARTNER_KEY"]
+        redirect_uri = st.secrets["SHOPEE_REDIRECT_URI"]
+    except KeyError:
+        st.error(
+            "Faltam credenciais nos secrets. Adicione `SHOPEE_PARTNER_ID`, "
+            "`SHOPEE_PARTNER_KEY` e `SHOPEE_REDIRECT_URI` no secrets.toml."
+        )
+        return
+
+    registro = carregar_token(sb, user_id)
+
+    # ---------- retorno da autorização (?code=...&shop_id=...) ----------
+    qp = st.query_params
+    if qp.get("code") and qp.get("shop_id"):
+        cli = ShopeeClient(partner_id, partner_key)
+        try:
+            dados = cli.trocar_code_por_token(qp["code"], int(qp["shop_id"]))
+            salvar_token(
+                sb, user_id, int(qp["shop_id"]),
+                dados["access_token"], dados["refresh_token"], dados["expira_em"],
+            )
+            st.query_params.clear()
+            st.success("Loja Shopee conectada.")
+            st.rerun()
+        except ShopeeError as e:
+            st.error(f"Falha ao conectar a loja: {e}")
+            return
+
+    # ---------- não conectado ----------
+    if not registro:
+        st.info("Nenhuma loja Shopee conectada ainda.")
+        url = ShopeeClient(partner_id, partner_key).url_autorizacao(redirect_uri)
+        st.link_button("Conectar loja Shopee", url, type="primary")
+        st.caption(
+            "Você será levado à Shopee para autorizar. A autorização vale 30 dias "
+            "de inatividade — usando o painel com regularidade, ela se renova sozinha."
+        )
+        return
+
+    # ---------- cliente autenticado ----------
+    cli = ShopeeClient(
+        partner_id, partner_key,
+        shop_id=registro["shop_id"],
+        access_token=registro["access_token"],
+        refresh_token=registro["refresh_token"],
+        on_token_refresh=lambda a, r, e: salvar_token(sb, user_id, registro["shop_id"], a, r, e),
+    )
+
+    # Avisa antes de quebrar: refresh_token vence em 30 dias de inatividade.
+    atualizado = pd.to_datetime(registro.get("atualizado_em"), errors="coerce")
+    if pd.notna(atualizado):
+        dias_parado = (pd.Timestamp.now(tz=atualizado.tz) - atualizado).days
+        if dias_parado >= 25:
+            st.warning(
+                f"A autorização da loja está há {dias_parado} dias sem renovar. "
+                "Aos 30 dias ela expira e será preciso reconectar."
+            )
+
+    # ---------- filtro de período ----------
+    c1, c2, _ = st.columns([1, 1, 3])
+    hoje = datetime.now().date()
+    with c1:
+        d_ini = st.date_input("De", hoje - timedelta(days=30), key="shopee_ini")
+    with c2:
+        d_fim = st.date_input("Até", hoje, key="shopee_fim")
+
+    if d_ini > d_fim:
+        st.error("A data inicial não pode ser maior que a final.")
+        return
+
+    inicio = datetime.combine(d_ini, datetime.min.time())
+    fim = datetime.combine(d_fim, datetime.max.time())
+
+    with st.spinner("Buscando pedidos na Shopee..."):
+        try:
+            df = _buscar_vendas(cli, inicio, fim, registro["access_token"][:12])
+        except ShopeeError as e:
+            st.error(f"Erro na API da Shopee: {e}")
+            return
+
+    if df.empty:
+        st.info("Nenhum pedido encontrado no período.")
+        return
+
+    # ---------- custo e lucro ----------
+    custos = _custo_vigente_por_sku(sb, user_id)
+    df["Custo Unit."] = df["SKU"].map(custos).fillna(0.0)
+    df["Custo Total"] = df["Custo Unit."] * df["Quantidade"]
+    df["Sem Custo"] = df["Custo Unit."] == 0
+    df["Lucro"] = df["Total Shopee"] - df["Custo Total"]
+    df.loc[df["Cancelada"], "Lucro"] = 0.0
+
+    aprovadas = df[df["Categoria"] == "aprovada"]
+
+    receita = aprovadas["Receita Bruta"].sum()
+    taxas = aprovadas["Taxas Shopee"].sum()
+    frete = aprovadas["Frete"].sum()
+    liquido = aprovadas["Total Shopee"].sum()
+    custo = aprovadas["Custo Total"].sum()
+    lucro = aprovadas["Lucro"].sum()
+    margem = (lucro / receita * 100) if receita else 0.0
+
+    # ---------- cards ----------
+    cols = st.columns(4)
+    for col, (titulo, valor, cor) in zip(
+        cols,
+        [
+            ("Receita bruta", _moeda(receita), "#1F2937"),
+            ("Taxas Shopee", _moeda(taxas), "#B45309"),
+            ("Frete", _moeda(frete), "#B45309"),
+            ("Repasse líquido", _moeda(liquido), "#1D4ED8"),
+        ],
+    ):
+        col.markdown(_kpi(titulo, valor, cor), unsafe_allow_html=True)
+
+    cols = st.columns(4)
+    for col, (titulo, valor, cor) in zip(
+        cols,
+        [
+            ("Custo dos produtos", _moeda(custo), "#B45309"),
+            ("Lucro", _moeda(lucro), "#047857" if lucro >= 0 else "#B91C1C"),
+            ("Margem", f"{margem:.1f}%", "#047857" if margem >= 0 else "#B91C1C"),
+            ("Pedidos", f"{aprovadas['Venda'].nunique()}", "#1F2937"),
+        ],
+    ):
+        col.markdown(_kpi(titulo, valor, cor), unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Sinaliza SKU sem custo cadastrado — senão o lucro parece bom sem ser.
+    sem_custo = aprovadas[aprovadas["Sem Custo"]]["SKU"].nunique()
+    if sem_custo:
+        st.warning(
+            f"{sem_custo} SKU(s) vendidos na Shopee não têm custo cadastrado em Custos. "
+            "O lucro desses itens está sendo contado como receita líquida cheia."
+        )
+
+    # ---------- tabela ----------
+    st.markdown("#### Vendas do período")
+    visao = df[
+        [
+            "Venda", "Data", "SKU", "Produto", "Quantidade", "Receita Bruta",
+            "Taxas Shopee", "Frete", "Total Shopee", "Custo Total", "Lucro",
+            "Categoria",
+        ]
+    ].sort_values("Data", ascending=False)
+
+    st.dataframe(
+        visao,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Data": st.column_config.DatetimeColumn("Data", format="DD/MM/YYYY HH:mm"),
+            **{
+                c: st.column_config.NumberColumn(c, format="R$ %.2f")
+                for c in ("Receita Bruta", "Taxas Shopee", "Frete", "Total Shopee", "Custo Total", "Lucro")
+            },
+        },
+    )
+
+    st.download_button(
+        "Baixar CSV",
+        visao.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"shopee_{d_ini}_{d_fim}.csv",
+        mime="text/csv",
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ███  FIM DO BLOCO SHOPEE  █████████████████████████████████████████████████
+# ═══════════════════════════════════════════════════════════════════════════
+
 # =========================
 # ESTILOS
 # =========================
@@ -1344,15 +2019,15 @@ nickname = get_user_info(str(user_id), token).get("nickname", "Vendedor")
 if "aba_ativa" not in st.session_state:
     st.session_state["aba_ativa"] = "financeiro"
 
-nav_cols = st.columns([2, 2, 2, 2, 2, 4])
-abas = [("financeiro","📊 Financeiro"), ("custos","📦 Custos"), ("regime","🏛️ Regime"), ("caixa","💰 Caixa"), ("fechamento","📅 Fechamento")]
-for col, (aba_id, aba_label) in zip(nav_cols[:5], abas):
+nav_cols = st.columns([2, 2, 2, 2, 2, 2, 3])
+abas = [("financeiro","📊 Financeiro"), ("custos","📦 Custos"), ("regime","🏛️ Regime"), ("caixa","💰 Caixa"), ("fechamento","📅 Fechamento"), ("shopee","🛍️ Shopee")]
+for col, (aba_id, aba_label) in zip(nav_cols[:6], abas):
     with col:
         if st.button(aba_label, use_container_width=True,
                      type="primary" if st.session_state["aba_ativa"] == aba_id else "secondary"):
             st.session_state["aba_ativa"] = aba_id
             st.rerun()
-with nav_cols[5]:
+with nav_cols[6]:
     c1, c2 = st.columns([1,1])
     with c2:
         if st.button("🔓 Sair", use_container_width=True):
@@ -3573,3 +4248,9 @@ elif st.session_state["aba_ativa"] == "fechamento":
                 })
                 st.success(f"✅ {nome_mes} {ano} fechado!")
                 st.rerun()
+
+# ══════════════════════════════════════════
+# ABA: SHOPEE
+# ══════════════════════════════════════════
+elif st.session_state["aba_ativa"] == "shopee":
+    render_shopee(get_supabase(), user_id)
