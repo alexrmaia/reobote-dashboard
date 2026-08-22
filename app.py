@@ -1723,7 +1723,7 @@ def _moeda(v: float) -> str:
 # RENDER
 # =========================================================
 def render_shopee(sb, user_id: str):
-    st.markdown('<h1 class="hero-title">Shopee</h1>', unsafe_allow_html=True)
+    # (o título fica dentro do hero, depois que os dados carregam — igual ao Financeiro)
 
     # ---------- credenciais ----------
     try:
@@ -1814,19 +1814,93 @@ def render_shopee(sb, user_id: str):
     lucro    = aprovadas["Lucro"].sum()
     margem   = (lucro / receita * 100) if receita else 0.0
 
-    # ---------- cards ----------
-    for linha in (
-        [("Receita bruta", _moeda(receita), "#15803D"),
-         ("Tarifas Shopee", _moeda(taxas), "#B45309"),
-         ("Frete", _moeda(frete), "#1D4ED8"),
-         ("Custo dos produtos", _moeda(custo), "#6D28D9")],
-        [("Imposto", _moeda(imposto), "#475569"),
-         ("Margem de contribuição", _moeda(lucro), "#15803D" if lucro >= 0 else "#DC2626"),
-         ("Margem", f"{margem:.1f}%".replace(".", ","), "#15803D" if margem >= 0 else "#DC2626"),
-         ("Pedidos", f"{aprovadas['Venda'].nunique()}", "#1F2937")],
-    ):
-        for col, (titulo, valor, cor) in zip(st.columns(4), linha):
-            col.markdown(_kpi(titulo, valor, cor), unsafe_allow_html=True)
+    # ---------- hero ----------
+    canceladas_df = df[df["Cancelada"]]
+    fat_cancel = canceladas_df["Receita Bruta"].sum()
+    n_vendas = len(aprovadas)
+    ticket = receita / n_vendas if n_vendas else 0.0
+    lucro_venda = lucro / n_vendas if n_vendas else 0.0
+    label_periodo = f"{d_ini.strftime('%d/%m/%Y')} a {d_fim.strftime('%d/%m/%Y')}"
+
+    st.markdown(
+        f'<div class="hero">'
+        f'<div style="display:flex;justify-content:space-between;gap:30px;align-items:flex-start;">'
+        f'<div>'
+        f'<p class="hero-small">Resumo</p>'
+        f'<h1 class="hero-title">Shopee</h1>'
+        f'<div style="background:rgba(255,255,255,.18);color:white;border:1px solid rgba(255,255,255,.35);'
+        f'border-radius:999px;padding:10px 16px;font-weight:900;width:fit-content;">'
+        f'Período selecionado: {label_periodo}</div>'
+        f'</div>'
+        f'<div style="min-width:320px;">'
+        f'<div class="hero-value-label">Faturamento</div>'
+        f'<div class="hero-value">R$ {receita:,.2f}</div>'
+        f'</div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True)
+
+    def metric_card(col, title, value, sub, color):
+        col.markdown(f"""<div class="metric-card" style="--accent:{color};">
+            <div class="metric-title">{title}</div>
+            <div class="metric-value">{value}</div>
+            <div class="metric-pill">{sub}</div>
+        </div>""", unsafe_allow_html=True)
+
+    def kpi_card(col, title, value, color="#1F2937"):
+        col.markdown(f"""<div style="background:#F4F1EA;border:1px solid transparent;border-radius:14px;
+                                     padding:18px 14px;text-align:center;min-height:150px;
+                                     display:flex;flex-direction:column;justify-content:center;">
+            <div style="font-size:13px;font-weight:800;color:#44403C;text-transform:uppercase;
+                        letter-spacing:.25px;margin-bottom:10px;">{title}</div>
+            <div style="font-size:24px;color:{color};font-weight:900;letter-spacing:-.8px;
+                        line-height:1.05;white-space:nowrap;">{value}</div>
+        </div>""", unsafe_allow_html=True)
+
+    pct = lambda v: f"{v/receita*100:.1f}%" if receita else "0%"
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    metric_card(c1, "Tarifas",    f"R$ {taxas:,.2f}",      pct(taxas),   "#FBBF24")
+    metric_card(c2, "Custos",     f"R$ {custo:,.2f}",      pct(custo),   "#8B5CF6")
+    metric_card(c3, "Impostos",   f"R$ {imposto:,.2f}",    pct(imposto), "#64748B")
+    metric_card(c4, "Canceladas", f"R$ {fat_cancel:,.2f}", f"{len(canceladas_df)} vendas", "#EF4444")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    left, right = st.columns([1, 1])
+    with left:
+        st.markdown(f"""<div class="metric-card" style="--accent:#E5E7EB;min-height:138px;">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                <div>
+                    <div style="font-size:22px;font-weight:900;color:#020617;margin-bottom:12px;">Ticket Médio</div>
+                    <div class="muted">De vendas</div>
+                    <div style="font-size:24px;font-weight:900;color:#020617;">R$ {ticket:,.2f}</div>
+                </div>
+                <div>
+                    <div class="muted">Lucro por venda</div>
+                    <div style="font-size:24px;font-weight:900;color:#020617;">R$ {lucro_venda:,.2f}</div>
+                </div>
+            </div>
+        </div>""", unsafe_allow_html=True)
+    with right:
+        box_cls = "green-box" if lucro >= 0 else "red-box"
+        st.markdown(f"""<div class="{box_cls}">
+            <div class="green-title">Lucro Líquido Real</div>
+            <div class="green-value">R$ {lucro:,.2f}</div>
+            <div class="green-sub">Margem real: {margem:.2f}%</div>
+        </div>""", unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # KPI-cards bege
+    k1, k2, k3 = st.columns(3)
+    kpi_card(k1, "Receita Bruta", f"R$ {receita:,.2f}")
+    kpi_card(k2, "Tarifas Shopee", f"R$ {taxas:,.2f}", "#EF4444")
+    kpi_card(k3, "Frete", f"R$ {frete:,.2f}", "#EF4444")
+    st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
+    k4, k5, k6 = st.columns(3)
+    kpi_card(k4, "Custo dos Produtos", f"R$ {custo:,.2f}", "#EF4444")
+    kpi_card(k5, "Impostos", f"R$ {imposto:,.2f}", "#EF4444")
+    kpi_card(k6, "Pedidos", f"{aprovadas['Venda'].nunique()}")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -1836,6 +1910,205 @@ def render_shopee(sb, user_id: str):
             f"{sem_custo} SKU(s) vendidos na Shopee não têm custo cadastrado em Custos. "
             "A margem desses itens está superestimada."
         )
+
+    # ---------- gráficos (mesmos do Financeiro) ----------
+    daily = aprovadas.copy()
+    daily["Dia"] = pd.to_datetime(daily["Data"]).dt.date
+    daily_agg = daily.groupby("Dia").agg(
+        Lucro=("Lucro", "sum"), Receita=("Receita Bruta", "sum"), Quantidade=("Quantidade", "sum")
+    ).reset_index()
+    daily_agg["Dia"] = pd.to_datetime(daily_agg["Dia"])
+    media_lucro = daily_agg["Lucro"].mean() if not daily_agg.empty else 0.0
+    daily_agg["Cor"] = daily_agg["Lucro"].apply(lambda x: "Acima" if x >= media_lucro else "Abaixo")
+
+    qty_agg = daily.groupby(["Dia", "SKU"]).agg(Quantidade=("Quantidade", "sum")).reset_index()
+    qty_agg["Dia"] = pd.to_datetime(qty_agg["Dia"])
+    cores_sku = ["#7C3AED", "#0EA5E9", "#F59E0B", "#16A34A", "#EF4444"]
+    skus = qty_agg["SKU"].unique().tolist() if not qty_agg.empty else []
+    cor_map = {s: cores_sku[i % len(cores_sku)] for i, s in enumerate(skus)}
+    media_sku = (qty_agg.groupby("SKU")["Quantidade"].mean().reset_index()
+                 .rename(columns={"Quantidade": "Media"})) if not qty_agg.empty else pd.DataFrame()
+
+    gc1, gc2 = st.columns(2)
+
+    with gc1:
+        st.markdown('<div class="card" style="height:100%;">', unsafe_allow_html=True)
+        st.markdown("**Resumo de Vendas**")
+        st.markdown(f'<div style="color:#64748B;font-size:13px;margin-bottom:16px;">{label_periodo}</div>',
+                    unsafe_allow_html=True)
+        qtd_unid = int(aprovadas["Quantidade"].sum())
+        m1, m2 = st.columns(2)
+        with m1:
+            st.markdown(f"""
+            <div style="margin-bottom:20px;">
+                <div style="font-size:12px;font-weight:700;color:#7C3AED;">Vendas</div>
+                <div style="font-size:36px;font-weight:900;color:#0F172A;line-height:1.1;">{n_vendas}</div>
+                <div style="font-size:12px;color:#64748B;">{qtd_unid} unidades</div>
+            </div>
+            <div>
+                <div style="font-size:12px;font-weight:700;color:#7C3AED;">Ticket médio</div>
+                <div style="font-size:28px;font-weight:900;color:#0F172A;line-height:1.1;">R$ {ticket:,.2f}</div>
+                <div style="font-size:12px;color:#64748B;">lucro/venda R$ {lucro_venda:,.2f}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with m2:
+            st.markdown(f"""
+            <div style="margin-bottom:20px;">
+                <div style="font-size:12px;font-weight:700;color:#EF4444;">Cancelamentos</div>
+                <div style="font-size:36px;font-weight:900;color:#0F172A;line-height:1.1;">{len(canceladas_df)}</div>
+                <div style="font-size:12px;color:#64748B;">R$ {fat_cancel:,.2f}</div>
+            </div>
+            <div>
+                <div style="font-size:12px;font-weight:700;color:#16A34A;">Receita</div>
+                <div style="font-size:28px;font-weight:900;color:#0F172A;line-height:1.1;">R$ {receita:,.2f}</div>
+                <div style="font-size:12px;color:#7C3AED;font-weight:700;">margem {margem:.2f}%</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        if len(daily_agg) > 1:
+            mini = alt.Chart(daily_agg).mark_area(
+                interpolate="monotone",
+                color=alt.Gradient(gradient="linear",
+                    stops=[alt.GradientStop(color="#8B5CF666", offset=0),
+                           alt.GradientStop(color="#FFFFFF00", offset=1)],
+                    x1=1, x2=1, y1=1, y2=0),
+                line={"color": "#7C3AED", "strokeWidth": 3}
+            ).encode(
+                x=alt.X("Dia:T", title=None, axis=alt.Axis(labelAngle=0, format="%d/%m", labelFontSize=10)),
+                y=alt.Y("Receita:Q", title=None),
+                tooltip=[alt.Tooltip("Dia:T", format="%d/%m/%Y", title="Data"),
+                         alt.Tooltip("Receita:Q", format=",.2f", title="Receita")]
+            ).properties(height=230)
+            st.altair_chart(mini, use_container_width=True)
+        else:
+            st.info("Gráfico disponível com 2+ dias de dados.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with gc2:
+        st.markdown('<div class="card" style="height:100%;">', unsafe_allow_html=True)
+        st.markdown("**Resumo do Período**")
+        st.markdown(f'<div style="color:#64748B;font-size:13px;margin-bottom:16px;">Quantidade vendida por dia no período selecionado — {label_periodo}</div>',
+                    unsafe_allow_html=True)
+        if len(qty_agg) > 1:
+            dsa = daily.groupby(["Dia", "SKU"]).agg(
+                Quantidade=("Quantidade", "sum"), Receita=("Receita Bruta", "sum"),
+                Lucro=("Lucro", "sum"), Frete=("Frete", "sum"), Tarifa=("Taxas Shopee", "sum"),
+            ).reset_index()
+            dsa["Dia"] = pd.to_datetime(dsa["Dia"])
+            dsa["Margem"] = (dsa["Lucro"] / dsa["Receita"].replace(0, 1) * 100).round(1)
+            dsa["Receita_fmt"] = dsa["Receita"].apply(lambda x: f"R$ {x:,.2f}")
+            dsa["Lucro_fmt"] = dsa["Lucro"].apply(lambda x: f"R$ {x:,.2f}")
+            esc = alt.Scale(domain=skus, range=[cor_map[s] for s in skus])
+            base_qty = alt.Chart(dsa)
+            area_qty = base_qty.mark_area(interpolate="monotone", opacity=0.18, line=True).encode(
+                x=alt.X("Dia:T", title=None, axis=alt.Axis(format="%d/%m", labelFontSize=10)),
+                y=alt.Y("Quantidade:Q", title="Quantidade vendida", stack=None, axis=alt.Axis(labelFontSize=10)),
+                color=alt.Color("SKU:N", scale=esc, legend=None),
+            )
+            pontos_qty = base_qty.mark_point(filled=True, size=70).encode(
+                x="Dia:T", y="Quantidade:Q", color=alt.Color("SKU:N", scale=esc, legend=None),
+                tooltip=[alt.Tooltip("Dia:T", title="Data", format="%d/%m/%Y"),
+                         alt.Tooltip("SKU:N", title="SKU"),
+                         alt.Tooltip("Quantidade:Q", title="Qtd vendida"),
+                         alt.Tooltip("Receita_fmt:N", title="Receita"),
+                         alt.Tooltip("Lucro_fmt:N", title="Lucro"),
+                         alt.Tooltip("Margem:Q", title="Margem %", format=".1f")]
+            )
+            regras = alt.Chart(media_sku).mark_rule(strokeDash=[4, 3], strokeWidth=1.5, opacity=0.5).encode(
+                y="Media:Q", color=alt.Color("SKU:N", scale=esc, legend=None))
+            st.altair_chart((area_qty + pontos_qty + regras).properties(height=240), use_container_width=True)
+        else:
+            st.info("Gráfico disponível com 2+ dias de dados.")
+
+        legenda = '<div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:4px;">'
+        for _, ms in media_sku.iterrows():
+            cor = cor_map.get(ms["SKU"], "#666")
+            legenda += (f'<div style="display:flex;align-items:center;gap:6px;">'
+                        f'<div style="width:10px;height:10px;border-radius:50%;background:{cor};opacity:.5;"></div>'
+                        f'<span style="font-size:12px;color:#64748B;font-weight:600;">'
+                        f'{ms["SKU"]} (média: {ms["Media"]:.1f}/dia)</span></div>')
+        st.markdown(legenda + '</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # GRÁFICO LUCRO POR DIA
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="small-title">Lucro real por dia (R$)</div><br>', unsafe_allow_html=True)
+    if len(daily_agg) > 1:
+        daily_agg["Margem"] = (daily_agg["Lucro"] / daily_agg["Receita"].replace(0, 1) * 100).round(1)
+        area_l = alt.Chart(daily_agg).mark_area(
+            interpolate="monotone",
+            color=alt.Gradient(gradient="linear",
+                stops=[alt.GradientStop(color="#16A34A44", offset=0),
+                       alt.GradientStop(color="#16A34A00", offset=1)],
+                x1=1, x2=1, y1=1, y2=0)
+        ).encode(x=alt.X("Dia:T", title=None), y=alt.Y("Lucro:Q", title=None))
+        linha_l = alt.Chart(daily_agg).mark_line(
+            interpolate="monotone", color="#16A34A", strokeWidth=3).encode(x="Dia:T", y="Lucro:Q")
+        pontos_l = alt.Chart(daily_agg).mark_point(filled=True, size=80).encode(
+            x=alt.X("Dia:T", title=None), y=alt.Y("Lucro:Q", title=None),
+            color=alt.Color("Cor:N", scale=alt.Scale(domain=["Acima", "Abaixo"], range=["#16A34A", "#EF4444"]),
+                            legend=alt.Legend(title="vs Média",
+                                labelExpr="datum.label === 'Acima' ? '▲ Acima' : '▼ Abaixo'", orient="top-right")),
+            tooltip=[alt.Tooltip("Dia:T", title="Data", format="%d/%m/%Y"),
+                     alt.Tooltip("Lucro:Q", title="Lucro R$", format=",.2f"),
+                     alt.Tooltip("Receita:Q", title="Receita R$", format=",.2f"),
+                     alt.Tooltip("Quantidade:Q", title="Qtd vendida", format=",.0f"),
+                     alt.Tooltip("Margem:Q", title="Margem média %", format=".1f")])
+        regra_m = alt.Chart(pd.DataFrame({"media": [media_lucro]})).mark_rule(
+            color="#94A3B8", strokeDash=[6, 4], strokeWidth=1.5
+        ).encode(y=alt.Y("media:Q"), tooltip=[alt.Tooltip("media:Q", title="Média do período R$", format=",.2f")])
+        texto_m = alt.Chart(pd.DataFrame({"media": [media_lucro], "Dia": [daily_agg["Dia"].max()]})).mark_text(
+            align="right", dy=-8, fontSize=11, fontWeight=700, color="#64748B"
+        ).encode(x=alt.X("Dia:T"), y=alt.Y("media:Q"), text=alt.value(f"Média: R$ {media_lucro:,.0f}"))
+        st.altair_chart((area_l + linha_l + pontos_l + regra_m + texto_m).properties(height=300),
+                        use_container_width=True)
+    else:
+        st.info("Gráfico disponível com 2+ dias de dados.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # MARGEM PONDERADA POR SKU
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="small-title">Margem ponderada por SKU</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="muted">Faturamento, participação e margem ponderada — {label_periodo}</div><br>',
+                unsafe_allow_html=True)
+    sku_pond = aprovadas.groupby("SKU").agg(
+        Vendas=("Venda", "count"), Unidades=("Quantidade", "sum"),
+        Receita=("Receita Bruta", "sum"), Lucro=("Lucro", "sum"),
+    ).reset_index()
+    sku_pond["Margem %"] = (sku_pond["Lucro"] / sku_pond["Receita"].replace(0, 1) * 100).round(2)
+    sku_pond["Participação %"] = (sku_pond["Receita"] / (sku_pond["Receita"].sum() or 1) * 100).round(1)
+    sku_pond = sku_pond.sort_values("Receita", ascending=False).reset_index(drop=True)
+    for _, sr in sku_pond.iterrows():
+        cor_m = "#16A34A" if sr["Margem %"] >= 15 else "#B45309" if sr["Margem %"] >= 8 else "#DC2626"
+        bar_w = min(int(sr["Participação %"] * 3), 100)
+        bg_m = "#DCFCE7" if sr["Margem %"] >= 15 else "#FEF9C3" if sr["Margem %"] >= 8 else "#FEE2E2"
+        st.markdown(f"""
+        <div style="display:flex;align-items:center;gap:16px;padding:12px 0;border-bottom:1px solid #F1F5F9;">
+            <div style="min-width:70px;font-weight:900;color:#7C3AED;font-size:15px;">{sr['SKU'] or '—'}</div>
+            <div style="flex:1;">
+                <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                    <span style="font-weight:700;color:#0F172A;">R$ {sr['Receita']:,.2f}</span>
+                    <span style="color:#64748B;font-size:13px;">{sr['Participação %']:.1f}% do faturamento</span>
+                </div>
+                <div style="background:#F1F5F9;border-radius:999px;height:6px;">
+                    <div style="background:#7C3AED;width:{bar_w}%;height:6px;border-radius:999px;"></div>
+                </div>
+            </div>
+            <div style="min-width:80px;text-align:center;">
+                <div style="font-size:12px;color:#64748B;font-weight:600;">Vendas / Unid</div>
+                <div style="font-weight:800;color:#0F172A;">{int(sr['Vendas'])} / {int(sr['Unidades'])}</div>
+            </div>
+            <div style="min-width:90px;text-align:right;">
+                <div style="font-size:12px;color:#64748B;font-weight:600;">Lucro</div>
+                <div style="font-weight:800;color:{cor_m};">R$ {sr['Lucro']:,.2f}</div>
+            </div>
+            <div style="min-width:70px;text-align:right;">
+                <span style="background:{bg_m};color:{cor_m};border-radius:999px;padding:4px 12px;
+                             font-size:14px;font-weight:900;">{sr['Margem %']:.2f}%</span>
+            </div>
+        </div>""", unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
     # ---------- tabela (mesmo layout da aba Financeiro) ----------
     st.markdown('<div class="card">', unsafe_allow_html=True)
