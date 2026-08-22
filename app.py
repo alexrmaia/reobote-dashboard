@@ -1544,14 +1544,38 @@ def parse_orders_shopee(pedidos: list[dict], escrow: dict[str, dict] | None = No
 
 TABELA_TOKENS = "shopee_tokens"
 
+# user_id provisório usado quando a loja é autorizada numa sessão que ainda não
+# passou pelo login do Mercado Livre. A aba reivindica a linha depois.
+SHOPEE_USER_PENDENTE = "__pendente__"
+
 
 # =========================================================
 # TOKENS (única escrita deste módulo)
 # =========================================================
 def carregar_token(sb, user_id: str) -> dict | None:
+    """
+    Token da loja deste usuário. Se não houver, tenta reivindicar uma
+    autorização pendente — aquela feita numa sessão anterior, antes do login do
+    Mercado Livre (ver o bloco de AUTH).
+    """
     try:
         r = sb.table(TABELA_TOKENS).select("*").eq("user_id", user_id).limit(1).execute()
-        return (r.data or [None])[0]
+        if r.data:
+            return r.data[0]
+    except Exception:
+        return None
+
+    try:
+        p = (sb.table(TABELA_TOKENS).select("*")
+             .eq("user_id", SHOPEE_USER_PENDENTE).limit(1).execute())
+        if not p.data:
+            return None
+        pend = p.data[0]
+        salvar_token(sb, user_id, pend["shop_id"], pend["access_token"],
+                     pend["refresh_token"], pend["expira_em"])
+        sb.table(TABELA_TOKENS).delete().eq("user_id", SHOPEE_USER_PENDENTE).execute()
+        pend["user_id"] = user_id
+        return pend
     except Exception:
         return None
 
@@ -1648,28 +1672,19 @@ def render_shopee(sb, user_id: str):
 
     registro = carregar_token(sb, user_id)
 
-    # ---------- retorno da autorização ----------
-    # O bloco de AUTH lá em cima separa o callback da Shopee do callback do
-    # Mercado Livre (ambos usam ?code=) e deixa o resultado aqui.
-    callback = st.session_state.pop("shopee_callback", None)
-    if callback:
-        cli = ShopeeClient(partner_id, partner_key)
-        try:
-            shop_id = int(callback["shop_id"])
-            dados = cli.trocar_code_por_token(callback["code"], shop_id)
-            salvar_token(
-                sb, user_id, shop_id,
-                dados["access_token"], dados["refresh_token"], dados["expira_em"],
-            )
-            st.success("Loja Shopee conectada.")
-            st.rerun()
-        except (ShopeeError, ValueError, KeyError) as e:
-            st.error(f"Falha ao conectar a loja: {e}")
-            st.caption(
-                "O código de autorização da Shopee expira em poucos minutos. "
-                "Se demorou entre autorizar e voltar, tente conectar de novo."
-            )
-            return
+    # ---------- resultado da autorização ----------
+    # A troca do código por token acontece no bloco de AUTH, assim que a Shopee
+    # redireciona — ali o código ainda é válido e a sessão é nova. Aqui só
+    # mostramos o desfecho.
+    if st.session_state.pop("shopee_conectada", False):
+        st.success("Loja Shopee conectada.")
+    erro_conexao = st.session_state.pop("shopee_erro", None)
+    if erro_conexao:
+        st.error(f"Falha ao conectar a loja: {erro_conexao}")
+        st.caption(
+            "O código de autorização da Shopee expira em poucos minutos. "
+            "Se demorou entre autorizar e voltar, tente conectar de novo."
+        )
 
     # ---------- não conectado ----------
     if not registro:
@@ -1923,7 +1938,24 @@ code = query_params.get("code", None)
 # depois.
 _shopee_shop_id = query_params.get("shop_id", None)
 if code and _shopee_shop_id:
-    st.session_state["shopee_callback"] = {"code": code, "shop_id": _shopee_shop_id}
+    # O código da Shopee vale poucos minutos e o session_state NÃO sobrevive a
+    # esta navegação (sessão nova, login do ML perdido). Por isso trocamos o
+    # código por token aqui mesmo e gravamos direto no Supabase, que é durável.
+    #
+    # Como ainda não sabemos o user_id do Mercado Livre, a linha entra como
+    # PENDENTE e a aba Shopee a reivindica no primeiro acesso.
+    try:
+        _cli = ShopeeClient(
+            st.secrets["SHOPEE_PARTNER_ID"], st.secrets["SHOPEE_PARTNER_KEY"]
+        )
+        _dados = _cli.trocar_code_por_token(code, int(_shopee_shop_id))
+        salvar_token(
+            get_supabase(), SHOPEE_USER_PENDENTE, int(_shopee_shop_id),
+            _dados["access_token"], _dados["refresh_token"], _dados["expira_em"],
+        )
+        st.session_state["shopee_conectada"] = True
+    except Exception as _e:
+        st.session_state["shopee_erro"] = str(_e)
     st.query_params.clear()
     code = None
 # ───────────────────────────────────────────────────────────────────────────
