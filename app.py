@@ -1595,35 +1595,102 @@ def salvar_token(sb, user_id: str, shop_id: int, access_token: str, refresh_toke
 
 
 # =========================================================
-# CUSTOS — leitura apenas
+# CUSTOS E IMPOSTOS — leitura apenas
 # =========================================================
-@st.cache_data(ttl=300, show_spinner=False)
-def _custo_vigente_por_sku(_sb, user_id: str) -> dict[str, float]:
+def _aplicar_custos_impostos(sb, user_id: str, df):
     """
-    Custo unitário vigente de cada SKU (custo do produto + frete do fornecedor
-    + embalagem + outros). Pega o registro de vigência mais recente por SKU.
+    Calcula custo (FIFO) e imposto para as vendas da Shopee.
 
-    Read-only por design: não grava consumo, não altera qtd_disponivel.
+    FIFO SIMULADO, sem persistência: consome os lotes em memória, do mais
+    antigo para o mais novo, exatamente como o Mercado Livre faz — mas NÃO
+    grava em `fifo_consumo` nem atualiza `qtd_disponivel`. É o que mantém a aba
+    isolada. O efeito prático é que o custo aqui reflete os lotes que estão
+    abertos no momento da consulta.
+
+    Usa `custo_produto` puro (mesmo campo do ML), e não a soma com frete do
+    fornecedor e embalagem — assim os números das duas abas são comparáveis.
     """
+    df = df.copy()
+    df["Custo Unit."] = 0.0
+    df["Custo Total"] = 0.0
+    df["Imposto"] = 0.0
+    df["FIFO"] = False
+    df["Sem Custo"] = True
+
     try:
-        r = _sb.table("custos_sku").select("*").eq("user_id", user_id).execute()
+        r = sb.table("custos_sku").select("*").eq("user_id", user_id).execute()
+        custos_df = pd.DataFrame(r.data or [])
     except Exception:
-        return {}
-    if not r.data:
-        return {}
+        custos_df = pd.DataFrame()
 
-    df = pd.DataFrame(r.data)
-    df["vigencia"] = pd.to_datetime(df.get("vigencia"), errors="coerce")
-    df = df.sort_values("vigencia").drop_duplicates(subset=["sku"], keep="last")
+    try:
+        r = sb.table("regime_tributario").select("*").eq("user_id", user_id).order("vigencia").execute()
+        regime_df = pd.DataFrame(r.data or [])
+    except Exception:
+        regime_df = pd.DataFrame()
 
-    custos = {}
-    for _, l in df.iterrows():
-        total = sum(
-            float(l.get(c) or 0)
-            for c in ("custo_produto", "frete_fornecedor", "embalagem", "outros_custos")
-        )
-        custos[str(l.get("sku", "")).strip()] = total
-    return custos
+    if not custos_df.empty:
+        custos_df["vigencia"] = pd.to_datetime(custos_df["vigencia"], utc=True, errors="coerce")
+        custos_df = custos_df.sort_values("vigencia", na_position="first").reset_index(drop=True)
+        # cópia local de saldos: o consumo abaixo é só em memória
+        saldos = custos_df["qtd_disponivel"].astype(float).copy()
+    if not regime_df.empty:
+        regime_df["vigencia"] = pd.to_datetime(regime_df["vigencia"], utc=True, errors="coerce")
+
+    def aliquota(data):
+        if regime_df.empty:
+            return 0.0
+        validos = regime_df[regime_df["vigencia"] <= data]
+        return float(validos.iloc[-1]["aliquota"]) / 100 if not validos.empty else 0.0
+
+    def custo_por_vigencia(sku, data):
+        if custos_df.empty:
+            return 0.0
+        sk = custos_df[custos_df["sku"] == sku]
+        validos = sk[sk["vigencia"].isna() | (sk["vigencia"] <= data)]
+        return float(validos.iloc[-1]["custo_produto"]) if not validos.empty else 0.0
+
+    # ordem cronológica: FIFO só faz sentido consumindo na ordem das vendas
+    df = df.sort_values("Data").reset_index(drop=True)
+
+    for idx, row in df.iterrows():
+        if row["Cancelada"]:
+            continue
+        sku = str(row["SKU"]).strip()
+        qtd = int(row["Quantidade"])
+        data = pd.to_datetime(row["Data"], utc=True)
+
+        custo_unit = 0.0
+        if not custos_df.empty:
+            lotes = custos_df.index[(custos_df["sku"] == sku) & (saldos > 0)].tolist()
+            if lotes:
+                restante, total = qtd, 0.0
+                for li in lotes:
+                    if restante <= 0:
+                        break
+                    consumido = min(restante, float(saldos.at[li]))
+                    total += consumido * float(custos_df.at[li, "custo_produto"])
+                    saldos.at[li] -= consumido
+                    restante -= consumido
+                if restante > 0:  # estoque acabou no meio: completa pela vigência
+                    total += restante * custo_por_vigencia(sku, data)
+                custo_unit = total / qtd if qtd else 0.0
+                df.at[idx, "FIFO"] = True
+            else:
+                custo_unit = custo_por_vigencia(sku, data)
+
+        imposto = float(row["Receita Bruta"]) * aliquota(data)
+        df.at[idx, "Custo Unit."] = custo_unit
+        df.at[idx, "Custo Total"] = custo_unit * qtd
+        df.at[idx, "Imposto"] = imposto
+        df.at[idx, "Sem Custo"] = custo_unit == 0
+
+    df["Lucro"] = df["Total Shopee"] - df["Custo Total"] - df["Imposto"]
+    df.loc[df["Cancelada"], ["Lucro", "Imposto", "Custo Total"]] = 0.0
+    df["Margem %"] = 0.0
+    ok = (~df["Cancelada"]) & (df["Receita Bruta"] > 0)
+    df.loc[ok, "Margem %"] = df.loc[ok, "Lucro"] / df.loc[ok, "Receita Bruta"] * 100
+    return df.sort_values("Data", ascending=False).reset_index(drop=True)
 
 
 # =========================================================
@@ -1735,88 +1802,119 @@ def render_shopee(sb, user_id: str):
         st.info("Nenhum pedido encontrado no período.")
         return
 
-    # ---------- custo e lucro ----------
-    custos = _custo_vigente_por_sku(sb, user_id)
-    df["Custo Unit."] = df["SKU"].map(custos).fillna(0.0)
-    df["Custo Total"] = df["Custo Unit."] * df["Quantidade"]
-    df["Sem Custo"] = df["Custo Unit."] == 0
-    df["Lucro"] = df["Total Shopee"] - df["Custo Total"]
-    df.loc[df["Cancelada"], "Lucro"] = 0.0
-
+    # ---------- custo, imposto, lucro ----------
+    df = _aplicar_custos_impostos(sb, user_id, df)
     aprovadas = df[df["Categoria"] == "aprovada"]
 
-    receita = aprovadas["Receita Bruta"].sum()
-    taxas = aprovadas["Taxas Shopee"].sum()
-    frete = aprovadas["Frete"].sum()
-    liquido = aprovadas["Total Shopee"].sum()
-    custo = aprovadas["Custo Total"].sum()
-    lucro = aprovadas["Lucro"].sum()
-    margem = (lucro / receita * 100) if receita else 0.0
+    receita  = aprovadas["Receita Bruta"].sum()
+    taxas    = aprovadas["Taxas Shopee"].sum()
+    frete    = aprovadas["Frete"].sum()
+    custo    = aprovadas["Custo Total"].sum()
+    imposto  = aprovadas["Imposto"].sum()
+    lucro    = aprovadas["Lucro"].sum()
+    margem   = (lucro / receita * 100) if receita else 0.0
 
     # ---------- cards ----------
-    cols = st.columns(4)
-    for col, (titulo, valor, cor) in zip(
-        cols,
-        [
-            ("Receita bruta", _moeda(receita), "#1F2937"),
-            ("Taxas Shopee", _moeda(taxas), "#B45309"),
-            ("Frete", _moeda(frete), "#B45309"),
-            ("Repasse líquido", _moeda(liquido), "#1D4ED8"),
-        ],
+    for linha in (
+        [("Receita bruta", _moeda(receita), "#15803D"),
+         ("Tarifas Shopee", _moeda(taxas), "#B45309"),
+         ("Frete", _moeda(frete), "#1D4ED8"),
+         ("Custo dos produtos", _moeda(custo), "#6D28D9")],
+        [("Imposto", _moeda(imposto), "#475569"),
+         ("Margem de contribuição", _moeda(lucro), "#15803D" if lucro >= 0 else "#DC2626"),
+         ("Margem", f"{margem:.1f}%".replace(".", ","), "#15803D" if margem >= 0 else "#DC2626"),
+         ("Pedidos", f"{aprovadas['Venda'].nunique()}", "#1F2937")],
     ):
-        col.markdown(_kpi(titulo, valor, cor), unsafe_allow_html=True)
-
-    cols = st.columns(4)
-    for col, (titulo, valor, cor) in zip(
-        cols,
-        [
-            ("Custo dos produtos", _moeda(custo), "#B45309"),
-            ("Lucro", _moeda(lucro), "#047857" if lucro >= 0 else "#B91C1C"),
-            ("Margem", f"{margem:.1f}%", "#047857" if margem >= 0 else "#B91C1C"),
-            ("Pedidos", f"{aprovadas['Venda'].nunique()}", "#1F2937"),
-        ],
-    ):
-        col.markdown(_kpi(titulo, valor, cor), unsafe_allow_html=True)
+        for col, (titulo, valor, cor) in zip(st.columns(4), linha):
+            col.markdown(_kpi(titulo, valor, cor), unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Sinaliza SKU sem custo cadastrado — senão o lucro parece bom sem ser.
     sem_custo = aprovadas[aprovadas["Sem Custo"]]["SKU"].nunique()
     if sem_custo:
         st.warning(
             f"{sem_custo} SKU(s) vendidos na Shopee não têm custo cadastrado em Custos. "
-            "O lucro desses itens está sendo contado como receita líquida cheia."
+            "A margem desses itens está superestimada."
         )
 
-    # ---------- tabela ----------
-    st.markdown("#### Vendas do período")
-    visao = df[
-        [
-            "Venda", "Data", "SKU", "Produto", "Quantidade", "Receita Bruta",
-            "Taxas Shopee", "Frete", "Total Shopee", "Custo Total", "Lucro",
-            "Categoria",
-        ]
-    ].sort_values("Data", ascending=False)
+    # ---------- tabela (mesmo layout da aba Financeiro) ----------
+    st.markdown('<div class="card">', unsafe_allow_html=True)
 
-    st.dataframe(
-        visao,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Data": st.column_config.DatetimeColumn("Data", format="DD/MM/YYYY HH:mm"),
-            **{
-                c: st.column_config.NumberColumn(c, format="R$ %.2f")
-                for c in ("Receita Bruta", "Taxas Shopee", "Frete", "Total Shopee", "Custo Total", "Lucro")
-            },
-        },
-    )
+    fat_total = receita or 1
 
+    def badge(valor, total, bg, txt):
+        pct = abs(valor / total * 100) if total else 0
+        return (f'<span style="font-weight:700;">R$ {valor:,.2f}</span> '
+                f'<span style="background:{bg};color:{txt};border-radius:999px;'
+                f'padding:2px 7px;font-size:11px;font-weight:800;">{pct:.0f}%</span>')
+
+    def margem_badge(pct, lucro=None):
+        bg  = "#DCFCE7" if pct >= 15 else "#FEF9C3" if pct >= 8 else "#FEE2E2"
+        txt = "#15803D" if pct >= 15 else "#854D0E" if pct >= 8 else "#DC2626"
+        val = f'<span style="font-weight:700;color:{txt};">R$ {lucro:,.2f}</span> ' if lucro is not None else ""
+        return (f'{val}<span style="background:{bg};color:{txt};border-radius:999px;'
+                f'padding:2px 9px;font-size:12px;font-weight:800;">{pct:.1f}%</span>')
+
+    def status_icon(s):
+        s = (s or "").upper()
+        if s in ("CANCELLED", "UNPAID"):
+            return "❌"
+        if s in ("COMPLETED", "SHIPPED", "TO_CONFIRM_RECEIVE"):
+            return "🚚"
+        return "⏳"
+
+    linhas = ""
+    for _, row in df.iterrows():
+        cancelada = row["Cancelada"]
+        bg_row = "#FFF5F5" if cancelada else "white"
+        rec = row["Receita Bruta"]
+        tag_custo = ('<span style="background:#EDE9FE;color:#5B21B6;border-radius:4px;'
+                     'padding:1px 5px;font-size:10px;font-weight:700;">FIFO</span> ') if row.get("FIFO") else ""
+
+        linhas += f"""<tr style="background:{bg_row};border-bottom:1px solid #F1F5F9;">
+            <td style="padding:10px 8px;font-weight:800;color:#7C3AED;white-space:nowrap;">{row['SKU'] or '—'}</td>
+            <td style="padding:10px 8px;color:#64748B;font-size:13px;white-space:nowrap;">{pd.to_datetime(row['Data']).strftime('%d/%m/%Y %H:%M')}</td>
+            <td style="padding:10px 8px;font-size:18px;text-align:center;">{status_icon(row['Status'])}</td>
+            <td style="padding:10px 8px;text-align:center;font-weight:700;">{int(row['Quantidade'])}</td>
+            <td style="padding:10px 8px;font-weight:700;">{badge(rec, fat_total,'#DCFCE7','#15803D')}</td>
+            <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Frete'], rec,'#DBEAFE','#1D4ED8')}</td>
+            <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Taxas Shopee'], rec,'#FEF3C7','#B45309')}</td>
+            <td style="padding:10px 8px;">{'–' if cancelada else f'{tag_custo}{badge(row["Custo Total"], rec, "#EDE9FE","#6D28D9")}'}</td>
+            <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Imposto'], rec,'#F1F5F9','#475569')}</td>
+            <td style="padding:10px 8px;text-align:center;">{'<span style="color:#DC2626;font-weight:700;">Cancelada</span>' if cancelada else margem_badge(row.get('Margem %',0), row.get('Lucro',0))}</td>
+            <td style="padding:10px 8px;color:#94A3B8;font-size:12px;white-space:nowrap;">{row['Venda']}</td>
+        </tr>"""
+
+    _th = "padding:10px 8px;font-size:11px;font-weight:800;text-transform:uppercase;"
+    st.markdown(f"""<div style="overflow-x:auto;">
+    <table style="width:100%;border-collapse:collapse;font-family:'Inter',sans-serif;font-size:13px;">
+        <thead><tr style="background:#F8FAFC;border-bottom:2px solid #E2E8F0;">
+            <th style="{_th}text-align:left;color:#64748B;">SKU</th>
+            <th style="{_th}text-align:left;color:#64748B;">Data</th>
+            <th style="{_th}text-align:center;color:#64748B;">Transp.</th>
+            <th style="{_th}text-align:center;color:#64748B;">Qnt.</th>
+            <th style="{_th}text-align:left;color:#16A34A;">Receita (=)</th>
+            <th style="{_th}text-align:left;color:#1D4ED8;">Frete (-)</th>
+            <th style="{_th}text-align:left;color:#B45309;">Tarifa (-)</th>
+            <th style="{_th}text-align:left;color:#6D28D9;">Custo (-)</th>
+            <th style="{_th}text-align:left;color:#475569;">Imposto (-)</th>
+            <th style="{_th}text-align:center;color:#64748B;">M. de Contrib. (=)</th>
+            <th style="{_th}text-align:left;color:#64748B;">N.º Venda</th>
+        </tr></thead>
+        <tbody>{linhas}</tbody>
+    </table></div>""", unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    _cols_csv = ["Venda", "Data", "SKU", "Produto", "Quantidade", "Receita Bruta",
+                 "Taxas Shopee", "Frete", "Custo Total", "Imposto", "Lucro",
+                 "Margem %", "Categoria"]
     st.download_button(
         "Baixar CSV",
-        visao.to_csv(index=False).encode("utf-8-sig"),
+        df[_cols_csv].to_csv(index=False).encode("utf-8-sig"),
         file_name=f"shopee_{d_ini}_{d_fim}.csv",
         mime="text/csv",
     )
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ███  FIM DO BLOCO SHOPEE  █████████████████████████████████████████████████
