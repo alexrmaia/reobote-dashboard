@@ -1776,13 +1776,36 @@ def render_shopee(sb, user_id: str):
                 "Aos 30 dias ela expira e será preciso reconectar."
             )
 
-    # ---------- filtro de período ----------
-    c1, c2, _ = st.columns([1, 1, 3])
-    hoje = datetime.now().date()
-    with c1:
-        d_ini = st.date_input("De", hoje - timedelta(days=30), key="shopee_ini")
-    with c2:
-        d_fim = st.date_input("Até", hoje, key="shopee_fim")
+    # ---------- filtro de período (mesmo da aba Financeiro) ----------
+    import zoneinfo
+    tz_br = zoneinfo.ZoneInfo("America/Sao_Paulo")
+    agora_br = datetime.now(tz_br)
+    hoje = agora_br.date()
+
+    col_f1, col_f2, col_f3, col_f4 = st.columns([2, 1.5, 1.5, 0.5])
+    with col_f1:
+        periodo = st.selectbox(
+            "Período", ["Hoje", "7 dias", "15 dias", "30 dias", "Personalizar"],
+            index=1, key="shopee_periodo",
+        )
+    with col_f4:
+        if st.button("🔄", key="shopee_refresh", help="Limpar cache e atualizar"):
+            st.cache_data.clear()
+            st.rerun()
+
+    if periodo == "Personalizar":
+        with col_f2:
+            d_ini = st.date_input("De", value=hoje - timedelta(days=7), key="shopee_ini")
+        with col_f3:
+            d_fim = st.date_input("Até", value=hoje, key="shopee_fim")
+        label_periodo = f"{d_ini.strftime('%d/%m')} – {d_fim.strftime('%d/%m/%Y')}"
+    elif periodo == "Hoje":
+        d_ini = d_fim = hoje
+        label_periodo = f"Hoje • {hoje.strftime('%d/%m/%Y')}"
+    else:
+        dias = {"7 dias": 7, "15 dias": 15, "30 dias": 30}[periodo]
+        d_ini, d_fim = hoje - timedelta(days=dias), hoje
+        label_periodo = f"{periodo} • até {hoje.strftime('%d/%m/%Y')}"
 
     if d_ini > d_fim:
         st.error("A data inicial não pode ser maior que a final.")
@@ -1820,7 +1843,7 @@ def render_shopee(sb, user_id: str):
     n_vendas = len(aprovadas)
     ticket = receita / n_vendas if n_vendas else 0.0
     lucro_venda = lucro / n_vendas if n_vendas else 0.0
-    label_periodo = f"{d_ini.strftime('%d/%m/%Y')} a {d_fim.strftime('%d/%m/%Y')}"
+    # label_periodo vem do seletor de período, lá em cima
 
     st.markdown(
         f'<div class="hero">'
