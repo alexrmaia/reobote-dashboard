@@ -1648,21 +1648,27 @@ def render_shopee(sb, user_id: str):
 
     registro = carregar_token(sb, user_id)
 
-    # ---------- retorno da autorização (?code=...&shop_id=...) ----------
-    qp = st.query_params
-    if qp.get("code") and qp.get("shop_id"):
+    # ---------- retorno da autorização ----------
+    # O bloco de AUTH lá em cima separa o callback da Shopee do callback do
+    # Mercado Livre (ambos usam ?code=) e deixa o resultado aqui.
+    callback = st.session_state.pop("shopee_callback", None)
+    if callback:
         cli = ShopeeClient(partner_id, partner_key)
         try:
-            dados = cli.trocar_code_por_token(qp["code"], int(qp["shop_id"]))
+            shop_id = int(callback["shop_id"])
+            dados = cli.trocar_code_por_token(callback["code"], shop_id)
             salvar_token(
-                sb, user_id, int(qp["shop_id"]),
+                sb, user_id, shop_id,
                 dados["access_token"], dados["refresh_token"], dados["expira_em"],
             )
-            st.query_params.clear()
             st.success("Loja Shopee conectada.")
             st.rerun()
-        except ShopeeError as e:
+        except (ShopeeError, ValueError, KeyError) as e:
             st.error(f"Falha ao conectar a loja: {e}")
+            st.caption(
+                "O código de autorização da Shopee expira em poucos minutos. "
+                "Se demorou entre autorizar e voltar, tente conectar de novo."
+            )
             return
 
     # ---------- não conectado ----------
@@ -1905,6 +1911,22 @@ div[data-baseweb="select"]>div{border-radius:12px!important;border-color:#D8E0EC
 # =========================
 query_params = st.query_params
 code = query_params.get("code", None)
+
+# ── Desambiguação de callback OAuth ────────────────────────────────────────
+# Mercado Livre e Shopee voltam no MESMO parâmetro ?code=. O que distingue os
+# dois é que a Shopee acompanha ?shop_id=. Sem esta guarda, o código da Shopee
+# seria enviado ao Mercado Livre e voltaria como invalid_grant.
+#
+# Guardamos no session_state (e não deixamos na URL) porque o redirect da
+# Shopee pode chegar numa sessão nova: se o usuário ainda precisar logar no
+# Mercado Livre, o código da Shopee sobrevive ao login e a aba o consome
+# depois.
+_shopee_shop_id = query_params.get("shop_id", None)
+if code and _shopee_shop_id:
+    st.session_state["shopee_callback"] = {"code": code, "shop_id": _shopee_shop_id}
+    st.query_params.clear()
+    code = None
+# ───────────────────────────────────────────────────────────────────────────
 
 if code and "access_token" not in st.session_state:
     with st.spinner("Conectando com o Mercado Livre..."):
