@@ -1676,15 +1676,8 @@ def render_shopee(sb, user_id: str):
     # A troca do código por token acontece no bloco de AUTH, assim que a Shopee
     # redireciona — ali o código ainda é válido e a sessão é nova. Aqui só
     # mostramos o desfecho.
-    if st.session_state.pop("shopee_conectada", False):
-        st.success("Loja Shopee conectada.")
-    erro_conexao = st.session_state.pop("shopee_erro", None)
-    if erro_conexao:
-        st.error(f"Falha ao conectar a loja: {erro_conexao}")
-        st.caption(
-            "O código de autorização da Shopee expira em poucos minutos. "
-            "Se demorou entre autorizar e voltar, tente conectar de novo."
-        )
+    # (a troca de código por token acontece no bloco de AUTH, no retorno da
+    #  Shopee — aqui a loja já está conectada ou não está)
 
     # ---------- não conectado ----------
     if not registro:
@@ -1944,6 +1937,9 @@ if code and _shopee_shop_id:
     #
     # Como ainda não sabemos o user_id do Mercado Livre, a linha entra como
     # PENDENTE e a aba Shopee a reivindica no primeiro acesso.
+    # O desfecho é mostrado AQUI e a execução para. Não dá para adiar a
+    # mensagem para a aba: o session_state morre nesta navegação, então um erro
+    # guardado nele desapareceria sem deixar rastro.
     try:
         _cli = ShopeeClient(
             st.secrets["SHOPEE_PARTNER_ID"], st.secrets["SHOPEE_PARTNER_KEY"]
@@ -1953,11 +1949,27 @@ if code and _shopee_shop_id:
             get_supabase(), SHOPEE_USER_PENDENTE, int(_shopee_shop_id),
             _dados["access_token"], _dados["refresh_token"], _dados["expira_em"],
         )
-        st.session_state["shopee_conectada"] = True
+        st.query_params.clear()
+        st.success("✅ Loja Shopee conectada e salva.")
+        st.info(
+            "Faça o login no Mercado Livre e abra a aba Shopee — ela já vai "
+            "estar conectada. Este login extra acontece só desta vez."
+        )
+        if st.button("Continuar para o login", type="primary"):
+            st.rerun()
+        st.stop()
     except Exception as _e:
-        st.session_state["shopee_erro"] = str(_e)
-    st.query_params.clear()
-    code = None
+        st.query_params.clear()
+        st.error("❌ Não foi possível conectar a loja Shopee.")
+        st.code(f"{type(_e).__name__}: {_e}", language="text")
+        st.caption(
+            "Causas comuns: partner_id/key de TESTE no lugar dos de PRODUÇÃO, "
+            "domínio de redirect diferente do cadastrado no console, ou código "
+            "expirado (ele vale poucos minutos)."
+        )
+        if st.button("Voltar ao dashboard"):
+            st.rerun()
+        st.stop()
 # ───────────────────────────────────────────────────────────────────────────
 
 if code and "access_token" not in st.session_state:
