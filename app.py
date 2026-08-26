@@ -1850,7 +1850,7 @@ def render_shopee(sb, user_id: str):
         f'<div style="display:flex;justify-content:space-between;gap:30px;align-items:flex-start;">'
         f'<div>'
         f'<p class="hero-small">Resumo</p>'
-        f'<h1 class="hero-title">Shopee</h1>'
+        f'<h1 class="hero-title">Operação Shopee</h1>'
         f'<div style="background:rgba(255,255,255,.18);color:white;border:1px solid rgba(255,255,255,.35);'
         f'border-radius:999px;padding:10px 16px;font-weight:900;width:fit-content;">'
         f'Período selecionado: {label_periodo}</div>'
@@ -2479,8 +2479,8 @@ nickname = get_user_info(str(user_id), token).get("nickname", "Vendedor")
 if "aba_ativa" not in st.session_state:
     st.session_state["aba_ativa"] = "financeiro"
 
-nav_cols = st.columns([2, 2, 2, 2, 2, 2, 3])
-abas = [("financeiro","📊 Financeiro"), ("custos","📦 Custos"), ("regime","🏛️ Regime"), ("caixa","💰 Caixa"), ("fechamento","📅 Fechamento"), ("shopee","🛍️ Shopee")]
+nav_cols = st.columns([3, 3, 2, 2, 2, 2, 3])
+abas = [("financeiro","📊 Operação ML"), ("shopee","🛍️ Operação Shopee"), ("custos","📦 Custos"), ("regime","🏛️ Regime"), ("caixa","💰 Caixa"), ("fechamento","📅 Fechamento")]
 for col, (aba_id, aba_label) in zip(nav_cols[:6], abas):
     with col:
         if st.button(aba_label, use_container_width=True,
@@ -2613,7 +2613,7 @@ if st.session_state["aba_ativa"] == "financeiro":
         f'<div style="display:flex;justify-content:space-between;gap:30px;align-items:flex-start;">'
         f'<div>'
         f'<p class="hero-small">Resumo</p>'
-        f'<h1 class="hero-title">Financeiro</h1>'
+        f'<h1 class="hero-title">Operação ML</h1>'
         f'<div style="background:rgba(255,255,255,.18);color:white;border:1px solid rgba(255,255,255,.35);'
         f'border-radius:999px;padding:10px 16px;font-weight:900;width:fit-content;">'
         f'Período selecionado: {label_periodo}</div>'
