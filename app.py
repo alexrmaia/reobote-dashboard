@@ -1407,6 +1407,52 @@ class ShopeeClient:
             saida.extend(resp.get("order_list", []) or [])
         return saida
 
+    # ---------- ads (CPC / Shopee Ads) ----------
+    def gasto_ads(self, d_ini: date, d_fim: date) -> float:
+        """
+        Gasto total com Shopee Ads (CPC) no período, em R$.
+
+        Endpoint: /api/v2/ads/get_all_cpc_ads_daily_performance
+        As datas vão no formato DD-MM-YYYY e a API limita a janela, então
+        fatiamos de 30 em 30 dias — mesma lógica das janelas de pedidos.
+
+        Requer que o módulo "Ads" esteja habilitado na autorização do app.
+        Se não estiver, a Shopee devolve erro de permissão e o ShopeeError
+        sobe para quem chamou decidir o que mostrar.
+        """
+        path = "/api/v2/ads/get_all_cpc_ads_daily_performance"
+        total = 0.0
+        atual = d_ini
+        while atual <= d_fim:
+            fatia_fim = min(atual + timedelta(days=29), d_fim)
+            data = self._request(
+                path,
+                params={
+                    "start_date": atual.strftime("%d-%m-%Y"),
+                    "end_date": fatia_fim.strftime("%d-%m-%Y"),
+                },
+            ).get("response", {}) or {}
+
+            # A Shopee já devolveu esse bloco como dict e como lista,
+            # dependendo da região/versão. Aceitamos os dois.
+            if isinstance(data, list):
+                linhas = data
+            else:
+                linhas = data.get("shop_all_cpc_ads_daily_performance") or []
+                if not linhas:
+                    for v in data.values():
+                        if isinstance(v, list):
+                            linhas = v
+                            break
+
+            for linha in linhas or []:
+                if isinstance(linha, dict):
+                    total += _num(linha.get("expense"))
+
+            atual = fatia_fim + timedelta(days=1)
+
+        return round(total, 2)
+
     def escrow_por_pedido(self, order_sns: Iterable[str]) -> dict[str, dict]:
         """
         Detalhe financeiro (comissão, taxa de serviço, frete, valor líquido).
@@ -1708,6 +1754,21 @@ def _buscar_vendas(_cli: ShopeeClient, inicio: datetime, fim: datetime, _cache_k
     return pd.DataFrame(linhas) if linhas else pd.DataFrame()
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def _buscar_gasto_ads(_cli: ShopeeClient, d_ini: date, d_fim: date, _cache_key: str):
+    """
+    Gasto com Shopee Ads no período.
+    Retorna (valor, erro) — erro é None quando deu certo. Nunca levanta:
+    a aba precisa continuar funcionando mesmo sem permissão de Ads.
+    """
+    try:
+        return _cli.gasto_ads(d_ini, d_fim), None
+    except ShopeeError as e:
+        return 0.0, str(e)
+    except Exception as e:  # rede, formato inesperado, etc.
+        return 0.0, str(e)
+
+
 def _kpi(titulo: str, valor: str, cor: str = "#1F2937") -> str:
     return (
         f'<div class="kpi-card"><div class="kpi-title">{titulo}</div>'
@@ -1835,14 +1896,28 @@ def render_shopee(sb, user_id: str):
     custo    = aprovadas["Custo Total"].sum()
     imposto  = aprovadas["Imposto"].sum()
     lucro    = aprovadas["Lucro"].sum()
-    margem   = (lucro / receita * 100) if receita else 0.0
+
+    # ---------- gasto com Shopee Ads (ao vivo, mesmo período) ----------
+    with st.spinner("Buscando gasto com Shopee Ads..."):
+        ads_cost, ads_erro = _buscar_gasto_ads(
+            cli, d_ini, d_fim, registro["access_token"][:12]
+        )
+
+    # Toggle: o card de ADS é clicável e liga/desliga a dedução no lucro
+    if "ads_on_shopee" not in st.session_state:
+        st.session_state["ads_on_shopee"] = True
+    ads_on  = st.session_state["ads_on_shopee"]
+    ads_eff = ads_cost if ads_on else 0.0
+
+    lucro_total = lucro - ads_eff
+    margem      = (lucro_total / receita * 100) if receita else 0.0
 
     # ---------- hero ----------
     canceladas_df = df[df["Cancelada"]]
     fat_cancel = canceladas_df["Receita Bruta"].sum()
     n_vendas = len(aprovadas)
     ticket = receita / n_vendas if n_vendas else 0.0
-    lucro_venda = lucro / n_vendas if n_vendas else 0.0
+    lucro_venda = lucro_total / n_vendas if n_vendas else 0.0
     # label_periodo vem do seletor de período, lá em cima
 
     st.markdown(
@@ -1906,11 +1981,12 @@ def render_shopee(sb, user_id: str):
             </div>
         </div>""", unsafe_allow_html=True)
     with right:
-        box_cls = "green-box" if lucro >= 0 else "red-box"
+        box_cls = "green-box" if lucro_total >= 0 else "red-box"
+        _sub_ads = "" if ads_on else " · ADS fora do cálculo"
         st.markdown(f"""<div class="{box_cls}">
             <div class="green-title">Lucro Líquido Real</div>
-            <div class="green-value">R$ {lucro:,.2f}</div>
-            <div class="green-sub">Margem real: {margem:.2f}%</div>
+            <div class="green-value">R$ {lucro_total:,.2f}</div>
+            <div class="green-sub">Margem real: {margem:.2f}%{_sub_ads}</div>
         </div>""", unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1924,6 +2000,55 @@ def render_shopee(sb, user_id: str):
     kpi_card(k4, "Custo dos Produtos", f"R$ {custo:,.2f}", "#EF4444")
     kpi_card(k5, "Impostos", f"R$ {imposto:,.2f}", "#EF4444")
     kpi_card(k6, "Pedidos", f"{aprovadas['Venda'].nunique()}")
+    st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
+
+    # Card ADS clicável (mesmo comportamento da Operação ML) + Lucro e Margem
+    k7, k8, k9 = st.columns(3)
+    _ads_color    = "#EF4444" if ads_on else "#9CA3AF"
+    _ads_val_html = (
+        f"R$ {ads_cost:,.2f}" if ads_on
+        else f"<span style='text-decoration:line-through;'>R$ {ads_cost:,.2f}</span>"
+    )
+    _ads_sub  = "contando no lucro" if ads_on else "ignorado no lucro"
+    _chip_bg  = "#16A34A" if ads_on else "#9CA3AF"
+    _chip_txt = "ON ⇋" if ads_on else "OFF ⇋"
+    _border   = "#EF4444" if ads_on else "#D1D5DB"
+    with k7:
+        _card_html = f"""
+        <style>
+            body{{margin:0;padding:0;}}
+            html,body{{height:100%;}}
+        </style>
+        <a href='#' id='ads_toggle_shopee' style='text-decoration:none;color:inherit;display:block;'>
+          <div style='background:#F4F1EA;border:1px solid {_border};border-radius:14px;
+                      padding:18px 14px;text-align:center;position:relative;cursor:pointer;
+                      min-height:150px;box-sizing:border-box;
+                      display:flex;flex-direction:column;justify-content:center;'>
+            <span style='position:absolute;top:10px;right:12px;background:{_chip_bg};color:white;
+                         font-size:9px;font-weight:700;letter-spacing:.5px;padding:3px 8px;
+                         border-radius:99px;text-transform:uppercase;'>{_chip_txt}</span>
+            <div style='font-size:13px;font-weight:800;color:#44403C;text-transform:uppercase;
+                        letter-spacing:.25px;margin-bottom:10px;'>ADS (Shopee Ads)</div>
+            <div style='font-size:24px;color:{_ads_color};font-weight:900;letter-spacing:-.8px;
+                        line-height:1.05;'>{_ads_val_html}</div>
+            <div style='font-size:11px;color:#64748B;margin-top:6px;'>{_ads_sub}</div>
+          </div>
+        </a>
+        """
+        _clicked = click_detector(_card_html, key=f"ads_click_shopee_{ads_on}")
+        if _clicked == "ads_toggle_shopee":
+            st.session_state["ads_on_shopee"] = not ads_on
+            st.rerun()
+    kpi_card(k8, "Lucro Real", f"R$ {lucro_total:,.2f}",
+             "#059669" if lucro_total >= 0 else "#DC2626")
+    kpi_card(k9, "Margem", f"{margem:.2f}%", "#B45309")
+
+    if ads_erro:
+        st.caption(
+            f"⚠️ Não foi possível ler o gasto com Shopee Ads ({ads_erro}). "
+            "O lucro está sem essa dedução. Se o erro for de permissão, habilite o "
+            "módulo **Ads** na autorização do app e reconecte a loja."
+        )
 
     st.markdown("<br>", unsafe_allow_html=True)
 
