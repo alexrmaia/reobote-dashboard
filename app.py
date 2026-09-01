@@ -2771,6 +2771,52 @@ def promo_detalhes_itens(ids_tuple, token):
     return out
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def promo_offer_id_candidato(promotion_id, promotion_type, item_id, token):
+    """Procura o offer_id de candidato do anúncio dentro da campanha."""
+    d = promo_itens_da_campanha(promotion_id, promotion_type, token,
+                                status="candidate", limite=1000)
+    for it in d.get("itens", []):
+        if it.get("id") == item_id:
+            return it.get("offer_id")
+    return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def promo_diagnostico(token):
+    """Lê dados do app/usuário para ajudar a diagnosticar 403 de permissão."""
+    out = {"me": None, "app": None, "erro_app": None}
+    r, _ = _promo_request("GET", f"{ML_API_BASE}/users/me", token, tentativas=2, timeout=15)
+    if r is not None and r.status_code == 200:
+        d = r.json()
+        out["me"] = {"id": d.get("id"), "nickname": d.get("nickname"),
+                     "site_id": d.get("site_id"), "tags": d.get("tags")}
+    r2, _ = _promo_request("GET", f"{ML_API_BASE}/applications/{CLIENT_ID}", token,
+                           tentativas=2, timeout=15)
+    if r2 is not None and r2.status_code == 200:
+        d = r2.json()
+        out["app"] = {"id": d.get("id"), "name": d.get("name"),
+                      "scopes": d.get("scopes"), "permissions": d.get("permissions"),
+                      "topics": d.get("notifications_topics")}
+    elif r2 is not None:
+        out["erro_app"] = f"HTTP {r2.status_code} — {r2.text[:200]}"
+    return out
+
+
+def _promo_painel_permissoes():
+    """Explica o 403 do PolicyAgent e oferece reautorização."""
+    st.markdown("##### Por que o Mercado Livre bloqueou (HTTP 403 · PolicyAgent)")
+    st.markdown(
+        "- A aplicação precisa ter a **permissão funcional de Ofertas/Promoções** "
+        "habilitada em *Minhas aplicações* no painel de desenvolvedor do ML.\n"
+        "- Depois de habilitar, o vendedor precisa **autorizar o app de novo** — "
+        "tokens emitidos antes da mudança continuam sem a permissão de escrita.\n"
+        "- Leitura (listar campanhas e anúncios elegíveis) funciona sem essa permissão; "
+        "só a adesão (POST/PUT/DELETE) é bloqueada — que é exatamente o que você está vendo."
+    )
+    st.link_button("🔐 Reautorizar no Mercado Livre", get_auth_url(), type="primary")
+
+
 def promo_incluir_item(item_id, token, promotion_id, promotion_type,
                        deal_price=None, top_deal_price=None, offer_id=None):
     """POST /seller-promotions/items/{item_id} — inclui o anúncio na promoção."""
@@ -2836,6 +2882,22 @@ def _promo_data(txt):
         return str(txt)[:16]
 
 
+def _promo_feedback(ok, msg, texto_ok="Feito!"):
+    """Mostra sucesso/erro sem devolver DeltaGenerator (evita eco na tela)."""
+    if ok:
+        st.success(texto_ok)
+        return
+    txt = str(msg)
+    if "403" in txt and "POLICIES" in txt.upper():
+        st.error("HTTP 403 — o Mercado Livre bloqueou a operação por política.")
+        st.caption("Detalhe: " + txt[:300])
+        _promo_painel_permissoes()
+    elif "409" in txt:
+        st.warning("HTTP 409 — limite temporário do ML. Tente novamente em instantes.")
+    else:
+        st.error(txt[:500])
+
+
 class _PromoSkip(Exception):
     """Interrompe apenas o bloco da aba, sem parar o resto da página."""
 
@@ -2860,6 +2922,21 @@ def render_promocoes(user_id, token):
         if st.button("🔄 Atualizar", use_container_width=True):
             _promo_limpar_cache()
             st.rerun()
+
+    with st.expander("🩺 Diagnóstico de permissões (abra se receber HTTP 403)"):
+        dg = promo_diagnostico(token)
+        c_d1, c_d2 = st.columns(2)
+        with c_d1:
+            st.caption("Conta autenticada")
+            st.json(dg["me"] or {"erro": "não consegui ler /users/me"})
+        with c_d2:
+            st.caption("Aplicação (scopes e permissões)")
+            if dg["app"]:
+                st.json(dg["app"])
+            else:
+                st.write(dg["erro_app"] or "Sem acesso a /applications/{app_id} "
+                         "(só o dono da aplicação consegue ler).")
+        _promo_painel_permissoes()
 
     res = promo_campanhas_disponiveis(user_id, token)
     if res["erro"]:
@@ -3013,6 +3090,8 @@ def render_promocoes(user_id, token):
                 for n, (_, row) in enumerate(marcados.iterrows(), start=1):
                     iid = row["Anúncio"]
                     offer_id = df_it.loc[df_it["Anúncio"] == iid, "offer_id"].iloc[0]
+                    if sem_preco and not offer_id:
+                        offer_id = promo_offer_id_candidato(promo_id, promo_type, iid, token)
                     preco_promo = None if sem_preco else float(row.get("Preço promo") or 0)
                     ok, resp = promo_incluir_item(
                         iid, token, promo_id, promo_type,
@@ -3029,6 +3108,8 @@ def render_promocoes(user_id, token):
                     st.error("Falhas:")
                     for e in erros:
                         st.write(f"• {e}")
+                    if any("403" in e for e in erros):
+                        _promo_painel_permissoes()
                 if ok_n and not erros:
                     st.rerun()
         else:
@@ -3041,7 +3122,7 @@ def render_promocoes(user_id, token):
                 offer_id = df_it.loc[df_it["Anúncio"] == iid_rm, "offer_id"].iloc[0]
                 ok, msg = promo_remover_item(iid_rm, token, promo_id, promo_type, offer_id)
                 _promo_limpar_cache()
-                st.success("Removido.") if ok else st.error(msg)
+                _promo_feedback(ok, msg, "Removido.")
                 if ok:
                     st.rerun()
 
@@ -3106,15 +3187,26 @@ def render_promocoes(user_id, token):
                 # índice garante chave única mesmo se o ML devolver ofertas
                 # com o mesmo id/tipo (ou sem id) para o mesmo anúncio
                 chave = f'{sel}_{o.get("id") or "noid"}_{tipo or "notype"}_{o.get("offer_id") or ""}_{pos}'
+                # offer_id do candidato: obrigatório em SMART/LIGHTNING/DOD etc.
+                offer_id = (o.get("offer_id") or o.get("candidate_id")
+                            or (o.get("offer") or {}).get("id"))
+
                 if status in ("candidate", ""):
                     if tipo in PROMO_SEM_PRECO:
                         if st.button("Participar", key=f"btn_join_{chave}", type="primary"):
-                            ok, msg = promo_incluir_item(sel, token, o.get("id"), tipo,
-                                                         offer_id=o.get("offer_id"))
-                            _promo_limpar_cache()
-                            st.success("Incluído!") if ok else st.error(msg)
-                            if ok:
-                                st.rerun()
+                            oid = offer_id or promo_offer_id_candidato(
+                                o.get("id"), tipo, sel, token)
+                            if not oid:
+                                st.error("Não encontrei o `offer_id` de candidato deste "
+                                         "anúncio nesta campanha — o ML exige esse campo "
+                                         "para aderir. Tente pela aba **Campanhas disponíveis**.")
+                            else:
+                                ok, msg = promo_incluir_item(sel, token, o.get("id"), tipo,
+                                                             offer_id=oid)
+                                _promo_limpar_cache()
+                                _promo_feedback(ok, msg, "Incluído!")
+                                if ok:
+                                    st.rerun()
                     else:
                         cpa, cpb = st.columns([2, 1])
                         with cpa:
@@ -3127,17 +3219,17 @@ def render_promocoes(user_id, token):
                             if st.button("Participar", key=f"btn_join_{chave}", type="primary"):
                                 ok, msg = promo_incluir_item(sel, token, o.get("id"), tipo,
                                                             deal_price=novo,
-                                                            offer_id=o.get("offer_id"))
+                                                            offer_id=offer_id)
                                 _promo_limpar_cache()
-                                st.success("Incluído!") if ok else st.error(msg)
+                                _promo_feedback(ok, msg, "Incluído!")
                                 if ok:
                                     st.rerun()
                 else:
                     if st.button("🗑️ Sair desta promoção", key=f"btn_out_{chave}"):
                         ok, msg = promo_remover_item(sel, token, o.get("id"), tipo,
-                                                     o.get("offer_id"))
+                                                     offer_id)
                         _promo_limpar_cache()
-                        st.success("Removido.") if ok else st.error(msg)
+                        _promo_feedback(ok, msg, "Removido.")
                         if ok:
                             st.rerun()
 
@@ -3210,7 +3302,7 @@ def render_promocoes(user_id, token):
                 ok, msg = promo_remover_item(r["Anúncio"], token, r["promotion_id"],
                                              r["promotion_type"], r["offer_id"])
                 _promo_limpar_cache()
-                st.success("Removido.") if ok else st.error(msg)
+                _promo_feedback(ok, msg, "Removido.")
                 if ok:
                     st.rerun()
 
