@@ -2626,20 +2626,53 @@ def _promo_label(tipo):
     return PROMO_LABELS.get(tipo, tipo or "-")
 
 
+# Tipos que NÃO expõem a lista de anúncios em /promotions/{id}/items
+PROMO_SEM_LISTA_ITENS = {"SELLER_COUPON_CAMPAIGN"}
+
+# Status HTTP transitórios do ML — vale reenviar
+_PROMO_RETRY_STATUS = {409, 425, 429, 500, 502, 503, 504}
+
+
+def _promo_request(metodo, url, token, params=None, json_body=None,
+                   tentativas=4, timeout=30):
+    """
+    Chamada à API de promoções com retry/backoff em erros transitórios
+    (409 internal_capacity_conflict, 429 rate limit, 5xx).
+    Retorna (response|None, erro_str|None).
+    """
+    espera = 1.0
+    ultimo = None
+    for n in range(tentativas):
+        try:
+            r = requests.request(metodo, url, headers=_promo_headers(token),
+                                 params=params, json=json_body, timeout=timeout)
+            if r.status_code in _PROMO_RETRY_STATUS and n < tentativas - 1:
+                ultimo = f"HTTP {r.status_code} — {r.text[:200]}"
+                time.sleep(espera)
+                espera *= 2
+                continue
+            return r, None
+        except Exception as e:
+            ultimo = str(e)
+            if n < tentativas - 1:
+                time.sleep(espera)
+                espera *= 2
+                continue
+    return None, ultimo
+
+
 @st.cache_data(ttl=180, show_spinner=False)
 def promo_campanhas_disponiveis(user_id, token):
     """GET /seller-promotions/users/{user_id} — campanhas que o vendedor pode participar."""
-    try:
-        r = requests.get(f"{ML_API_BASE}/seller-promotions/users/{user_id}",
-                         headers=_promo_headers(token),
-                         params={"app_version": "v2"}, timeout=25)
-        if r.status_code != 200:
-            return {"erro": f"HTTP {r.status_code} — {r.text[:300]}", "campanhas": []}
-        data = r.json()
-        campanhas = data if isinstance(data, list) else data.get("results", [])
-        return {"erro": None, "campanhas": campanhas}
-    except Exception as e:
-        return {"erro": str(e), "campanhas": []}
+    r, err = _promo_request("GET", f"{ML_API_BASE}/seller-promotions/users/{user_id}",
+                            token, params={"app_version": "v2"}, timeout=25)
+    if r is None:
+        return {"erro": err, "campanhas": []}
+    if r.status_code != 200:
+        return {"erro": f"HTTP {r.status_code} — {r.text[:300]}", "campanhas": []}
+    data = r.json()
+    campanhas = data if isinstance(data, list) else data.get("results", [])
+    return {"erro": None, "campanhas": campanhas}
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -2649,43 +2682,47 @@ def promo_itens_da_campanha(promotion_id, promotion_type, token, status="candida
     status: candidate (pode entrar) | started | pending | finished
     Pagina com o cursor searchAfter.
     """
+    if promotion_type in PROMO_SEM_LISTA_ITENS:
+        return {"erro": None, "itens": [],
+                "aviso": "Este tipo de campanha não expõe a lista de anúncios pela API "
+                         "(a gestão é feita no painel do Mercado Livre)."}
+
     itens, cursor, erro = [], None, None
-    try:
-        while len(itens) < limite:
-            params = {"promotion_type": promotion_type, "app_version": "v2",
-                      "status": status, "limit": 50}
-            if cursor:
-                params["searchAfter"] = cursor
-            r = requests.get(f"{ML_API_BASE}/seller-promotions/promotions/{promotion_id}/items",
-                             headers=_promo_headers(token), params=params, timeout=30)
-            if r.status_code != 200:
-                erro = f"HTTP {r.status_code} — {r.text[:300]}"
-                break
-            data = r.json()
-            lote = data.get("results", []) or []
-            itens.extend(lote)
-            cursor = (data.get("paging") or {}).get("searchAfter")
-            if not lote or not cursor:
-                break
-    except Exception as e:
-        erro = str(e)
-    return {"erro": erro, "itens": itens[:limite]}
+    while len(itens) < limite:
+        params = {"promotion_type": promotion_type, "app_version": "v2",
+                  "status": status, "limit": 50}
+        if cursor:
+            params["searchAfter"] = cursor
+        r, err = _promo_request(
+            "GET", f"{ML_API_BASE}/seller-promotions/promotions/{promotion_id}/items",
+            token, params=params)
+        if r is None:
+            erro = err
+            break
+        if r.status_code != 200:
+            erro = f"HTTP {r.status_code} — {r.text[:300]}"
+            break
+        data = r.json()
+        lote = data.get("results", []) or []
+        itens.extend(lote)
+        cursor = (data.get("paging") or {}).get("searchAfter")
+        if not lote or not cursor:
+            break
+    return {"erro": erro, "itens": itens[:limite], "aviso": None}
 
 
 @st.cache_data(ttl=120, show_spinner=False)
 def promo_ofertas_do_item(item_id, token):
     """GET /seller-promotions/items/{item_id} — promoções ativas e disponíveis do anúncio."""
-    try:
-        r = requests.get(f"{ML_API_BASE}/seller-promotions/items/{item_id}",
-                         headers=_promo_headers(token),
-                         params={"app_version": "v2"}, timeout=25)
-        if r.status_code != 200:
-            return {"erro": f"HTTP {r.status_code} — {r.text[:300]}", "ofertas": []}
-        data = r.json()
-        ofertas = data if isinstance(data, list) else data.get("results", [])
-        return {"erro": None, "ofertas": ofertas}
-    except Exception as e:
-        return {"erro": str(e), "ofertas": []}
+    r, err = _promo_request("GET", f"{ML_API_BASE}/seller-promotions/items/{item_id}",
+                            token, params={"app_version": "v2"}, timeout=25)
+    if r is None:
+        return {"erro": err, "ofertas": []}
+    if r.status_code != 200:
+        return {"erro": f"HTTP {r.status_code} — {r.text[:300]}", "ofertas": []}
+    data = r.json()
+    ofertas = data if isinstance(data, list) else data.get("results", [])
+    return {"erro": None, "ofertas": ofertas}
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -2744,14 +2781,12 @@ def promo_incluir_item(item_id, token, promotion_id, promotion_type,
         payload["deal_price"] = round(float(deal_price), 2)
     if top_deal_price is not None:
         payload["top_deal_price"] = round(float(top_deal_price), 2)
-    try:
-        r = requests.post(f"{ML_API_BASE}/seller-promotions/items/{item_id}",
-                          headers=_promo_headers(token),
-                          params={"app_version": "v2"}, json=payload, timeout=30)
-        ok = r.status_code in (200, 201)
-        return ok, (r.json() if r.content else {}) if ok else f"HTTP {r.status_code} — {r.text[:300]}"
-    except Exception as e:
-        return False, str(e)
+    r, err = _promo_request("POST", f"{ML_API_BASE}/seller-promotions/items/{item_id}",
+                            token, params={"app_version": "v2"}, json_body=payload)
+    if r is None:
+        return False, err
+    ok = r.status_code in (200, 201)
+    return ok, (r.json() if r.content else {}) if ok else f"HTTP {r.status_code} — {r.text[:300]}"
 
 
 def promo_atualizar_preco(item_id, token, promotion_id, promotion_type,
@@ -2761,14 +2796,12 @@ def promo_atualizar_preco(item_id, token, promotion_id, promotion_type,
                "deal_price": round(float(deal_price), 2)}
     if top_deal_price is not None:
         payload["top_deal_price"] = round(float(top_deal_price), 2)
-    try:
-        r = requests.put(f"{ML_API_BASE}/seller-promotions/items/{item_id}",
-                         headers=_promo_headers(token),
-                         params={"app_version": "v2"}, json=payload, timeout=30)
-        ok = r.status_code in (200, 201)
-        return ok, (r.json() if r.content else {}) if ok else f"HTTP {r.status_code} — {r.text[:300]}"
-    except Exception as e:
-        return False, str(e)
+    r, err = _promo_request("PUT", f"{ML_API_BASE}/seller-promotions/items/{item_id}",
+                            token, params={"app_version": "v2"}, json_body=payload)
+    if r is None:
+        return False, err
+    ok = r.status_code in (200, 201)
+    return ok, (r.json() if r.content else {}) if ok else f"HTTP {r.status_code} — {r.text[:300]}"
 
 
 def promo_remover_item(item_id, token, promotion_id, promotion_type, offer_id=None):
@@ -2777,13 +2810,12 @@ def promo_remover_item(item_id, token, promotion_id, promotion_type, offer_id=No
               "app_version": "v2"}
     if offer_id:
         params["offer_id"] = offer_id
-    try:
-        r = requests.delete(f"{ML_API_BASE}/seller-promotions/items/{item_id}",
-                            headers=_promo_headers(token), params=params, timeout=30)
-        ok = r.status_code in (200, 201, 204)
-        return ok, "" if ok else f"HTTP {r.status_code} — {r.text[:300]}"
-    except Exception as e:
-        return False, str(e)
+    r, err = _promo_request("DELETE", f"{ML_API_BASE}/seller-promotions/items/{item_id}",
+                            token, params=params)
+    if r is None:
+        return False, err
+    ok = r.status_code in (200, 201, 204)
+    return ok, "" if ok else f"HTTP {r.status_code} — {r.text[:300]}"
 
 
 def _promo_limpar_cache():
@@ -2804,6 +2836,21 @@ def _promo_data(txt):
         return str(txt)[:16]
 
 
+class _PromoSkip(Exception):
+    """Interrompe apenas o bloco da aba, sem parar o resto da página."""
+
+
+import contextlib
+
+
+@contextlib.contextmanager
+def _promo_bloco():
+    try:
+        yield
+    except _PromoSkip:
+        pass
+
+
 def render_promocoes(user_id, token):
     st.markdown("## 🏷️ Central de Promoções")
     st.caption("Campanhas do Mercado Livre disponíveis para a sua conta, anúncios elegíveis e adesão via API.")
@@ -2817,7 +2864,8 @@ def render_promocoes(user_id, token):
     res = promo_campanhas_disponiveis(user_id, token)
     if res["erro"]:
         st.error(f"Não consegui carregar as campanhas: {res['erro']}")
-        st.info("Verifique se o app tem permissão de ofertas e se o token do vendedor está válido.")
+        st.info("Se for HTTP 409, é limite temporário do ML — tente de novo em instantes. "
+                "Se for 401/403, revise o token e a permissão de ofertas do app.")
         return
 
     campanhas = res["campanhas"]
@@ -2832,7 +2880,7 @@ def render_promocoes(user_id, token):
     # ─────────────────────────────────────────────
     # ABA 1 — CAMPANHAS → ITENS CANDIDATOS → ADESÃO
     # ─────────────────────────────────────────────
-    with aba1:
+    with aba1, _promo_bloco():
         linhas = []
         for c in campanhas:
             linhas.append({
@@ -2863,14 +2911,27 @@ def render_promocoes(user_id, token):
                                    "finished": "Encerrados"}[s],
                                key="promo_status_item")
 
-        dados = promo_itens_da_campanha(promo_id, promo_type, token, status=status_item)
+        with st.spinner("Buscando anúncios da campanha..."):
+            dados = promo_itens_da_campanha(promo_id, promo_type, token, status=status_item)
+
+        if dados.get("aviso"):
+            st.info(dados["aviso"])
+            raise _PromoSkip()
         if dados["erro"]:
-            st.error(f"Erro ao listar anúncios da campanha: {dados['erro']}")
-            return
+            if "409" in str(dados["erro"]) or "internal_capacity" in str(dados["erro"]):
+                st.warning("⏳ O Mercado Livre está limitando as consultas agora "
+                           "(409 — capacidade interna). Já tentei 4 vezes com intervalo. "
+                           "Clique abaixo para tentar de novo em alguns segundos.")
+            else:
+                st.error(f"Erro ao listar anúncios da campanha: {dados['erro']}")
+            if st.button("🔁 Tentar novamente", key=f"retry_{promo_id}_{status_item}"):
+                promo_itens_da_campanha.clear()
+                st.rerun()
+            raise _PromoSkip()
         itens = dados["itens"]
         if not itens:
             st.info("Nenhum anúncio nesse status para esta campanha.")
-            return
+            raise _PromoSkip()
 
         detalhes = promo_detalhes_itens(tuple(i.get("id") for i in itens if i.get("id")), token)
 
@@ -2987,15 +3048,15 @@ def render_promocoes(user_id, token):
     # ─────────────────────────────────────────────
     # ABA 2 — MEUS ANÚNCIOS → PROMOÇÕES DISPONÍVEIS
     # ─────────────────────────────────────────────
-    with aba2:
+    with aba2, _promo_bloco():
         anuncios = promo_meus_anuncios(str(user_id), token)
         if anuncios["erro"]:
             st.error(anuncios["erro"])
-            return
+            raise _PromoSkip()
         itens = anuncios["itens"]
         if not itens:
             st.info("Nenhum anúncio ativo encontrado.")
-            return
+            raise _PromoSkip()
 
         busca = st.text_input("Buscar por título, MLB ou SKU", key="promo_busca")
         lista = []
@@ -3010,7 +3071,8 @@ def render_promocoes(user_id, token):
         st.dataframe(df_an, use_container_width=True, hide_index=True, height=320)
 
         if df_an.empty:
-            return
+            st.info("Nenhum anúncio encontrado para essa busca.")
+            raise _PromoSkip()
         sel = st.selectbox("Ver promoções disponíveis para o anúncio:",
                            df_an["Anúncio"].tolist(),
                            format_func=lambda i: f'{i} — {itens.get(i, {}).get("title", "")[:50]}',
@@ -3018,12 +3080,12 @@ def render_promocoes(user_id, token):
 
         of = promo_ofertas_do_item(sel, token)
         if of["erro"]:
-            st.error(of["erro"])
-            return
+            st.warning(f"Não consegui ler as promoções deste anúncio: {of['erro']}")
+            raise _PromoSkip()
         ofertas = of["ofertas"]
         if not ofertas:
             st.info("Este anúncio não tem promoções disponíveis nem ativas.")
-            return
+            raise _PromoSkip()
 
         preco_atual = float(itens.get(sel, {}).get("price") or 0)
         for pos, o in enumerate(ofertas):
@@ -3082,14 +3144,27 @@ def render_promocoes(user_id, token):
     # ─────────────────────────────────────────────
     # ABA 3 — PARTICIPAÇÕES ATIVAS
     # ─────────────────────────────────────────────
-    with aba3:
-        st.caption("Anúncios que já estão em campanhas (status started/pending).")
-        linhas = []
-        for c in campanhas:
-            if (c.get("status") or "").lower() in ("finished",):
-                continue
+    with aba3, _promo_bloco():
+        st.caption("Anúncios que já estão em campanhas (status started/pending). "
+                   "A varredura consulta todas as campanhas, por isso roda sob demanda.")
+        if not st.session_state.get("promo_scan_ativas"):
+            if st.button("🔎 Varrer participações ativas", type="primary"):
+                st.session_state["promo_scan_ativas"] = True
+                st.rerun()
+            raise _PromoSkip()
+
+        linhas, falhas = [], []
+        ativas = [c for c in campanhas
+                  if (c.get("status") or "").lower() != "finished"
+                  and c.get("type") not in PROMO_SEM_LISTA_ITENS]
+        barra_scan = st.progress(0.0, text="Varrendo campanhas...")
+        for n_c, c in enumerate(ativas, start=1):
             for st_i in ("started", "pending"):
                 d = promo_itens_da_campanha(c.get("id"), c.get("type"), token, status=st_i, limite=100)
+                if d["erro"]:
+                    falhas.append(f'{c.get("name") or c.get("id")} ({st_i}): {d["erro"][:80]}')
+                    continue
+                time.sleep(0.2)  # respira entre chamadas para não tomar 409
                 for it in d["itens"]:
                     linhas.append({
                         "Campanha": c.get("name") or c.get("id"),
@@ -3102,6 +3177,20 @@ def render_promocoes(user_id, token):
                         "promotion_type": c.get("type"),
                         "offer_id": it.get("offer_id"),
                     })
+            barra_scan.progress(n_c / max(len(ativas), 1), text=f"Varrendo campanhas... {n_c}/{len(ativas)}")
+        barra_scan.empty()
+
+        if falhas:
+            with st.expander(f"⚠️ {len(falhas)} campanha(s) não puderam ser lidas agora"):
+                for f in falhas:
+                    st.write(f"• {f}")
+
+        c_re1, c_re2 = st.columns([1, 5])
+        with c_re1:
+            if st.button("🔄 Refazer varredura"):
+                promo_itens_da_campanha.clear()
+                st.rerun()
+
         if not linhas:
             st.info("Nenhuma participação ativa no momento.")
         else:
@@ -3196,7 +3285,7 @@ if st.session_state["aba_ativa"] == "financeiro":
 
     if not orders:
         st.info("Nenhuma venda encontrada no período.")
-        st.stop()
+        raise _PromoSkip()
 
     shipping_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in orders if o.get("shipping",{}).get("id")}))
     token_hash   = token[-8:] if token else ""
@@ -3209,7 +3298,7 @@ if st.session_state["aba_ativa"] == "financeiro":
     df_raw = parse_orders(orders, fretes, reembolsados)
     if df_raw.empty:
         st.info("Nenhuma venda encontrada.")
-        st.stop()
+        raise _PromoSkip()
 
     with st.spinner("Calculando custos e margens..."):
         df = apply_costs_online(df_raw, str(user_id))
