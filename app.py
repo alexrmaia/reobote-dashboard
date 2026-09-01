@@ -2594,6 +2594,536 @@ if "access_token" not in st.session_state:
 # =========================
 st.markdown('<div class="navbar"><span style="font-size:20px;">🛒</span><span class="navbar-name">REOBOTE IMPORTS</span></div>', unsafe_allow_html=True)
 
+# =========================================================
+# PROMOÇÕES ML — seller-promotions API
+# =========================================================
+PROMO_LABELS = {
+    "DEAL": "Campanha tradicional",
+    "MARKETPLACE_CAMPAIGN": "Campanha cofinanciada",
+    "SELLER_CAMPAIGN": "Campanha do vendedor",
+    "PRICE_DISCOUNT": "Desconto individual",
+    "LIGHTNING": "Oferta relâmpago",
+    "DOD": "Oferta do dia",
+    "VOLUME": "Desconto por quantidade",
+    "PRE_NEGOTIATED": "Pré-negociada",
+    "SMART": "Campanha inteligente",
+    "PRICE_MATCHING": "Igualar preço",
+    "PRICE_MATCHING_MELI_ALL": "Igualar preço (Meli)",
+    "UNHEALTHY_STOCK": "Estoque parado (Full)",
+    "SELLER_COUPON_CAMPAIGN": "Cupom do vendedor",
+}
+
+# Tipos em que o vendedor NÃO define o preço (basta aderir com o offer_id)
+PROMO_SEM_PRECO = {"MARKETPLACE_CAMPAIGN", "SMART", "PRE_NEGOTIATED",
+                   "PRICE_MATCHING", "PRICE_MATCHING_MELI_ALL", "UNHEALTHY_STOCK"}
+
+
+def _promo_headers(token):
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+
+def _promo_label(tipo):
+    return PROMO_LABELS.get(tipo, tipo or "-")
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def promo_campanhas_disponiveis(user_id, token):
+    """GET /seller-promotions/users/{user_id} — campanhas que o vendedor pode participar."""
+    try:
+        r = requests.get(f"{ML_API_BASE}/seller-promotions/users/{user_id}",
+                         headers=_promo_headers(token),
+                         params={"app_version": "v2"}, timeout=25)
+        if r.status_code != 200:
+            return {"erro": f"HTTP {r.status_code} — {r.text[:300]}", "campanhas": []}
+        data = r.json()
+        campanhas = data if isinstance(data, list) else data.get("results", [])
+        return {"erro": None, "campanhas": campanhas}
+    except Exception as e:
+        return {"erro": str(e), "campanhas": []}
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def promo_itens_da_campanha(promotion_id, promotion_type, token, status="candidate", limite=200):
+    """
+    GET /seller-promotions/promotions/{id}/items
+    status: candidate (pode entrar) | started | pending | finished
+    Pagina com o cursor searchAfter.
+    """
+    itens, cursor, erro = [], None, None
+    try:
+        while len(itens) < limite:
+            params = {"promotion_type": promotion_type, "app_version": "v2",
+                      "status": status, "limit": 50}
+            if cursor:
+                params["searchAfter"] = cursor
+            r = requests.get(f"{ML_API_BASE}/seller-promotions/promotions/{promotion_id}/items",
+                             headers=_promo_headers(token), params=params, timeout=30)
+            if r.status_code != 200:
+                erro = f"HTTP {r.status_code} — {r.text[:300]}"
+                break
+            data = r.json()
+            lote = data.get("results", []) or []
+            itens.extend(lote)
+            cursor = (data.get("paging") or {}).get("searchAfter")
+            if not lote or not cursor:
+                break
+    except Exception as e:
+        erro = str(e)
+    return {"erro": erro, "itens": itens[:limite]}
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def promo_ofertas_do_item(item_id, token):
+    """GET /seller-promotions/items/{item_id} — promoções ativas e disponíveis do anúncio."""
+    try:
+        r = requests.get(f"{ML_API_BASE}/seller-promotions/items/{item_id}",
+                         headers=_promo_headers(token),
+                         params={"app_version": "v2"}, timeout=25)
+        if r.status_code != 200:
+            return {"erro": f"HTTP {r.status_code} — {r.text[:300]}", "ofertas": []}
+        data = r.json()
+        ofertas = data if isinstance(data, list) else data.get("results", [])
+        return {"erro": None, "ofertas": ofertas}
+    except Exception as e:
+        return {"erro": str(e), "ofertas": []}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def promo_meus_anuncios(user_id, token, status="active", limite=300):
+    """Lista os anúncios do vendedor (id, título, preço, estoque)."""
+    ids, offset, erro = [], 0, None
+    try:
+        while len(ids) < limite:
+            r = requests.get(f"{ML_API_BASE}/users/{user_id}/items/search",
+                             headers=_promo_headers(token),
+                             params={"status": status, "limit": 50, "offset": offset}, timeout=25)
+            if r.status_code != 200:
+                erro = f"HTTP {r.status_code} — {r.text[:200]}"
+                break
+            data = r.json()
+            lote = data.get("results", []) or []
+            ids.extend(lote)
+            offset += 50
+            if len(lote) < 50 or offset >= (data.get("paging", {}).get("total", 0) or 0):
+                break
+    except Exception as e:
+        erro = str(e)
+    return {"erro": erro, "itens": promo_detalhes_itens(tuple(ids[:limite]), token)}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def promo_detalhes_itens(ids_tuple, token):
+    """Multiget /items?ids= (lotes de 20) → dict {item_id: {...}}"""
+    out = {}
+    ids = list(ids_tuple)
+    campos = "id,title,price,original_price,available_quantity,status,permalink,thumbnail,seller_custom_field"
+    for i in range(0, len(ids), 20):
+        lote = ids[i:i + 20]
+        try:
+            r = requests.get(f"{ML_API_BASE}/items",
+                             headers=_promo_headers(token),
+                             params={"ids": ",".join(lote), "attributes": campos}, timeout=25)
+            if r.status_code != 200:
+                continue
+            for reg in r.json():
+                body = reg.get("body") or {}
+                if body.get("id"):
+                    out[body["id"]] = body
+        except Exception:
+            continue
+    return out
+
+
+def promo_incluir_item(item_id, token, promotion_id, promotion_type,
+                       deal_price=None, top_deal_price=None, offer_id=None):
+    """POST /seller-promotions/items/{item_id} — inclui o anúncio na promoção."""
+    payload = {"promotion_id": promotion_id, "promotion_type": promotion_type}
+    if offer_id:
+        payload["offer_id"] = offer_id
+    if deal_price is not None:
+        payload["deal_price"] = round(float(deal_price), 2)
+    if top_deal_price is not None:
+        payload["top_deal_price"] = round(float(top_deal_price), 2)
+    try:
+        r = requests.post(f"{ML_API_BASE}/seller-promotions/items/{item_id}",
+                          headers=_promo_headers(token),
+                          params={"app_version": "v2"}, json=payload, timeout=30)
+        ok = r.status_code in (200, 201)
+        return ok, (r.json() if r.content else {}) if ok else f"HTTP {r.status_code} — {r.text[:300]}"
+    except Exception as e:
+        return False, str(e)
+
+
+def promo_atualizar_preco(item_id, token, promotion_id, promotion_type,
+                          deal_price, top_deal_price=None):
+    """PUT /seller-promotions/items/{item_id} — atualiza o preço promocional."""
+    payload = {"promotion_id": promotion_id, "promotion_type": promotion_type,
+               "deal_price": round(float(deal_price), 2)}
+    if top_deal_price is not None:
+        payload["top_deal_price"] = round(float(top_deal_price), 2)
+    try:
+        r = requests.put(f"{ML_API_BASE}/seller-promotions/items/{item_id}",
+                         headers=_promo_headers(token),
+                         params={"app_version": "v2"}, json=payload, timeout=30)
+        ok = r.status_code in (200, 201)
+        return ok, (r.json() if r.content else {}) if ok else f"HTTP {r.status_code} — {r.text[:300]}"
+    except Exception as e:
+        return False, str(e)
+
+
+def promo_remover_item(item_id, token, promotion_id, promotion_type, offer_id=None):
+    """DELETE /seller-promotions/items/{item_id} — tira o anúncio da promoção."""
+    params = {"promotion_id": promotion_id, "promotion_type": promotion_type,
+              "app_version": "v2"}
+    if offer_id:
+        params["offer_id"] = offer_id
+    try:
+        r = requests.delete(f"{ML_API_BASE}/seller-promotions/items/{item_id}",
+                            headers=_promo_headers(token), params=params, timeout=30)
+        ok = r.status_code in (200, 201, 204)
+        return ok, "" if ok else f"HTTP {r.status_code} — {r.text[:300]}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _promo_limpar_cache():
+    for fn in (promo_campanhas_disponiveis, promo_itens_da_campanha,
+               promo_ofertas_do_item, promo_meus_anuncios, promo_detalhes_itens):
+        try:
+            fn.clear()
+        except Exception:
+            pass
+
+
+def _promo_data(txt):
+    if not txt:
+        return "-"
+    try:
+        return pd.to_datetime(txt).strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return str(txt)[:16]
+
+
+def render_promocoes(user_id, token):
+    st.markdown("## 🏷️ Central de Promoções")
+    st.caption("Campanhas do Mercado Livre disponíveis para a sua conta, anúncios elegíveis e adesão via API.")
+
+    col_a, col_b = st.columns([1, 6])
+    with col_a:
+        if st.button("🔄 Atualizar", use_container_width=True):
+            _promo_limpar_cache()
+            st.rerun()
+
+    res = promo_campanhas_disponiveis(user_id, token)
+    if res["erro"]:
+        st.error(f"Não consegui carregar as campanhas: {res['erro']}")
+        st.info("Verifique se o app tem permissão de ofertas e se o token do vendedor está válido.")
+        return
+
+    campanhas = res["campanhas"]
+    if not campanhas:
+        st.warning("Nenhuma campanha disponível para esta conta no momento.")
+        return
+
+    aba1, aba2, aba3 = st.tabs(["📢 Campanhas disponíveis",
+                                "📦 Meus anúncios",
+                                "✅ Participações ativas"])
+
+    # ─────────────────────────────────────────────
+    # ABA 1 — CAMPANHAS → ITENS CANDIDATOS → ADESÃO
+    # ─────────────────────────────────────────────
+    with aba1:
+        linhas = []
+        for c in campanhas:
+            linhas.append({
+                "Campanha": c.get("name") or c.get("id"),
+                "Tipo": _promo_label(c.get("type")),
+                "Status": c.get("status", "-"),
+                "Início": _promo_data(c.get("start_date")),
+                "Fim": _promo_data(c.get("finish_date")),
+                "Prazo p/ aderir": _promo_data(c.get("deadline_date")),
+                "Desconto ML": f'{c.get("meli_percentage") or 0}%',
+                "id": c.get("id"),
+                "type_raw": c.get("type"),
+            })
+        df_camp = pd.DataFrame(linhas)
+        st.dataframe(df_camp.drop(columns=["id", "type_raw"]),
+                     use_container_width=True, hide_index=True)
+
+        opcoes = {f'{l["Campanha"]}  ·  {l["Tipo"]}  ·  {l["Status"]}': (l["id"], l["type_raw"])
+                  for l in linhas}
+        escolha = st.selectbox("Escolha a campanha para participar:", list(opcoes.keys()))
+        promo_id, promo_type = opcoes[escolha]
+
+        status_item = st.radio("Anúncios:", ["candidate", "started", "pending", "finished"],
+                               horizontal=True, format_func=lambda s: {
+                                   "candidate": "Elegíveis (podem entrar)",
+                                   "started": "Participando",
+                                   "pending": "Aguardando início",
+                                   "finished": "Encerrados"}[s],
+                               key="promo_status_item")
+
+        dados = promo_itens_da_campanha(promo_id, promo_type, token, status=status_item)
+        if dados["erro"]:
+            st.error(f"Erro ao listar anúncios da campanha: {dados['erro']}")
+            return
+        itens = dados["itens"]
+        if not itens:
+            st.info("Nenhum anúncio nesse status para esta campanha.")
+            return
+
+        detalhes = promo_detalhes_itens(tuple(i.get("id") for i in itens if i.get("id")), token)
+
+        base = []
+        for it in itens:
+            iid = it.get("id")
+            det = detalhes.get(iid, {})
+            preco = it.get("price") or det.get("price") or 0
+            orig = it.get("original_price") or det.get("original_price") or preco
+            sug = (it.get("suggested_discounted_price")
+                   or it.get("next_price") or it.get("discounted_price"))
+            minp = it.get("min_discounted_price")
+            maxp = it.get("max_discounted_price")
+            base.append({
+                "Incluir": False,
+                "Anúncio": iid,
+                "Título": (det.get("title") or "")[:70],
+                "SKU": det.get("seller_custom_field") or "",
+                "Estoque": det.get("available_quantity"),
+                "Preço atual": float(preco or 0),
+                "Preço sugerido": float(sug) if sug else None,
+                "Mín. permitido": float(minp) if minp else None,
+                "Máx. permitido": float(maxp) if maxp else None,
+                "Preço promo": float(sug) if sug else float(preco or 0),
+                "offer_id": it.get("offer_id"),
+                "_orig": float(orig or 0),
+            })
+        df_it = pd.DataFrame(base)
+
+        if status_item == "candidate":
+            st.markdown("#### Defina os preços e marque o que quer incluir")
+            c1, c2, c3 = st.columns([2, 2, 3])
+            with c1:
+                pct = st.number_input("Aplicar desconto (%) sobre o preço atual",
+                                      min_value=0.0, max_value=90.0, value=0.0, step=1.0)
+            with c2:
+                if st.button("Aplicar % em todos", use_container_width=True):
+                    st.session_state["promo_pct_aplicar"] = pct
+                    st.rerun()
+            with c3:
+                st.caption("Ou edite o campo **Preço promo** linha a linha. "
+                           "Deixe em branco para usar o sugerido pelo ML.")
+
+            pct_ap = st.session_state.get("promo_pct_aplicar")
+            if pct_ap:
+                df_it["Preço promo"] = (df_it["Preço atual"] * (1 - pct_ap / 100)).round(2)
+
+            sem_preco = promo_type in PROMO_SEM_PRECO
+            cols_show = ["Incluir", "Anúncio", "Título", "SKU", "Estoque", "Preço atual"]
+            if not sem_preco:
+                cols_show += ["Preço sugerido", "Mín. permitido", "Máx. permitido", "Preço promo"]
+
+            if sem_preco:
+                st.info("Nesta campanha o desconto é definido/cofinanciado pelo Mercado Livre — "
+                        "basta marcar os anúncios e confirmar a adesão.")
+
+            edit = st.data_editor(
+                df_it[cols_show],
+                use_container_width=True, hide_index=True, height=420,
+                disabled=[c for c in cols_show if c not in ("Incluir", "Preço promo")],
+                column_config={
+                    "Incluir": st.column_config.CheckboxColumn(required=True),
+                    "Preço atual": st.column_config.NumberColumn(format="R$ %.2f"),
+                    "Preço sugerido": st.column_config.NumberColumn(format="R$ %.2f"),
+                    "Mín. permitido": st.column_config.NumberColumn(format="R$ %.2f"),
+                    "Máx. permitido": st.column_config.NumberColumn(format="R$ %.2f"),
+                    "Preço promo": st.column_config.NumberColumn(format="R$ %.2f", min_value=0.0),
+                },
+                key=f"editor_promo_{promo_id}",
+            )
+
+            marcados = edit[edit["Incluir"] == True]  # noqa: E712
+            st.markdown(f"**{len(marcados)}** anúncio(s) selecionado(s).")
+
+            if len(marcados) and st.button("🚀 Incluir na campanha", type="primary"):
+                barra = st.progress(0.0)
+                ok_n, erros = 0, []
+                total = len(marcados)
+                for n, (_, row) in enumerate(marcados.iterrows(), start=1):
+                    iid = row["Anúncio"]
+                    offer_id = df_it.loc[df_it["Anúncio"] == iid, "offer_id"].iloc[0]
+                    preco_promo = None if sem_preco else float(row.get("Preço promo") or 0)
+                    ok, resp = promo_incluir_item(
+                        iid, token, promo_id, promo_type,
+                        deal_price=preco_promo, offer_id=offer_id)
+                    if ok:
+                        ok_n += 1
+                    else:
+                        erros.append(f"{iid}: {resp}")
+                    barra.progress(n / total)
+                _promo_limpar_cache()
+                if ok_n:
+                    st.success(f"✅ {ok_n} anúncio(s) incluído(s) na campanha.")
+                if erros:
+                    st.error("Falhas:")
+                    for e in erros:
+                        st.write(f"• {e}")
+                if ok_n and not erros:
+                    st.rerun()
+        else:
+            st.dataframe(df_it[["Anúncio", "Título", "SKU", "Estoque",
+                                "Preço atual", "Preço promo"]],
+                         use_container_width=True, hide_index=True)
+            iid_rm = st.selectbox("Remover anúncio da campanha:",
+                                  ["—"] + list(df_it["Anúncio"]), key="promo_rm_camp")
+            if iid_rm != "—" and st.button("🗑️ Remover da campanha"):
+                offer_id = df_it.loc[df_it["Anúncio"] == iid_rm, "offer_id"].iloc[0]
+                ok, msg = promo_remover_item(iid_rm, token, promo_id, promo_type, offer_id)
+                _promo_limpar_cache()
+                st.success("Removido.") if ok else st.error(msg)
+                if ok:
+                    st.rerun()
+
+    # ─────────────────────────────────────────────
+    # ABA 2 — MEUS ANÚNCIOS → PROMOÇÕES DISPONÍVEIS
+    # ─────────────────────────────────────────────
+    with aba2:
+        anuncios = promo_meus_anuncios(str(user_id), token)
+        if anuncios["erro"]:
+            st.error(anuncios["erro"])
+            return
+        itens = anuncios["itens"]
+        if not itens:
+            st.info("Nenhum anúncio ativo encontrado.")
+            return
+
+        busca = st.text_input("Buscar por título, MLB ou SKU", key="promo_busca")
+        lista = []
+        for iid, d in itens.items():
+            alvo = f'{iid} {d.get("title","")} {d.get("seller_custom_field","")}'.lower()
+            if busca and busca.lower() not in alvo:
+                continue
+            lista.append({"Anúncio": iid, "Título": (d.get("title") or "")[:70],
+                          "SKU": d.get("seller_custom_field") or "",
+                          "Preço": d.get("price"), "Estoque": d.get("available_quantity")})
+        df_an = pd.DataFrame(lista)
+        st.dataframe(df_an, use_container_width=True, hide_index=True, height=320)
+
+        if df_an.empty:
+            return
+        sel = st.selectbox("Ver promoções disponíveis para o anúncio:",
+                           df_an["Anúncio"].tolist(),
+                           format_func=lambda i: f'{i} — {itens.get(i, {}).get("title", "")[:50]}',
+                           key="promo_item_sel")
+
+        of = promo_ofertas_do_item(sel, token)
+        if of["erro"]:
+            st.error(of["erro"])
+            return
+        ofertas = of["ofertas"]
+        if not ofertas:
+            st.info("Este anúncio não tem promoções disponíveis nem ativas.")
+            return
+
+        preco_atual = float(itens.get(sel, {}).get("price") or 0)
+        for o in ofertas:
+            tipo = o.get("type") or o.get("promotion_type")
+            status = (o.get("status") or "").lower()
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([3, 2, 2])
+                with c1:
+                    st.markdown(f'**{o.get("name") or _promo_label(tipo)}**')
+                    st.caption(f'{_promo_label(tipo)} · status: {status or "-"} · id: {o.get("id")}')
+                with c2:
+                    st.caption(f'Início {_promo_data(o.get("start_date"))}')
+                    st.caption(f'Fim {_promo_data(o.get("finish_date"))}')
+                with c3:
+                    sug = o.get("suggested_discounted_price") or o.get("price")
+                    st.metric("Preço sugerido", f'R$ {float(sug):.2f}' if sug else "—")
+
+                chave = f'{sel}_{o.get("id")}_{tipo}'
+                if status in ("candidate", ""):
+                    if tipo in PROMO_SEM_PRECO:
+                        if st.button("Participar", key=f"btn_join_{chave}", type="primary"):
+                            ok, msg = promo_incluir_item(sel, token, o.get("id"), tipo,
+                                                         offer_id=o.get("offer_id"))
+                            _promo_limpar_cache()
+                            st.success("Incluído!") if ok else st.error(msg)
+                            if ok:
+                                st.rerun()
+                    else:
+                        cpa, cpb = st.columns([2, 1])
+                        with cpa:
+                            novo = st.number_input(
+                                "Preço promocional", min_value=0.0,
+                                value=float(o.get("suggested_discounted_price") or preco_atual),
+                                step=0.01, key=f"preco_{chave}")
+                        with cpb:
+                            st.write("")
+                            if st.button("Participar", key=f"btn_join_{chave}", type="primary"):
+                                ok, msg = promo_incluir_item(sel, token, o.get("id"), tipo,
+                                                            deal_price=novo,
+                                                            offer_id=o.get("offer_id"))
+                                _promo_limpar_cache()
+                                st.success("Incluído!") if ok else st.error(msg)
+                                if ok:
+                                    st.rerun()
+                else:
+                    if st.button("🗑️ Sair desta promoção", key=f"btn_out_{chave}"):
+                        ok, msg = promo_remover_item(sel, token, o.get("id"), tipo,
+                                                     o.get("offer_id"))
+                        _promo_limpar_cache()
+                        st.success("Removido.") if ok else st.error(msg)
+                        if ok:
+                            st.rerun()
+
+    # ─────────────────────────────────────────────
+    # ABA 3 — PARTICIPAÇÕES ATIVAS
+    # ─────────────────────────────────────────────
+    with aba3:
+        st.caption("Anúncios que já estão em campanhas (status started/pending).")
+        linhas = []
+        for c in campanhas:
+            if (c.get("status") or "").lower() in ("finished",):
+                continue
+            for st_i in ("started", "pending"):
+                d = promo_itens_da_campanha(c.get("id"), c.get("type"), token, status=st_i, limite=100)
+                for it in d["itens"]:
+                    linhas.append({
+                        "Campanha": c.get("name") or c.get("id"),
+                        "Tipo": _promo_label(c.get("type")),
+                        "Status": st_i,
+                        "Anúncio": it.get("id"),
+                        "Preço promo": it.get("price"),
+                        "Preço original": it.get("original_price"),
+                        "promotion_id": c.get("id"),
+                        "promotion_type": c.get("type"),
+                        "offer_id": it.get("offer_id"),
+                    })
+        if not linhas:
+            st.info("Nenhuma participação ativa no momento.")
+        else:
+            df_p = pd.DataFrame(linhas)
+            detalhes = promo_detalhes_itens(tuple(df_p["Anúncio"].dropna().unique()), token)
+            df_p["Título"] = df_p["Anúncio"].map(lambda i: (detalhes.get(i, {}).get("title") or "")[:60])
+            st.dataframe(df_p[["Campanha", "Tipo", "Status", "Anúncio", "Título",
+                               "Preço original", "Preço promo"]],
+                         use_container_width=True, hide_index=True)
+
+            st.markdown("##### Remover participação")
+            idx = st.selectbox("Selecione:", df_p.index,
+                               format_func=lambda i: f'{df_p.loc[i,"Anúncio"]} — {df_p.loc[i,"Campanha"]}',
+                               key="promo_rm_ativa")
+            if st.button("🗑️ Remover"):
+                r = df_p.loc[idx]
+                ok, msg = promo_remover_item(r["Anúncio"], token, r["promotion_id"],
+                                             r["promotion_type"], r["offer_id"])
+                _promo_limpar_cache()
+                st.success("Removido.") if ok else st.error(msg)
+                if ok:
+                    st.rerun()
+
+
 # =========================
 # DASHBOARD
 # =========================
@@ -2604,15 +3134,15 @@ nickname = get_user_info(str(user_id), token).get("nickname", "Vendedor")
 if "aba_ativa" not in st.session_state:
     st.session_state["aba_ativa"] = "financeiro"
 
-nav_cols = st.columns([3, 3, 2, 2, 2, 2, 3])
-abas = [("financeiro","📊 Operação ML"), ("shopee","🛍️ Operação Shopee"), ("custos","📦 Custos"), ("regime","🏛️ Regime"), ("caixa","💰 Caixa"), ("fechamento","📅 Fechamento")]
-for col, (aba_id, aba_label) in zip(nav_cols[:6], abas):
+nav_cols = st.columns([3, 3, 2, 2, 2, 2, 2, 2])
+abas = [("financeiro","📊 Operação ML"), ("shopee","🛍️ Operação Shopee"), ("custos","📦 Custos"), ("regime","🏛️ Regime"), ("caixa","💰 Caixa"), ("fechamento","📅 Fechamento"), ("promocoes","🏷️ Promoções")]
+for col, (aba_id, aba_label) in zip(nav_cols[:7], abas):
     with col:
         if st.button(aba_label, use_container_width=True,
                      type="primary" if st.session_state["aba_ativa"] == aba_id else "secondary"):
             st.session_state["aba_ativa"] = aba_id
             st.rerun()
-with nav_cols[6]:
+with nav_cols[7]:
     c1, c2 = st.columns([1,1])
     with c2:
         if st.button("🔓 Sair", use_container_width=True):
@@ -4839,3 +5369,9 @@ elif st.session_state["aba_ativa"] == "fechamento":
 # ══════════════════════════════════════════
 elif st.session_state["aba_ativa"] == "shopee":
     render_shopee(get_supabase(), user_id)
+
+# ══════════════════════════════════════════
+# ABA: PROMOÇÕES
+# ══════════════════════════════════════════
+elif st.session_state["aba_ativa"] == "promocoes":
+    render_promocoes(str(user_id), token)
