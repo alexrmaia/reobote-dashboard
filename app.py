@@ -2939,7 +2939,7 @@ def render_promocoes(user_id, token):
                     "Máx. permitido": st.column_config.NumberColumn(format="R$ %.2f"),
                     "Preço promo": st.column_config.NumberColumn(format="R$ %.2f", min_value=0.0),
                 },
-                key=f"editor_promo_{promo_id}",
+                key=f"editor_promo_{promo_id}_{promo_type}_{status_item}",
             )
 
             marcados = edit[edit["Incluir"] == True]  # noqa: E712
@@ -3026,7 +3026,7 @@ def render_promocoes(user_id, token):
             return
 
         preco_atual = float(itens.get(sel, {}).get("price") or 0)
-        for o in ofertas:
+        for pos, o in enumerate(ofertas):
             tipo = o.get("type") or o.get("promotion_type")
             status = (o.get("status") or "").lower()
             with st.container(border=True):
@@ -3041,7 +3041,9 @@ def render_promocoes(user_id, token):
                     sug = o.get("suggested_discounted_price") or o.get("price")
                     st.metric("Preço sugerido", f'R$ {float(sug):.2f}' if sug else "—")
 
-                chave = f'{sel}_{o.get("id")}_{tipo}'
+                # índice garante chave única mesmo se o ML devolver ofertas
+                # com o mesmo id/tipo (ou sem id) para o mesmo anúncio
+                chave = f'{sel}_{o.get("id") or "noid"}_{tipo or "notype"}_{o.get("offer_id") or ""}_{pos}'
                 if status in ("candidate", ""):
                     if tipo in PROMO_SEM_PRECO:
                         if st.button("Participar", key=f"btn_join_{chave}", type="primary"):
