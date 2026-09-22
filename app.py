@@ -5347,8 +5347,8 @@ elif st.session_state["aba_ativa"] == "fechamento":
             (m1, "Ticket médio",        f"R$ {ticket:,.2f}",     f"lucro/venda R$ {lucro/pedidos:.2f}" if pedidos else "–"),
             (m2, "Taxa de devolução",   f"{_taxa_devol:.1f}%",   f"{devolvidas_n} devol · {_total_coorte} total · {_taxa_cancel:.1f}% cancel"),
             (m3, "ADS (Product Ads)",   f"R$ {ads_cost:,.0f}",   f"{_ads_pct:.1f}% do faturamento"),
-            (m4, "Frete reverso",       f"R$ {frete_reverso:,.2f}" if frete_reverso is not None else "Não registrado",
-                                      "custo líquido após reembolsos" if frete_reverso is not None else "fechamento manual ou sem conciliação"),
+            (m4, "Frete reverso no fechamento", f"R$ {frete_reverso:,.2f}" if frete_reverso is not None else "Não registrado",
+                                      "diferença inferida; confira os pedidos" if frete_reverso is not None else "total por pedido não foi salvo"),
             (m5, "Margem líquida",      f"{margem:.1f}%",        f"lucro R$ {lucro:,.0f}"),
         ]:
             col.markdown(f"""
@@ -5359,6 +5359,45 @@ elif st.session_state["aba_ativa"] == "fechamento":
             </div>""", unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
+
+        with st.expander("Conferir fretes reversos por pedido"):
+            st.caption("Consulta a situação atual das devoluções de vendas feitas neste mês. "
+                       "Reembolsos posteriores podem diferir do fechamento salvo.")
+            if st.button("Consultar devoluções", key=f"conferir_reverso_{ano_mes}"):
+                inicio_mes = f"{ano_mes}-01T00:00:00.000-03:00"
+                fim_mes = f"{ano_mes}-{calendar.monthrange(ano, mes)[1]:02d}T23:59:59.000-03:00"
+                with st.spinner("Conferindo devoluções no Mercado Livre..."):
+                    pedidos_mes = get_orders(str(user_id), token, inicio_mes, fim_mes)
+                    reembolsos_mes = get_orders_reembolsados(pedidos_mes)
+                    ids_mes = tuple(sorted(str(o.get("id")) for o in pedidos_mes
+                        if o.get("status") == "cancelled" or str(o.get("id")) in reembolsos_mes))
+                    custos_mes = get_custos_devolucao(ids_mes, token[-8:] if token else "", token)
+                    envios_mes = tuple(sorted({o.get("shipping", {}).get("id") for o in pedidos_mes
+                                               if o.get("shipping", {}).get("id")}))
+                    info_envios_mes = fetch_shipments_batch(envios_mes, token[-8:] if token else "", token)
+                    linhas_mes = parse_orders(pedidos_mes, reembolsados=reembolsos_mes,
+                                              shipments_info=info_envios_mes,
+                                              custos_devolucao=custos_mes)
+                if linhas_mes.empty:
+                    st.info("Nenhum pedido encontrado neste mês.")
+                else:
+                    devol_mes = linhas_mes[linhas_mes["Categoria"] == "devolvida"]
+                    if devol_mes.empty:
+                        st.info("Nenhuma devolução identificada entre as vendas deste mês.")
+                    else:
+                        resumo_reverso = (devol_mes.groupby("Venda", as_index=False)
+                            .agg({"Frete": "sum", "Frete reverso original": "max",
+                                  "Situação frete reverso": "first",
+                                  "Frete reverso confirmado": "first"}))
+                        cobrados = resumo_reverso[(resumo_reverso["Frete"] > 0) &
+                                                  resumo_reverso["Frete reverso confirmado"]]
+                        st.metric("Fretes cobrados atualmente", f"{len(cobrados)} pedido(s) · R$ {cobrados['Frete'].sum():,.2f}")
+                        st.dataframe(resumo_reverso.rename(columns={
+                            "Venda": "Pedido", "Frete": "Custo líquido (R$)",
+                            "Frete reverso original": "Custo original (R$)",
+                            "Situação frete reverso": "Situação",
+                            "Frete reverso confirmado": "Confirmado pela API",
+                        }), hide_index=True, use_container_width=True)
 
         # DRE + Histórico lado a lado
         col_dre, col_hist = st.columns(2)
