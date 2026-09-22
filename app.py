@@ -5271,6 +5271,17 @@ elif st.session_state["aba_ativa"] == "fechamento":
         custos      = float(d.get("custo_produto", 0))
         impostos    = float(d.get("impostos", 0))
         lucro       = float(d.get("lucro_liquido", 0))
+        # Fechamentos automáticos guardam o lucro já descontado do frete reverso,
+        # mas a coluna frete_ml contém somente o frete de ida. A diferença
+        # concilia o custo reverso líquido, inclusive nos meses já fechados.
+        # Fechamentos manuais não têm essa separação e não permitem inferi-la.
+        frete_reverso = None
+        if "devolvidas" in d and "ads_cost" in d:
+            diferenca_frete = round(
+                fat - tarifas - fretes - ads_cost - custos - impostos - lucro, 2
+            )
+            if diferenca_frete >= -0.01:
+                frete_reverso = max(diferenca_frete, 0.0)
         margem      = float(d.get("margem", 0))
         pedidos     = int(d.get("pedidos", 0))
         canceladas_n = int(d.get("canceladas", 0))
@@ -5331,12 +5342,14 @@ elif st.session_state["aba_ativa"] == "fechamento":
         _taxa_devol   = (devolvidas_n / _total_coorte * 100) if _total_coorte else 0
         _taxa_cancel  = (canceladas_n / _total_coorte * 100) if _total_coorte else 0
         _ads_pct = (ads_cost / fat * 100) if fat else 0
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         for col, label, val, sub in [
             (m1, "Ticket médio",        f"R$ {ticket:,.2f}",     f"lucro/venda R$ {lucro/pedidos:.2f}" if pedidos else "–"),
             (m2, "Taxa de devolução",   f"{_taxa_devol:.1f}%",   f"{devolvidas_n} devol · {_total_coorte} total · {_taxa_cancel:.1f}% cancel"),
             (m3, "ADS (Product Ads)",   f"R$ {ads_cost:,.0f}",   f"{_ads_pct:.1f}% do faturamento"),
-            (m4, "Margem líquida",      f"{margem:.1f}%",        f"lucro R$ {lucro:,.0f}"),
+            (m4, "Frete reverso",       f"R$ {frete_reverso:,.2f}" if frete_reverso is not None else "Não registrado",
+                                      "custo líquido após reembolsos" if frete_reverso is not None else "fechamento manual ou sem conciliação"),
+            (m5, "Margem líquida",      f"{margem:.1f}%",        f"lucro R$ {lucro:,.0f}"),
         ]:
             col.markdown(f"""
             <div style='background:#F8FAFC;border-radius:12px;padding:14px 16px;'>
