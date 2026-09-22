@@ -5,6 +5,11 @@ import altair as alt
 from datetime import datetime, timedelta, date
 import urllib.parse
 from supabase import create_client, Client
+from st_click_detector import click_detector
+import hashlib
+import hmac
+import time
+from typing import Any, Callable, Iterable
 
 # =========================
 # CONFIG
@@ -91,10 +96,17 @@ def save_regime(user_id, row):
 
 def load_fifo_consumo(user_id):
     sb = get_supabase()
-    resp = sb.table("fifo_consumo").select("*").eq("user_id", user_id).execute()
-    if not resp.data:
-        return {}
-    return {r["venda_id"]: r for r in resp.data}
+    out = {}
+    offset, page = 0, 1000
+    while True:
+        resp = sb.table("fifo_consumo").select("*").eq("user_id", user_id).range(offset, offset + page - 1).execute()
+        rows = resp.data or []
+        for r in rows:
+            out[r["venda_id"]] = r
+        if len(rows) < page:
+            break
+        offset += page
+    return out
 
 def load_correcoes(user_id):
     sb = get_supabase()
@@ -131,6 +143,59 @@ def save_capital(user_id, row):
         sb.table("capital_investido").update(row).eq("id", row["id"]).execute()
     else:
         sb.table("capital_investido").insert(row).execute()
+
+# --- Snapshots dos sensores ocultos da conta ML (para detectar mudanças) ---
+# Tabela sugerida no Supabase: sensores_conta
+#   colunas: user_id (text), data (date), snapshot (jsonb)
+#   chave única: (user_id, data)  -> 1 snapshot por dia
+def load_sensores_hist(user_id, limite=60):
+    sb = get_supabase()
+    resp = (sb.table("sensores_conta").select("*")
+            .eq("user_id", user_id).order("data", desc=True).limit(limite).execute())
+    if not resp.data:
+        return pd.DataFrame(columns=["data", "snapshot"])
+    df = pd.DataFrame(resp.data)
+    df["data"] = pd.to_datetime(df["data"], errors="coerce")
+    return df.sort_values("data")
+
+def salvar_snapshot_sensores(user_id, snapshot):
+    """Grava (ou atualiza) o snapshot de HOJE. Idempotente: upsert por (user_id, data)."""
+    from datetime import date as _date
+    import json as _json
+    sb = get_supabase()
+    hoje = _date.today().strftime("%Y-%m-%d")
+    try:
+        sb.table("sensores_conta").upsert(
+            {"user_id": user_id, "data": hoje, "snapshot": _json.dumps(snapshot, ensure_ascii=False)},
+            on_conflict="user_id,data").execute()
+    except Exception:
+        pass
+
+def detectar_mudancas_sensores(hist_df, snapshot_atual):
+    """
+    Compara o snapshot atual com o último snapshot DIFERENTE de hoje.
+    Retorna dict {campo: {"de": x, "para": y, "quando": data}} só dos que mudaram.
+    """
+    import json as _json
+    if hist_df is None or hist_df.empty:
+        return {}
+    from datetime import date as _date
+    hoje = pd.Timestamp(_date.today())
+    anteriores = hist_df[hist_df["data"] < hoje]
+    if anteriores.empty:
+        return {}
+    ultimo = anteriores.iloc[-1]
+    try:
+        prev = _json.loads(ultimo["snapshot"]) if isinstance(ultimo["snapshot"], str) else ultimo["snapshot"]
+    except Exception:
+        return {}
+    mudancas = {}
+    for k, v_atual in snapshot_atual.items():
+        v_ant = prev.get(k)
+        if v_ant != v_atual:
+            mudancas[k] = {"de": v_ant, "para": v_atual,
+                           "quando": ultimo["data"].strftime("%d/%m")}
+    return mudancas
 
 # =========================
 # OAUTH
@@ -174,9 +239,219 @@ def save_token(data):
 # =========================
 @st.cache_data(ttl=300, show_spinner=False)
 def get_user_info(user_id, token):
-    resp = requests.get(f"{ML_API_BASE}/users/{user_id}",
-                        headers={"Authorization": f"Bearer {token}"}, timeout=15)
-    return resp.json() if resp.status_code == 200 else {}
+    headers = {"Authorization": f"Bearer {token}"}
+    # 1) tenta pelo id informado, se houver
+    if user_id:
+        try:
+            resp = requests.get(f"{ML_API_BASE}/users/{user_id}", headers=headers, timeout=15)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+    # 2) fallback: /users/me retorna a conta dona do token (não depende do user_id da sessão)
+    try:
+        resp = requests.get(f"{ML_API_BASE}/users/me", headers=headers, timeout=15)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return {}
+
+def extrair_marcadores_conta(info):
+    """
+    Extrai da resposta de /users/{id} os marcadores internos de classificação
+    da conta no ML. Retorna dict pronto para exibir como tags.
+    Campos podem vir ausentes dependendo do tipo/país da conta.
+    """
+    rep = info.get("seller_reputation", {}) or {}
+    metrics = rep.get("metrics", {}) or {}
+    credit = info.get("credit", {}) or {}
+    return {
+        "seller_experience": info.get("seller_experience"),      # ex.: NEWBIE, INTERMEDIATE, ADVANCED
+        "level_id":          rep.get("level_id"),                # ex.: 5_green, None (=conta nova)
+        "power_seller_status": rep.get("power_seller_status"),   # Silver/Gold/Platinum (MercadoLíder)
+        "points":            info.get("points"),                 # placar interno
+        "user_type":         info.get("user_type"),              # normal, brand, etc.
+        "tags":              info.get("tags", []) or [],         # brand_new, mshops, normal...
+        "site_status":       (info.get("status", {}) or {}).get("site_status"),
+        "credit_rank":       credit.get("rank"),                 # newbie... (motor de crédito)
+        "credit_level_id":   credit.get("credit_level_id"),      # ex.: MLB5
+        "transactions_total": (rep.get("transactions", {}) or {}).get("total"),
+        "claims_rate":       (metrics.get("claims", {}) or {}).get("rate"),
+        "delayed_rate":      (metrics.get("delayed_handling_time", {}) or {}).get("rate"),
+        "cancel_rate":       (metrics.get("cancellations", {}) or {}).get("rate"),
+    }
+
+def montar_snapshot_sensores(mk):
+    """Só os sensores que valem vigiar ao longo do tempo (invisíveis na plataforma)."""
+    return {
+        "seller_experience": mk.get("seller_experience"),
+        "credit_rank":       mk.get("credit_rank"),
+        "credit_level_id":   mk.get("credit_level_id"),
+        "claims_rate":       mk.get("claims_rate"),
+        "delayed_rate":      mk.get("delayed_rate"),
+        "cancel_rate":       mk.get("cancel_rate"),
+    }
+
+def _mapa_cor(level_id):
+    """Traduz o level_id do ML (ex.: 5_green) para o rótulo do velocímetro de cor."""
+    m = {
+        "1_red": "1 Red", "2_orange": "2 Orange", "3_yellow": "3 Yellow",
+        "4_light_green": "4 L.Green", "5_green": "5 Green",
+    }
+    return m.get(str(level_id), "—")
+
+def _svg_estagios(titulo, estagios, atual, mudou=False):
+    """Velocímetro de estágios (régua ordinal): trilha com paradas, a atual destacada."""
+    n = len(estagios)
+    try:
+        idx = [e.upper() for e in estagios].index(str(atual).upper()) if atual else -1
+    except ValueError:
+        idx = -1
+    W, H, pad = 300, 74, 16
+    step = (W - 2 * pad) / max(n - 1, 1)
+    dots = ""
+    for i, nome in enumerate(estagios):
+        cx = pad + i * step
+        ativo = (i == idx)
+        cor = "#7C3AED" if ativo else "#D9D5E8"
+        r = 11 if ativo else 7
+        dots += f'<circle cx="{cx:.0f}" cy="30" r="{r}" fill="{cor}"/>'
+        peso = "800" if ativo else "500"
+        corT = "#4C1D95" if ativo else "#9CA3AF"
+        dots += (f'<text x="{cx:.0f}" y="62" text-anchor="middle" '
+                 f'font-size="10" font-weight="{peso}" fill="{corT}">{nome}</text>')
+    linha = f'<line x1="{pad}" y1="30" x2="{W-pad}" y2="30" stroke="#E5E1F0" stroke-width="3"/>'
+    if idx > 0:
+        xfim = pad + idx * step
+        linha += f'<line x1="{pad}" y1="30" x2="{xfim:.0f}" y2="30" stroke="#7C3AED" stroke-width="3"/>'
+    seta = ""
+    if mudou:
+        seta = f'<text x="{W-pad}" y="14" text-anchor="end" font-size="11" fill="#D97706" font-weight="800">▲ mudou</text>'
+    return (f'<div style="background:#fff;border:1px solid #EEE;border-radius:14px;padding:10px 6px 4px;">'
+            f'<div style="font-size:11px;font-weight:800;color:#6B7280;padding-left:12px;">{titulo}</div>'
+            f'<svg viewBox="0 0 {W} {H}" width="100%" height="{H}">{linha}{dots}{seta}</svg></div>')
+
+def _svg_gauge_meta(titulo, valor_rate, teto_verde, teto_amarelo):
+    """
+    Barra com zona verde/amarela/vermelha e ponteiro. valor_rate e tetos em fração (0-1).
+    Mostra o fôlego: quanto você usa do limite antes de cair de faixa.
+    """
+    try:
+        v = float(valor_rate or 0)
+    except Exception:
+        v = 0.0
+    escala = max(teto_amarelo * 1.4, v * 1.2, 0.0001)
+    W, H = 300, 58
+    pad = 12
+    largura = W - 2 * pad
+    def x(frac): return pad + min(frac / escala, 1.0) * largura
+    xv = x(teto_verde); xa = x(teto_amarelo); xp = x(v)
+    barra = (f'<rect x="{pad}" y="20" width="{largura}" height="12" rx="6" fill="#FEE2E2"/>'
+             f'<rect x="{pad}" y="20" width="{xa-pad:.0f}" height="12" rx="6" fill="#FEF3C7"/>'
+             f'<rect x="{pad}" y="20" width="{xv-pad:.0f}" height="12" rx="6" fill="#DCFCE7"/>')
+    ponteiro = (f'<line x1="{xp:.0f}" y1="14" x2="{xp:.0f}" y2="38" stroke="#111827" stroke-width="2.5"/>'
+                f'<circle cx="{xp:.0f}" cy="14" r="3.5" fill="#111827"/>')
+    pct = f"{v*100:.2f}%"
+    dentro_verde = v <= teto_verde
+    cor_val = "#16A34A" if dentro_verde else ("#D97706" if v <= teto_amarelo else "#DC2626")
+    return (f'<div style="background:#fff;border:1px solid #EEE;border-radius:14px;padding:10px 6px 6px;">'
+            f'<div style="display:flex;justify-content:space-between;padding:0 12px;">'
+            f'<span style="font-size:11px;font-weight:800;color:#6B7280;">{titulo}</span>'
+            f'<span style="font-size:13px;font-weight:900;color:{cor_val};">{pct}</span></div>'
+            f'<svg viewBox="0 0 {W} {H}" width="100%" height="{H}">{barra}{ponteiro}</svg></div>')
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_saude_anuncios(user_id, token):
+    """
+    Conta anúncios por estado de saúde (reputation_health_gauge), MAS cruzando
+    com status=active — porque um anúncio pausado aparece como 'perdendo exposição'
+    por definição (não é problema, é intencional). Só interessa o que está ATIVO
+    E perdendo exposição ao mesmo tempo. Rápido: usa paging.total.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    resultado = {"healthy": None, "warning": None, "unhealthy": None,
+                 "ids_unhealthy": [], "ids_warning": [], "erro": None,
+                 "unhealthy_ativos": None, "warning_ativos": None,
+                 "ids_unhealthy_ativos": [], "ids_warning_ativos": []}
+    for gauge in ("healthy", "warning", "unhealthy"):
+        try:
+            # total geral do gauge (inclui pausados)
+            r = requests.get(f"{ML_API_BASE}/users/{user_id}/items/search",
+                             headers=headers,
+                             params={"reputation_health_gauge": gauge, "limit": 50, "offset": 0},
+                             timeout=20)
+            if r.status_code != 200:
+                resultado["erro"] = f"HTTP {r.status_code} em {gauge}"
+                continue
+            data = r.json()
+            resultado[gauge] = data.get("paging", {}).get("total", 0)
+            if gauge in ("unhealthy", "warning"):
+                resultado[f"ids_{gauge}"] = data.get("results", [])[:50]
+                # agora só os ATIVOS desse gauge (o que realmente importa)
+                ra = requests.get(f"{ML_API_BASE}/users/{user_id}/items/search",
+                                  headers=headers,
+                                  params={"reputation_health_gauge": gauge,
+                                          "status": "active", "limit": 50, "offset": 0},
+                                  timeout=20)
+                if ra.status_code == 200:
+                    da = ra.json()
+                    resultado[f"{gauge}_ativos"] = da.get("paging", {}).get("total", 0)
+                    resultado[f"ids_{gauge}_ativos"] = da.get("results", [])[:50]
+        except Exception as e:
+            resultado["erro"] = str(e)
+    return resultado
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_item_cru(item_id, token):
+    """Lê o /items/{id} (recurso que existe) e devolve os campos de qualidade/estado."""
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        r = requests.get(f"{ML_API_BASE}/items/{item_id}",
+                         headers=headers,
+                         params={"include_attributes": "all"}, timeout=15)
+        if r.status_code != 200:
+            return {"item_id": item_id, "erro": f"HTTP {r.status_code}"}
+        d = r.json()
+        return {
+            "item_id": item_id,
+            "title": d.get("title"),
+            "status": d.get("status"),
+            "sub_status": d.get("sub_status"),
+            "tags": d.get("tags"),
+            "health": d.get("health"),
+            "catalog_listing": d.get("catalog_listing"),
+            "erro": None,
+        }
+    except Exception as e:
+        return {"item_id": item_id, "erro": str(e)}
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_itens_por_filtro_qualidade(user_id, token):
+    """
+    Usa filtros da busca de itens (que funcionam nesta conta) para achar causas
+    de perda de exposição, sem depender de endpoints /health por item.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    achados = {}
+    filtros = {
+        "incomplete_technical_specs": {"tags": "incomplete_technical_specs"},
+        "missing_product_identifiers": {"missing_product_identifiers": "true"},
+    }
+    for nome, params in filtros.items():
+        try:
+            p = {**params, "limit": 50}
+            r = requests.get(f"{ML_API_BASE}/users/{user_id}/items/search",
+                             headers=headers, params=p, timeout=20)
+            if r.status_code == 200:
+                data = r.json()
+                achados[nome] = {"total": data.get("paging", {}).get("total", 0),
+                                 "ids": data.get("results", [])[:50]}
+            else:
+                achados[nome] = {"erro": f"HTTP {r.status_code}"}
+        except Exception as e:
+            achados[nome] = {"erro": str(e)}
+    return achados
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_orders(user_id, token, date_from, date_to):
@@ -216,67 +491,589 @@ def get_orders_reembolsados(orders):
             reembolsadas[order_id] = reembolsado
     return reembolsadas
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_claims_por_pedidos(order_ids_tuple, token_hash, token):
+    """
+    Busca as reclamações (claims) de uma lista de pedidos — uma chamada por pedido,
+    em paralelo (mesmo padrão de fetch_shipments_batch: ThreadPoolExecutor).
+
+    Por quê pedido a pedido em vez de um filtro único por vendedor+período?
+    Testamos /post-purchase/v1/claims/search com players.role + players.user_id +
+    date_created.from/.to (parâmetros documentados em espelhos regionais do dev center)
+    e a API devolveu "atLeastOneFilterProvided" — ou seja, nenhum desses nomes foi
+    reconhecido como filtro válido. O par resource=order + resource_id={pedido} é a
+    combinação mais consistente entre as fontes oficiais, e como já temos a lista de
+    pedidos do período (via /orders/search), não precisamos de um filtro por data aqui.
+
+    Cache de 30 min (em vez de 5) porque reclamação é evento raro e isso corta bastante
+    o volume de chamadas repetidas — o principal motivo de bater rate limit (429) era
+    refazer todas essas centenas de chamadas a cada 5 min de recarregamento da página.
+
+    Rate limit (429): tenta de novo até 3x por pedido, com espera progressiva
+    (respeitando o header Retry-After da API quando ele vem, senão 1s/2s/4s), e reduz
+    a concorrência pra não estourar de novo.
+
+    Retorna: (dict {order_id: [claims]}, erro_amostra, n_falhas) — erro_amostra é o
+    texto bruto de uma falha (a última encontrada) pra debug, e n_falhas é a contagem
+    exata de pedidos que não puderam ser verificados, mesmo depois das tentativas.
+    """
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    if not order_ids_tuple:
+        return {}, None, 0
+    headers = {"Authorization": f"Bearer {token}"}
+
+    def fetch_one(oid):
+        ultimo_erro = None
+        for tentativa in range(3):
+            try:
+                resp = requests.get(f"{ML_API_BASE}/post-purchase/v1/claims/search", headers=headers, params={
+                    "resource": "order", "resource_id": oid, "limit": 50, "offset": 0,
+                }, timeout=15)
+            except Exception as e:
+                ultimo_erro = f"Falha de conexão (pedido {oid}): {e}"
+                time.sleep(2 ** tentativa)
+                continue
+            if resp.status_code == 429:
+                ultimo_erro = f"HTTP 429 (pedido {oid}): rate limit"
+                espera = float(resp.headers.get("Retry-After", 2 ** tentativa))
+                time.sleep(espera)
+                continue
+            if resp.status_code != 200:
+                return oid, [], f"HTTP {resp.status_code} (pedido {oid}): {resp.text[:300]}"
+            data    = resp.json()
+            results = data.get("data") or data.get("results") or []
+            return oid, results, None
+        return oid, [], ultimo_erro
+
+    out, erro_amostra, n_falhas = {}, None, 0
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for future in as_completed({ex.submit(fetch_one, oid): oid for oid in order_ids_tuple}):
+            oid, results, erro = future.result()
+            if erro:
+                n_falhas += 1
+                erro_amostra = erro
+            elif results:
+                out[oid] = results
+    return out, erro_amostra, n_falhas
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fretes_batch(shipping_ids_tuple, token_hash, token):
+    """
+    Retorna dict {shipping_id: custo_frete (float)}.
+    Mantido para compatibilidade — usa internamente fetch_shipments_batch.
+    """
+    full = fetch_shipments_batch(shipping_ids_tuple, token_hash, token)
+    return {sid: info.get("cost", 0.0) for sid, info in full.items()}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_shipments_batch(shipping_ids_tuple, token_hash, token):
+    """
+    Busca shipments em paralelo. Retorna dict {sid: {"cost": float, "status": str, "reverse_fee": float}}.
+    Uma única função para evitar chamar /shipments/{id} duas vezes.
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     if not shipping_ids_tuple:
         return {}
     headers = {"Authorization": f"Bearer {token}"}
     def fetch_one(sid):
         try:
-            # /shipments/{id}/costs retorna senders[0].cost = custo real do vendedor
-            resp = requests.get(f"{ML_API_BASE}/shipments/{sid}/costs", headers=headers, timeout=15)
-            if resp.status_code == 200:
-                senders = resp.json().get("senders", [])
-                if senders:
-                    return sid, float(senders[0].get("cost", 0) or 0)
-            # Fallback: /shipments/{id} com shipping_option.cost (menos preciso)
             resp = requests.get(f"{ML_API_BASE}/shipments/{sid}", headers=headers, timeout=15)
             if resp.status_code != 200:
-                return sid, 0.0
-            opt = resp.json().get("shipping_option", {})
-            cost = opt.get("cost") or opt.get("base_cost") or opt.get("list_cost") or 0
-            return sid, float(cost)
+                return sid, {"cost": 0.0, "status": "", "reverse_fee": 0.0}
+            data = resp.json()
+            opt  = data.get("shipping_option", {}) or {}
+            lc   = float(opt.get("list_cost") or 0)
+            ec   = float(opt.get("cost") or 0)
+            cost = max(lc - ec, 0)
+            status = (data.get("status") or "").lower()
+            ret    = data.get("return_details", {}) or {}
+            rev_fee = float(ret.get("reverse_shipping_fee") or 0)
+            return sid, {"cost": cost, "status": status, "reverse_fee": rev_fee}
         except:
-            return sid, 0.0
-    fretes = {}
+            return sid, {"cost": 0.0, "status": "", "reverse_fee": 0.0}
+    out = {}
     with ThreadPoolExecutor(max_workers=10) as ex:
         for future in as_completed({ex.submit(fetch_one, sid): sid for sid in shipping_ids_tuple}):
-            sid, custo = future.result()
-            fretes[sid] = custo
-    return fretes
+            sid, info = future.result()
+            out[sid] = info
+    return out
 
-def parse_orders(orders, fretes=None, reembolsados=None):
-    fretes       = fretes or {}
-    reembolsados = reembolsados or {}
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_advertiser_id(token_hash, token):
+    """Descobre o advertiser_id vinculado ao token. Cache de 24h (raramente muda)."""
+    try:
+        resp = requests.get(
+            f"{ML_API_BASE}/advertising/advertisers",
+            headers={"Authorization": f"Bearer {token}", "api-version": "1"},
+            params={"product_id": "PADS"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        advs = data.get("advertisers") or data.get("results") or []
+        if advs and isinstance(advs, list):
+            return advs[0].get("advertiser_id") or advs[0].get("id")
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_ads_cost(advertiser_id, token_hash, token, date_from_ymd, date_to_ymd):
+    """
+    Busca o gasto total em Product Ads no período.
+    date_from_ymd / date_to_ymd no formato 'YYYY-MM-DD'.
+    Range máximo da API: 90 dias.
+    Retorna float (R$).
+    
+    NOTA: endpoint legado foi depreciado em 27/mai/2026. Novo path:
+    /marketplace/advertising/{SITE_ID}/advertisers/{advertiser_id}/product_ads/campaigns/search
+    """
+    if not advertiser_id:
+        return 0.0
+    _SITE_ID = "MLB"  # Brasil
+    try:
+        resp = requests.get(
+            f"{ML_API_BASE}/marketplace/advertising/{_SITE_ID}/advertisers/{advertiser_id}/product_ads/campaigns/search",
+            headers={"Authorization": f"Bearer {token}", "api-version": "2"},
+            params={
+                "date_from": date_from_ymd,
+                "date_to": date_to_ymd,
+                "metrics": "cost",
+                "metrics_summary": "true",
+                "limit": 50,
+                "offset": 0,
+            },
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return 0.0
+        data = resp.json()
+        results = data.get("results", []) or []
+        if results:
+            return float(sum((c.get("metrics", {}) or {}).get("cost", 0) or 0 for c in results))
+        summary = data.get("metrics_summary") or {}
+        return float(summary.get("cost") or 0)
+    except Exception:
+        return 0.0
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_recebimentos_futuros(user_id, token_hash, token):
+    """
+    Busca orders aprovadas dos últimos 90 dias, coleta os payment IDs,
+    e chama /collections/{id} em paralelo pra pegar money_release_date + net_received_amount.
+    Retorna DataFrame com colunas: data (date), valor (float).
+    Só datas >= hoje (ou seja, dinheiro AINDA A LIBERAR).
+    """
+    from datetime import datetime, date, timedelta
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import zoneinfo
+    _tz = zoneinfo.ZoneInfo("America/Sao_Paulo")
+    _hoje = datetime.now(_tz).date()
+    _from = (_hoje - timedelta(days=90)).strftime("%Y-%m-%dT00:00:00.000-03:00")
+    _to   = (_hoje + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00.000-03:00")
+
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 1) Buscar orders + coletar payment IDs
+    payment_ids = []
+    offset, limit = 0, 50
+    while True:
+        try:
+            r = requests.get(f"{ML_API_BASE}/orders/search",
+                headers=headers,
+                params={"seller": user_id,
+                        "order.date_created.from": _from,
+                        "order.date_created.to": _to,
+                        "sort": "date_desc",
+                        "offset": offset, "limit": limit},
+                timeout=30)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            res = data.get("results", []) or []
+            for o in res:
+                if o.get("status") == "cancelled":
+                    continue
+                for pay in (o.get("payments") or []):
+                    if (pay.get("status") or "").lower() in ("approved", "authorized", "in_process"):
+                        payment_ids.append(pay.get("id"))
+            offset += limit
+            if offset >= data.get("paging", {}).get("total", 0) or not res:
+                break
+        except Exception:
+            break
+
+    payment_ids = list({p for p in payment_ids if p})
+
+    # 2) Buscar /collections/{id} em paralelo
+    def _fetch_one(pid):
+        try:
+            resp = requests.get(f"{ML_API_BASE}/collections/{pid}", headers=headers, timeout=15)
+            if resp.status_code != 200:
+                return None
+            d = resp.json()
+            release_iso = d.get("money_release_date")
+            net_val     = float(d.get("net_received_amount") or 0)
+            if not release_iso or net_val <= 0:
+                return None
+            try:
+                release_dt = pd.to_datetime(release_iso).tz_convert(_tz).date()
+            except Exception:
+                try:
+                    release_dt = pd.to_datetime(release_iso).date()
+                except Exception:
+                    return None
+            if release_dt < _hoje:
+                return None
+            return (release_dt, net_val)
+        except Exception:
+            return None
+
     rows = []
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs = {ex.submit(_fetch_one, pid): pid for pid in payment_ids}
+        for f in as_completed(futs):
+            r = f.result()
+            if r:
+                rows.append({"data": r[0], "valor": r[1]})
+
+    if not rows:
+        return pd.DataFrame(columns=["data", "valor"])
+    df = pd.DataFrame(rows)
+    df = df.groupby("data", as_index=False)["valor"].sum().sort_values("data")
+    return df
+
+def get_repasses_passados(user_id, token_hash, token, dias=15):
+    """
+    Repasses (net_received_amount) que JÁ foram liberados nos últimos `dias`.
+    Mesma mecânica de get_recebimentos_futuros, mas com money_release_date no
+    passado. Base para a média móvel usada no Caixa Projetado.
+    Retorna DataFrame: data (date), valor (float), agrupado por dia.
+    """
+    from datetime import datetime, timedelta
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import zoneinfo
+    _tz = zoneinfo.ZoneInfo("America/Sao_Paulo")
+    _hoje = datetime.now(_tz).date()
+    _ini  = _hoje - timedelta(days=dias)
+    _from = (_hoje - timedelta(days=dias + 20)).strftime("%Y-%m-%dT00:00:00.000-03:00")
+    _to   = (_hoje + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00.000-03:00")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    payment_ids = []
+    offset, limit = 0, 50
+    while True:
+        try:
+            r = requests.get(f"{ML_API_BASE}/orders/search", headers=headers,
+                params={"seller": user_id, "order.date_created.from": _from,
+                        "order.date_created.to": _to, "sort": "date_desc",
+                        "offset": offset, "limit": limit}, timeout=30)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            res = data.get("results", []) or []
+            for o in res:
+                if o.get("status") == "cancelled":
+                    continue
+                for pay in (o.get("payments") or []):
+                    if (pay.get("status") or "").lower() in ("approved", "authorized"):
+                        payment_ids.append(pay.get("id"))
+            offset += limit
+            if offset >= data.get("paging", {}).get("total", 0) or not res:
+                break
+        except Exception:
+            break
+
+    payment_ids = list({p for p in payment_ids if p})
+
+    def _fetch_one(pid):
+        try:
+            resp = requests.get(f"{ML_API_BASE}/collections/{pid}", headers=headers, timeout=15)
+            if resp.status_code != 200:
+                return None
+            d = resp.json()
+            release_iso = d.get("money_release_date")
+            net_val     = float(d.get("net_received_amount") or 0)
+            status      = (d.get("status") or "").lower()
+            # só repasses de venda liberados (ignora estornos/chargebacks/reembolsos)
+            if not release_iso or net_val <= 0 or status not in ("approved", "accredited"):
+                return None
+            try:
+                release_dt = pd.to_datetime(release_iso).tz_convert(_tz).date()
+            except Exception:
+                release_dt = pd.to_datetime(release_iso).date()
+            if release_dt < _ini or release_dt >= _hoje:   # só os últimos `dias`, no passado
+                return None
+            return (release_dt, net_val)
+        except Exception:
+            return None
+
+    rows = []
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs = {ex.submit(_fetch_one, pid): pid for pid in payment_ids}
+        for f in as_completed(futs):
+            res = f.result()
+            if res:
+                rows.append({"data": res[0], "valor": res[1]})
+
+    if not rows:
+        return pd.DataFrame(columns=["data", "valor"])
+    df = pd.DataFrame(rows).groupby("data", as_index=False)["valor"].sum().sort_values("data")
+    return df
+
+
+def projetar_caixa(caixa_inicial, piso_diario, saidas_por_dia=None, horizonte_dias=30):
+    """
+    Projeção de PISO: aplica um mesmo valor diário conservador (piso_diario) para
+    todos os dias do horizonte, somando ao caixa e descontando as contas datadas.
+    É a linha 'minimamente garantida' — na prática tende a vir mais que o projetado.
+
+    caixa_inicial : saldo em conta hoje.
+    piso_diario   : média móvel dos últimos 15 dias corridos x haircut (ex.: 78%).
+    saidas_por_dia: dict {date: valor} com parcelas, DAS, etc.
+    Retorna DataFrame com entra, sai, fluxo e saldo por dia.
+    """
+    from datetime import date as _date, timedelta
+    saidas_por_dia = saidas_por_dia or {}
+    hoje = _date.today()
+    linhas, saldo = [], float(caixa_inicial)
+    for i in range(horizonte_dias):
+        d = hoje + timedelta(days=i)
+        entra = float(piso_diario)
+        sai   = float(saidas_por_dia.get(d, 0.0))
+        saldo += entra - sai
+        linhas.append({"data": d, "entra": entra, "sai": sai,
+                       "fluxo": entra - sai, "saldo": saldo})
+    return pd.DataFrame(linhas)
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_custos_devolucao(order_ids_tuple, token_hash, token):
+    """Custo efetivamente cobrado do vendedor por pedido devolvido."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not order_ids_tuple:
+        return {}
+    claims, _, _ = get_claims_por_pedidos(order_ids_tuple, token_hash, token)
+    headers = {"Authorization": f"Bearer {token}"}
+    tarefas = []
+    for order_id, items in claims.items():
+        for claim in items:
+            claim_id = claim.get("id")
+            if claim_id:
+                tarefas.append((order_id, claim_id))
+
+    def consultar(tarefa):
+        order_id, claim_id = tarefa
+        try:
+            resp = requests.get(
+                f"{ML_API_BASE}/post-purchase/v1/claims/{claim_id}/charges/return-cost",
+                headers=headers, timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("currency_id") == "BRL":
+                    return order_id, max(float(data.get("amount") or 0), 0), True
+        except (requests.RequestException, ValueError, TypeError):
+            pass
+        return order_id, 0.0, False
+
+    custos = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for future in as_completed([executor.submit(consultar, t) for t in tarefas]):
+            order_id, amount, confirmado = future.result()
+            if confirmado:
+                custos[order_id] = custos.get(order_id, 0.0) + amount
+    return custos
+
+
+def parse_orders(orders, fretes=None, reembolsados=None, shipments_info=None, custos_devolucao=None):
+    import pandas as pd
+    
+    fretes         = fretes or {}
+    reembolsados   = reembolsados or {}
+    shipments_info = shipments_info or {}
+    custos_devolucao = custos_devolucao or {}
+    rows = []
+    
+    # Status de envio que indicam que o produto SAIU e foi DEVOLVIDO (alinhado com painel ML)
+    # not_delivered fica fora — ML conta como cancelamento (não chegou no destinatário)
+    _SHIPPED_STATUSES = {"shipped", "delivered", "ready_to_ship"}
+    
     for order in orders:
         order_id    = order.get("id", "")
         status      = order.get("status", "")
         date        = pd.to_datetime(order.get("date_created", ""), errors="coerce")
-        shipping_id = order.get("shipping", {}).get("id", 0)
+        shipping    = order.get("shipping", {}) or {}
+        shipping_id = shipping.get("id", 0)
+        # Prioriza shipping.status do shipments_info (vem do /shipments), fallback pro embedded
+        _sinfo      = shipments_info.get(shipping_id, {}) if shipping_id else {}
+        ship_status = (_sinfo.get("status") or shipping.get("status") or "").lower()
+        rev_fee     = float(_sinfo.get("reverse_fee") or 0)
         paid_amount = float(order.get("paid_amount") or 0)
         reemb_val   = float(reembolsados.get(str(order_id), 0) or 0)
+        
         # Cancelada = status cancelled OU reembolso total (>= 90% do valor pago)
         cancelada   = status in ["cancelled"] or (reemb_val > 0 and paid_amount > 0 and reemb_val >= paid_amount * 0.9)
-        for item in order.get("order_items", []):
+        
+        # Categoria: aprovada / cancelada (não saiu) / devolvida (saiu e voltou)
+        # Sinais de devolução: shipping.status indica que saiu OU houve frete reverso
+        if not cancelada:
+            categoria = "aprovada"
+        elif ship_status in _SHIPPED_STATUSES or rev_fee > 0:
+            categoria = "devolvida"
+        else:
+            categoria = "cancelada"
+        
+        itens = order.get("order_items", [])
+        for item_idx, item in enumerate(itens):
             sku        = (item.get("item", {}).get("seller_sku", "") or "").strip()
             produto    = (item.get("item", {}).get("title", "") or "")[:50]
             qty        = int(item.get("quantity", 1) or 1)
             unit_price = float(item.get("unit_price", 0) or 0)
-            sale_fee   = abs(float(item.get("sale_fee", 0) or 0)) * qty  # ML retorna sale_fee por unidade
-            frete      = float(fretes.get(shipping_id, 0) or 0)
-            receita    = unit_price * qty
-            total_ml   = receita - sale_fee - frete
+            
+            # ==========================================
+            # INÍCIO DA NOVA LÓGICA DE CANCELADOS
+            # ==========================================
+            if cancelada:
+                receita = unit_price * qty  # MANTÉM A RECEITA para o card "Canceladas" não zerar
+                sale_fee = 0.0
+                frete = 0.0
+                
+                # O endpoint da claim informa o valor cobrado do vendedor.
+                # Zero confirmado é gratuito; nunca substituir pelo frete de ida.
+                # O custo é do pedido: lançar uma vez, mesmo com vários itens.
+                if item_idx == 0:
+                    frete = float(custos_devolucao.get(str(order_id), rev_fee) or 0)
+                
+                # O repasse do ML é apenas o débito do frete reverso (prejuízo)
+                total_ml = -frete
+                
+            else:
+                # Lógica original para vendas aprovadas
+                sale_fee   = abs(float(item.get("sale_fee", 0) or 0)) * qty
+                frete      = float(fretes.get(shipping_id, 0) or 0)
+                receita    = unit_price * qty
+                total_ml   = receita - sale_fee - frete
+            # ==========================================
+            # FIM DA NOVA LÓGICA
+            # ==========================================
+
             rows.append({
                 "Venda": str(order_id), "Data": date, "Status": status,
                 "SKU": sku, "Produto": produto, "Quantidade": qty,
                 "Receita Bruta": receita, "Taxas ML": sale_fee,
                 "Frete": frete, "Total ML": total_ml,
                 "Cancelada": cancelada,
+                "Categoria": categoria,
                 "Reembolsado": reemb_val,
             })
+
     return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+_MOTIVOS_RECLAMACAO = {
+    "PNR": "Produto não recebido",
+    "PDD": "Produto diferente / com defeito",
+    "CS":  "Compra cancelada",
+}
+
+def _motivo_amigavel(reason_id):
+    """Traduz o reason_id da claim (ex.: PDD9528) pro rótulo amigável da categoria."""
+    if not reason_id:
+        return "—"
+    prefixo = "".join(c for c in str(reason_id) if c.isalpha())
+    return _MOTIVOS_RECLAMACAO.get(prefixo, str(reason_id))
+
+def montar_ranking_reclamacoes(orders, claims_por_pedido, min_vendas=15):
+    """
+    Cruza as reclamações (claims) com os pedidos pra construir o índice de
+    reclamação por anúncio: reclamações ÷ vendas aprovadas × 100.
+
+    claims_por_pedido vem de get_claims_por_pedidos: dict {order_id: [claims]}.
+    Como cada claim já chegou associada ao pedido que a gente mesmo pediu
+    (resource_id={pedido} na busca), o cruzamento é direto: order_id -> order_items
+    do pedido (já temos, sem chamada extra) -> item_id.
+
+    Se um pedido tiver mais de um anúncio (carrinho com itens diferentes do mesmo
+    vendedor), a reclamação é contada pra todos os itens daquele pedido — é raro,
+    mas fica sinalizado no motivo pra você saber que pode ser ambíguo.
+    """
+    from collections import Counter
+
+    # 1) Mapa order_id -> itens do pedido + se a venda foi aprovada
+    ordem_itens = {}
+    for o in orders:
+        oid      = str(o.get("id", ""))
+        aprovada = o.get("status") not in ("cancelled",)
+        itens = []
+        for it in o.get("order_items", []):
+            item = it.get("item", {}) or {}
+            itens.append({
+                "item_id": item.get("id"),
+                "titulo":  (item.get("title") or "")[:60],
+                "sku":     (item.get("seller_sku") or "").strip(),
+            })
+        ordem_itens[oid] = {"aprovada": aprovada, "itens": itens}
+
+    # 2) Vendas aprovadas por anúncio (em nº de pedidos — mesma base usada na taxa)
+    vendas = {}
+    for info in ordem_itens.values():
+        if not info["aprovada"]:
+            continue
+        for it in info["itens"]:
+            iid = it["item_id"]
+            if not iid:
+                continue
+            v = vendas.setdefault(iid, {"pedidos": 0, "titulo": it["titulo"], "sku": it["sku"]})
+            v["pedidos"] += 1
+
+    # 3) Reclamações por anúncio
+    reclamacoes = {}
+    for oid, claims in claims_por_pedido.items():
+        oid  = str(oid)
+        info = ordem_itens.get(oid)
+        if not info or not info["itens"]:
+            continue
+        for c in claims:
+            motivo = _motivo_amigavel(c.get("reason_id"))
+            for it in info["itens"]:
+                iid = it["item_id"]
+                if not iid:
+                    continue
+                r = reclamacoes.setdefault(iid, {"n": 0, "motivos": Counter()})
+                r["n"] += 1
+                r["motivos"][motivo] += 1
+
+    # 4) Monta a tabela final
+    linhas = []
+    for iid in set(vendas.keys()) | set(reclamacoes.keys()):
+        v = vendas.get(iid, {"pedidos": 0, "titulo": "—", "sku": "—"})
+        r = reclamacoes.get(iid, {"n": 0, "motivos": Counter()})
+        pedidos       = v["pedidos"]
+        n_reclamacoes = r["n"]
+        taxa      = (n_reclamacoes / pedidos * 100) if pedidos else None
+        motivo_top = r["motivos"].most_common(1)[0][0] if r["motivos"] else "—"
+        linhas.append({
+            "item_id": iid,
+            "Anúncio": v["titulo"] or "—",
+            "SKU": v["sku"] or "—",
+            "Vendas (pedidos)": pedidos,
+            "Reclamações": n_reclamacoes,
+            "Taxa (%)": round(taxa, 2) if taxa is not None else None,
+            "Vendas por reclamação": round(pedidos / n_reclamacoes, 1) if n_reclamacoes else None,
+            "Motivo predominante": motivo_top,
+            "Amostra suficiente": pedidos >= min_vendas,
+        })
+
+    df = pd.DataFrame(linhas)
+    if not df.empty:
+        df = df.sort_values(by=["Reclamações", "Taxa (%)"], ascending=[False, False]).reset_index(drop=True)
+    return df
 
 def apply_costs_online(df, user_id):
     if df.empty:
@@ -370,6 +1167,1210 @@ def apply_costs_online(df, user_id):
 
     return df_sorted.sort_values("Data", ascending=False).reset_index(drop=True)
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ███  SHOPEE — bloco isolado  ██████████████████████████████████████████████
+# ═══════════════════════════════════════════════════════════════════════════
+# Tudo que diz respeito à Shopee vive entre este cabeçalho e o marcador
+# "FIM DO BLOCO SHOPEE". Nada aqui escreve nas tabelas do fluxo Mercado Livre:
+# a única leitura compartilhada é `custos_sku` (somente leitura) e a única
+# escrita é em `shopee_tokens`.
+#
+# Referências da API:
+#   Host ............: https://partner.shopeemobile.com
+#   Assinatura ......: HMAC-SHA256 do partner_key sobre uma base string
+#   access_token ....: ~4 horas (renovado automaticamente)
+#   refresh_token ...: ~30 dias sem uso (aí precisa reautorizar a loja)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class ShopeeError(RuntimeError):
+    """Erro devolvido pela API da Shopee (campo `error` preenchido na resposta)."""
+
+    def __init__(self, error: str, message: str, path: str):
+        self.error = error
+        self.message = message
+        self.path = path
+        super().__init__(f"[{path}] {error}: {message}")
+
+
+HOST = "https://partner.shopeemobile.com"
+
+# Limites impostos pela própria API — não são escolhas nossas.
+MAX_JANELA_DIAS = 15      # get_order_list aceita no máximo ~15 dias por chamada
+MAX_ORDER_SN_LOTE = 50    # get_order_detail aceita no máximo 50 order_sn por chamada
+MAX_PAGE_SIZE = 100
+
+TIMEOUT = 20
+
+
+# =========================================================
+# ASSINATURA
+# =========================================================
+def _assinar(partner_key: str, base_string: str) -> str:
+    return hmac.new(
+        partner_key.encode("utf-8"),
+        base_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _sign_public(partner_id: int, partner_key: str, path: str, ts: int) -> str:
+    """Endpoints públicos (auth): partner_id + path + timestamp."""
+    return _assinar(partner_key, f"{partner_id}{path}{ts}")
+
+
+def _sign_shop(
+    partner_id: int, partner_key: str, path: str, ts: int, access_token: str, shop_id: int
+) -> str:
+    """Endpoints de loja: partner_id + path + timestamp + access_token + shop_id."""
+    return _assinar(partner_key, f"{partner_id}{path}{ts}{access_token}{shop_id}")
+
+
+# =========================================================
+# CLIENTE
+# =========================================================
+class ShopeeClient:
+    """
+    Uso típico:
+
+        cli = ShopeeClient(partner_id, partner_key, shop_id,
+                           access_token=tok, refresh_token=ref,
+                           on_token_refresh=salvar_no_supabase)
+        pedidos = cli.listar_pedidos(inicio, fim)
+
+    `on_token_refresh(access_token, refresh_token, expira_em)` é chamado sempre
+    que o cliente renova o token sozinho. É por ali que você persiste — o módulo
+    não grava nada por conta própria.
+    """
+
+    def __init__(
+        self,
+        partner_id: int,
+        partner_key: str,
+        shop_id: int | None = None,
+        access_token: str = "",
+        refresh_token: str = "",
+        on_token_refresh: Callable[[str, str, int], None] | None = None,
+    ):
+        self.partner_id = int(partner_id)
+        self.partner_key = partner_key
+        self.shop_id = int(shop_id) if shop_id else None
+        self.access_token = access_token or ""
+        self.refresh_token = refresh_token or ""
+        self.on_token_refresh = on_token_refresh
+        self._sess = requests.Session()
+
+    # ---------- infraestrutura de request ----------
+    def _request(
+        self,
+        path: str,
+        params: dict | None = None,
+        body: dict | None = None,
+        publico: bool = False,
+        _retentativa: bool = False,
+    ) -> dict:
+        ts = int(time.time())
+        query: dict[str, Any] = {"partner_id": self.partner_id, "timestamp": ts}
+
+        if publico:
+            query["sign"] = _sign_public(self.partner_id, self.partner_key, path, ts)
+        else:
+            if not (self.access_token and self.shop_id):
+                raise ShopeeError("no_auth", "Loja não autorizada (falta access_token/shop_id).", path)
+            query["sign"] = _sign_shop(
+                self.partner_id, self.partner_key, path, ts, self.access_token, self.shop_id
+            )
+            query["access_token"] = self.access_token
+            query["shop_id"] = self.shop_id
+
+        if params:
+            query.update(params)
+
+        url = f"{HOST}{path}"
+        if body is None:
+            resp = self._sess.get(url, params=query, timeout=TIMEOUT)
+        else:
+            resp = self._sess.post(url, params=query, json=body, timeout=TIMEOUT)
+
+        try:
+            data = resp.json()
+        except ValueError:
+            raise ShopeeError("resposta_invalida", resp.text[:300], path)
+
+        erro = (data.get("error") or "").strip()
+        if erro:
+            # Token vencido: renova uma vez e repete. Se falhar de novo, propaga.
+            if not _retentativa and not publico and _token_expirado(erro):
+                self.renovar_token()
+                return self._request(path, params, body, publico, _retentativa=True)
+            raise ShopeeError(erro, data.get("message", ""), path)
+
+        return data
+
+    # ---------- autorização ----------
+    def url_autorizacao(self, redirect_uri: str) -> str:
+        """URL para o vendedor autorizar a loja. Abre no navegador, ele aprova,
+        e a Shopee redireciona pro redirect_uri com ?code=...&shop_id=..."""
+        path = "/api/v2/shop/auth_partner"
+        ts = int(time.time())
+        sign = _sign_public(self.partner_id, self.partner_key, path, ts)
+        return (
+            f"{HOST}{path}?partner_id={self.partner_id}&timestamp={ts}"
+            f"&sign={sign}&redirect={redirect_uri}"
+        )
+
+    def trocar_code_por_token(self, code: str, shop_id: int) -> dict:
+        """Troca o `code` do redirect pelos tokens iniciais."""
+        path = "/api/v2/auth/token/get"
+        data = self._request(
+            path,
+            body={"code": code, "shop_id": int(shop_id), "partner_id": self.partner_id},
+            publico=True,
+        )
+        self.shop_id = int(shop_id)
+        return self._guardar_tokens(data)
+
+    def renovar_token(self) -> dict:
+        """Usa o refresh_token para obter um access_token novo."""
+        if not self.refresh_token or not self.shop_id:
+            raise ShopeeError("no_refresh", "Sem refresh_token ou shop_id para renovar.", "refresh")
+        path = "/api/v2/auth/access_token/get"
+        data = self._request(
+            path,
+            body={
+                "refresh_token": self.refresh_token,
+                "shop_id": self.shop_id,
+                "partner_id": self.partner_id,
+            },
+            publico=True,
+        )
+        return self._guardar_tokens(data)
+
+    def _guardar_tokens(self, data: dict) -> dict:
+        self.access_token = data.get("access_token", "") or self.access_token
+        self.refresh_token = data.get("refresh_token", "") or self.refresh_token
+        expira_em = int(time.time()) + int(data.get("expire_in", 14400) or 14400)
+        if self.on_token_refresh:
+            try:
+                self.on_token_refresh(self.access_token, self.refresh_token, expira_em)
+            except Exception:
+                # Persistir é responsabilidade de quem chamou; falha ali não
+                # pode derrubar a requisição que está em andamento.
+                pass
+        return {
+            "access_token": self.access_token,
+            "refresh_token": self.refresh_token,
+            "expira_em": expira_em,
+        }
+
+    # ---------- pedidos ----------
+    def listar_order_sn(
+        self,
+        inicio: datetime,
+        fim: datetime,
+        status: str = "",
+        campo_data: str = "create_time",
+    ) -> list[str]:
+        """
+        Lista os order_sn do período. Fatiar em janelas de 15 dias é obrigatório:
+        a API rejeita intervalos maiores, então isso não é otimização, é requisito.
+        """
+        path = "/api/v2/order/get_order_list"
+        encontrados: list[str] = []
+
+        for jan_ini, jan_fim in _janelas(inicio, fim, MAX_JANELA_DIAS):
+            cursor = ""
+            while True:
+                params = {
+                    "time_range_field": campo_data,
+                    "time_from": int(jan_ini.timestamp()),
+                    "time_to": int(jan_fim.timestamp()),
+                    "page_size": MAX_PAGE_SIZE,
+                    "cursor": cursor,
+                }
+                if status:
+                    params["order_status"] = status
+
+                resp = self._request(path, params=params).get("response", {}) or {}
+                for o in resp.get("order_list", []) or []:
+                    sn = o.get("order_sn")
+                    if sn:
+                        encontrados.append(sn)
+
+                if not resp.get("more"):
+                    break
+                cursor = resp.get("next_cursor", "") or ""
+                if not cursor:
+                    break
+
+        # A mesma venda pode reaparecer na borda de duas janelas.
+        return list(dict.fromkeys(encontrados))
+
+    def detalhar_pedidos(self, order_sns: Iterable[str]) -> list[dict]:
+        """
+        Detalhe dos pedidos, em lotes de 50 (limite da API).
+
+        Só pedimos campos NÃO sensíveis. O app está com "Access to Sensitive
+        Data: No access" no console, então `buyer_username` e
+        `recipient_address` fariam a chamada falhar ou voltar vazios — e a v1
+        não precisa de dado do comprador para calcular margem.
+        """
+        path = "/api/v2/order/get_order_detail"
+        campos = ",".join(
+            [
+                "item_list",
+                "pay_time",
+                "total_amount",
+                "shipping_carrier",
+                "actual_shipping_fee",
+                "order_status",
+                "cancel_reason",
+            ]
+        )
+        saida: list[dict] = []
+        for lote in _lotes(list(order_sns), MAX_ORDER_SN_LOTE):
+            resp = self._request(
+                path,
+                params={"order_sn_list": ",".join(lote), "response_optional_fields": campos},
+            ).get("response", {}) or {}
+            saida.extend(resp.get("order_list", []) or [])
+        return saida
+
+    # ---------- ads (CPC / Shopee Ads) ----------
+    def gasto_ads(self, d_ini: date, d_fim: date) -> float:
+        """
+        Gasto total com Shopee Ads (CPC) no período, em R$.
+
+        Endpoint: /api/v2/ads/get_all_cpc_ads_daily_performance
+        As datas vão no formato DD-MM-YYYY e a API limita a janela, então
+        fatiamos de 30 em 30 dias — mesma lógica das janelas de pedidos.
+
+        Requer que o módulo "Ads" esteja habilitado na autorização do app.
+        Se não estiver, a Shopee devolve erro de permissão e o ShopeeError
+        sobe para quem chamou decidir o que mostrar.
+        """
+        path = "/api/v2/ads/get_all_cpc_ads_daily_performance"
+        total = 0.0
+        atual = d_ini
+        while atual <= d_fim:
+            fatia_fim = min(atual + timedelta(days=29), d_fim)
+            data = self._request(
+                path,
+                params={
+                    "start_date": atual.strftime("%d-%m-%Y"),
+                    "end_date": fatia_fim.strftime("%d-%m-%Y"),
+                },
+            ).get("response", {}) or {}
+
+            # A Shopee já devolveu esse bloco como dict e como lista,
+            # dependendo da região/versão. Aceitamos os dois.
+            if isinstance(data, list):
+                linhas = data
+            else:
+                linhas = data.get("shop_all_cpc_ads_daily_performance") or []
+                if not linhas:
+                    for v in data.values():
+                        if isinstance(v, list):
+                            linhas = v
+                            break
+
+            for linha in linhas or []:
+                if isinstance(linha, dict):
+                    total += _num(linha.get("expense"))
+
+            atual = fatia_fim + timedelta(days=1)
+
+        return round(total, 2)
+
+    def escrow_por_pedido(self, order_sns: Iterable[str]) -> dict[str, dict]:
+        """
+        Detalhe financeiro (comissão, taxa de serviço, frete, valor líquido).
+        É aqui que moram as taxas — o get_order_detail sozinho não traz isso.
+
+        Existe um endpoint em lote (get_escrow_detail_batch) em algumas versões;
+        como a disponibilidade varia por região, aqui vai o unitário, que sempre
+        funciona. Se a sua conta tiver o batch liberado, dá pra trocar depois.
+        """
+        path = "/api/v2/payment/get_escrow_detail"
+        saida: dict[str, dict] = {}
+        for sn in order_sns:
+            try:
+                resp = self._request(path, params={"order_sn": sn}).get("response", {}) or {}
+                saida[sn] = resp
+            except ShopeeError:
+                # Pedido muito novo ou cancelado pode não ter escrow ainda.
+                saida[sn] = {}
+        return saida
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+def _token_expirado(erro: str) -> bool:
+    e = (erro or "").lower()
+    return "token" in e and ("expire" in e or "invalid" in e)
+
+
+def _janelas(inicio: datetime, fim: datetime, dias: int):
+    """Fatia [inicio, fim] em pedaços de no máximo `dias`."""
+    atual = inicio
+    while atual < fim:
+        prox = min(atual + timedelta(days=dias), fim)
+        yield atual, prox
+        atual = prox
+
+
+def _lotes(itens: list, tamanho: int):
+    for i in range(0, len(itens), tamanho):
+        yield itens[i : i + tamanho]
+
+
+# =========================================================
+# NORMALIZAÇÃO -> formato canônico do dashboard
+# =========================================================
+def _num(v) -> float:
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def parse_orders_shopee(pedidos: list[dict], escrow: dict[str, dict] | None = None) -> list[dict]:
+    """
+    Converte a resposta da Shopee para o mesmo formato de linha que o
+    `parse_orders` do Mercado Livre produz — uma linha por item vendido.
+
+    Assim a aba Shopee fala a mesma língua do resto do dashboard, mesmo
+    rodando isolada. Se um dia você quiser consolidar os dois canais, o
+    trabalho já está feito.
+    """
+    escrow = escrow or {}
+    linhas: list[dict] = []
+
+    for p in pedidos:
+        sn = p.get("order_sn", "")
+        status = (p.get("order_status", "") or "").upper()
+        criado = p.get("create_time") or p.get("pay_time") or 0
+        data = datetime.fromtimestamp(criado) if criado else None
+
+        cancelada = status in {"CANCELLED", "UNPAID"}
+        devolvida = status in {"TO_RETURN", "RETURNED"}
+        categoria = "cancelada" if cancelada else ("devolvida" if devolvida else "aprovada")
+
+        # --- taxas do pedido inteiro, vindas do escrow ---
+        renda = (escrow.get(sn, {}) or {}).get("order_income", {}) or {}
+        comissao = _num(renda.get("commission_fee"))
+        servico = _num(renda.get("service_fee"))
+        transacao = _num(renda.get("seller_transaction_fee"))
+        taxas_pedido = comissao + servico + transacao
+
+        # Frete que efetivamente sai do seu bolso: custo real menos o que o
+        # comprador pagou e menos o subsídio da Shopee. Nunca negativo.
+        frete_real = _num(renda.get("actual_shipping_fee"))
+        frete_comprador = _num(renda.get("buyer_paid_shipping_fee"))
+        rebate = _num(renda.get("shopee_shipping_rebate"))
+        frete_pedido = max(frete_real - frete_comprador - rebate, 0.0)
+
+        itens = p.get("item_list", []) or []
+        # Rateia taxas e frete (que vêm por pedido) entre os itens, proporcional
+        # à receita de cada um. Sem isso, pedido com 2+ itens distorce a margem.
+        receitas = [
+            _num(i.get("model_discounted_price") or i.get("model_original_price"))
+            * int(i.get("model_quantity_purchased", 1) or 1)
+            for i in itens
+        ]
+        receita_total = sum(receitas) or 1.0
+
+        for item, receita in zip(itens, receitas):
+            peso = receita / receita_total
+            qtd = int(item.get("model_quantity_purchased", 1) or 1)
+            sku = (item.get("model_sku") or item.get("item_sku") or "").strip()
+
+            if cancelada:
+                # Espelha a regra do ML: mantém a receita para o card de
+                # canceladas não zerar, mas zera taxas.
+                taxas_item, frete_item = 0.0, 0.0
+                liquido = 0.0
+            else:
+                taxas_item = taxas_pedido * peso
+                frete_item = frete_pedido * peso
+                liquido = receita - taxas_item - frete_item
+
+            linhas.append(
+                {
+                    "Venda": sn,
+                    "Data": data,
+                    "Status": status,
+                    "SKU": sku,
+                    "Produto": (item.get("item_name", "") or "")[:50],
+                    "Quantidade": qtd,
+                    "Receita Bruta": receita,
+                    "Taxas Shopee": taxas_item,
+                    "Frete": frete_item,
+                    "Total Shopee": liquido,
+                    "Cancelada": cancelada,
+                    "Categoria": categoria,
+                    "Escrow": _num(renda.get("escrow_amount")) * peso,
+                }
+            )
+
+    return linhas
+
+
+TABELA_TOKENS = "shopee_tokens"
+
+# user_id provisório usado quando a loja é autorizada numa sessão que ainda não
+# passou pelo login do Mercado Livre. A aba reivindica a linha depois.
+SHOPEE_USER_PENDENTE = "__pendente__"
+
+
+# =========================================================
+# TOKENS (única escrita deste módulo)
+# =========================================================
+def carregar_token(sb, user_id: str) -> dict | None:
+    """
+    Token da loja deste usuário. Se não houver, tenta reivindicar uma
+    autorização pendente — aquela feita numa sessão anterior, antes do login do
+    Mercado Livre (ver o bloco de AUTH).
+    """
+    try:
+        r = sb.table(TABELA_TOKENS).select("*").eq("user_id", user_id).limit(1).execute()
+        if r.data:
+            return r.data[0]
+    except Exception:
+        return None
+
+    try:
+        p = (sb.table(TABELA_TOKENS).select("*")
+             .eq("user_id", SHOPEE_USER_PENDENTE).limit(1).execute())
+        if not p.data:
+            return None
+        pend = p.data[0]
+        salvar_token(sb, user_id, pend["shop_id"], pend["access_token"],
+                     pend["refresh_token"], pend["expira_em"])
+        sb.table(TABELA_TOKENS).delete().eq("user_id", SHOPEE_USER_PENDENTE).execute()
+        pend["user_id"] = user_id
+        return pend
+    except Exception:
+        return None
+
+
+def salvar_token(sb, user_id: str, shop_id: int, access_token: str, refresh_token: str, expira_em: int):
+    sb.table(TABELA_TOKENS).upsert(
+        {
+            "user_id": user_id,
+            "shop_id": int(shop_id),
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expira_em": int(expira_em),
+            "atualizado_em": datetime.now().isoformat(),
+        },
+        on_conflict="user_id",
+    ).execute()
+
+
+# =========================================================
+# CUSTOS E IMPOSTOS — leitura apenas
+# =========================================================
+def _aplicar_custos_impostos(sb, user_id: str, df):
+    """
+    Calcula custo (FIFO) e imposto para as vendas da Shopee.
+
+    FIFO SIMULADO, sem persistência: consome os lotes em memória, do mais
+    antigo para o mais novo, exatamente como o Mercado Livre faz — mas NÃO
+    grava em `fifo_consumo` nem atualiza `qtd_disponivel`. É o que mantém a aba
+    isolada. O efeito prático é que o custo aqui reflete os lotes que estão
+    abertos no momento da consulta.
+
+    Usa `custo_produto` puro (mesmo campo do ML), e não a soma com frete do
+    fornecedor e embalagem — assim os números das duas abas são comparáveis.
+    """
+    df = df.copy()
+    df["Custo Unit."] = 0.0
+    df["Custo Total"] = 0.0
+    df["Imposto"] = 0.0
+    df["FIFO"] = False
+    df["Sem Custo"] = True
+
+    try:
+        r = sb.table("custos_sku").select("*").eq("user_id", user_id).execute()
+        custos_df = pd.DataFrame(r.data or [])
+    except Exception:
+        custos_df = pd.DataFrame()
+
+    try:
+        r = sb.table("regime_tributario").select("*").eq("user_id", user_id).order("vigencia").execute()
+        regime_df = pd.DataFrame(r.data or [])
+    except Exception:
+        regime_df = pd.DataFrame()
+
+    if not custos_df.empty:
+        custos_df["vigencia"] = pd.to_datetime(custos_df["vigencia"], utc=True, errors="coerce")
+        custos_df = custos_df.sort_values("vigencia", na_position="first").reset_index(drop=True)
+        # cópia local de saldos: o consumo abaixo é só em memória
+        saldos = custos_df["qtd_disponivel"].astype(float).copy()
+    if not regime_df.empty:
+        regime_df["vigencia"] = pd.to_datetime(regime_df["vigencia"], utc=True, errors="coerce")
+
+    def aliquota(data):
+        if regime_df.empty:
+            return 0.0
+        validos = regime_df[regime_df["vigencia"] <= data]
+        return float(validos.iloc[-1]["aliquota"]) / 100 if not validos.empty else 0.0
+
+    def custo_por_vigencia(sku, data):
+        if custos_df.empty:
+            return 0.0
+        sk = custos_df[custos_df["sku"] == sku]
+        validos = sk[sk["vigencia"].isna() | (sk["vigencia"] <= data)]
+        return float(validos.iloc[-1]["custo_produto"]) if not validos.empty else 0.0
+
+    # ordem cronológica: FIFO só faz sentido consumindo na ordem das vendas
+    df = df.sort_values("Data").reset_index(drop=True)
+
+    for idx, row in df.iterrows():
+        if row["Cancelada"]:
+            continue
+        sku = str(row["SKU"]).strip()
+        qtd = int(row["Quantidade"])
+        data = pd.to_datetime(row["Data"], utc=True)
+
+        custo_unit = 0.0
+        if not custos_df.empty:
+            lotes = custos_df.index[(custos_df["sku"] == sku) & (saldos > 0)].tolist()
+            if lotes:
+                restante, total = qtd, 0.0
+                for li in lotes:
+                    if restante <= 0:
+                        break
+                    consumido = min(restante, float(saldos.at[li]))
+                    total += consumido * float(custos_df.at[li, "custo_produto"])
+                    saldos.at[li] -= consumido
+                    restante -= consumido
+                if restante > 0:  # estoque acabou no meio: completa pela vigência
+                    total += restante * custo_por_vigencia(sku, data)
+                custo_unit = total / qtd if qtd else 0.0
+                df.at[idx, "FIFO"] = True
+            else:
+                custo_unit = custo_por_vigencia(sku, data)
+
+        imposto = float(row["Receita Bruta"]) * aliquota(data)
+        df.at[idx, "Custo Unit."] = custo_unit
+        df.at[idx, "Custo Total"] = custo_unit * qtd
+        df.at[idx, "Imposto"] = imposto
+        df.at[idx, "Sem Custo"] = custo_unit == 0
+
+    df["Lucro"] = df["Total Shopee"] - df["Custo Total"] - df["Imposto"]
+    df.loc[df["Cancelada"], ["Lucro", "Imposto", "Custo Total"]] = 0.0
+    df["Margem %"] = 0.0
+    ok = (~df["Cancelada"]) & (df["Receita Bruta"] > 0)
+    df.loc[ok, "Margem %"] = df.loc[ok, "Lucro"] / df.loc[ok, "Receita Bruta"] * 100
+    return df.sort_values("Data", ascending=False).reset_index(drop=True)
+
+
+# =========================================================
+# BUSCA DE PEDIDOS
+# =========================================================
+@st.cache_data(ttl=600, show_spinner=False)
+def _buscar_vendas(_cli: ShopeeClient, inicio: datetime, fim: datetime, _cache_key: str) -> pd.DataFrame:
+    """_cache_key existe só para invalidar o cache quando o token muda."""
+    sns = _cli.listar_order_sn(inicio, fim)
+    if not sns:
+        return pd.DataFrame()
+    pedidos = _cli.detalhar_pedidos(sns)
+    escrow = _cli.escrow_por_pedido(sns)
+    linhas = parse_orders_shopee(pedidos, escrow)
+    return pd.DataFrame(linhas) if linhas else pd.DataFrame()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _buscar_gasto_ads(_cli: ShopeeClient, d_ini: date, d_fim: date, _cache_key: str):
+    """
+    Gasto com Shopee Ads no período.
+    Retorna (valor, erro) — erro é None quando deu certo. Nunca levanta:
+    a aba precisa continuar funcionando mesmo sem permissão de Ads.
+    """
+    try:
+        return _cli.gasto_ads(d_ini, d_fim), None
+    except ShopeeError as e:
+        return 0.0, str(e)
+    except Exception as e:  # rede, formato inesperado, etc.
+        return 0.0, str(e)
+
+
+def _kpi(titulo: str, valor: str, cor: str = "#1F2937") -> str:
+    return (
+        f'<div class="kpi-card"><div class="kpi-title">{titulo}</div>'
+        f'<div class="kpi-value" style="color:{cor};">{valor}</div></div>'
+    )
+
+
+def _moeda(v: float) -> str:
+    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+# =========================================================
+# RENDER
+# =========================================================
+def render_shopee(sb, user_id: str):
+    # (o título fica dentro do hero, depois que os dados carregam — igual ao Financeiro)
+
+    # ---------- credenciais ----------
+    try:
+        partner_id = st.secrets["SHOPEE_PARTNER_ID"]
+        partner_key = st.secrets["SHOPEE_PARTNER_KEY"]
+        redirect_uri = st.secrets["SHOPEE_REDIRECT_URI"]
+    except KeyError:
+        st.error(
+            "Faltam credenciais nos secrets. Adicione `SHOPEE_PARTNER_ID`, "
+            "`SHOPEE_PARTNER_KEY` e `SHOPEE_REDIRECT_URI` no secrets.toml."
+        )
+        return
+
+    registro = carregar_token(sb, user_id)
+
+    # ---------- resultado da autorização ----------
+    # A troca do código por token acontece no bloco de AUTH, assim que a Shopee
+    # redireciona — ali o código ainda é válido e a sessão é nova. Aqui só
+    # mostramos o desfecho.
+    # (a troca de código por token acontece no bloco de AUTH, no retorno da
+    #  Shopee — aqui a loja já está conectada ou não está)
+
+    # ---------- não conectado ----------
+    if not registro:
+        st.info("Nenhuma loja Shopee conectada ainda.")
+        url = ShopeeClient(partner_id, partner_key).url_autorizacao(redirect_uri)
+        st.link_button("Conectar loja Shopee", url, type="primary")
+        st.caption(
+            "Você será levado à Shopee para autorizar. A autorização vale 30 dias "
+            "de inatividade — usando o painel com regularidade, ela se renova sozinha."
+        )
+        return
+
+    # ---------- cliente autenticado ----------
+    cli = ShopeeClient(
+        partner_id, partner_key,
+        shop_id=registro["shop_id"],
+        access_token=registro["access_token"],
+        refresh_token=registro["refresh_token"],
+        on_token_refresh=lambda a, r, e: salvar_token(sb, user_id, registro["shop_id"], a, r, e),
+    )
+
+    # Avisa antes de quebrar: refresh_token vence em 30 dias de inatividade.
+    atualizado = pd.to_datetime(registro.get("atualizado_em"), errors="coerce")
+    if pd.notna(atualizado):
+        dias_parado = (pd.Timestamp.now(tz=atualizado.tz) - atualizado).days
+        if dias_parado >= 25:
+            st.warning(
+                f"A autorização da loja está há {dias_parado} dias sem renovar. "
+                "Aos 30 dias ela expira e será preciso reconectar."
+            )
+
+    # ---------- filtro de período (mesmo da aba Financeiro) ----------
+    import zoneinfo
+    tz_br = zoneinfo.ZoneInfo("America/Sao_Paulo")
+    agora_br = datetime.now(tz_br)
+    hoje = agora_br.date()
+
+    col_f1, col_f2, col_f3, col_f4 = st.columns([2, 1.5, 1.5, 0.5])
+    with col_f1:
+        periodo = st.selectbox(
+            "Período", ["Hoje", "7 dias", "15 dias", "30 dias", "Personalizar"],
+            index=1, key="shopee_periodo",
+        )
+    with col_f4:
+        if st.button("🔄", key="shopee_refresh", help="Limpar cache e atualizar"):
+            st.cache_data.clear()
+            st.rerun()
+
+    if periodo == "Personalizar":
+        with col_f2:
+            d_ini = st.date_input("De", value=hoje - timedelta(days=7), key="shopee_ini")
+        with col_f3:
+            d_fim = st.date_input("Até", value=hoje, key="shopee_fim")
+        label_periodo = f"{d_ini.strftime('%d/%m')} – {d_fim.strftime('%d/%m/%Y')}"
+    elif periodo == "Hoje":
+        d_ini = d_fim = hoje
+        label_periodo = f"Hoje • {hoje.strftime('%d/%m/%Y')}"
+    else:
+        dias = {"7 dias": 7, "15 dias": 15, "30 dias": 30}[periodo]
+        d_ini, d_fim = hoje - timedelta(days=dias), hoje
+        label_periodo = f"{periodo} • até {hoje.strftime('%d/%m/%Y')}"
+
+    if d_ini > d_fim:
+        st.error("A data inicial não pode ser maior que a final.")
+        return
+
+    inicio = datetime.combine(d_ini, datetime.min.time())
+    fim = datetime.combine(d_fim, datetime.max.time())
+
+    with st.spinner("Buscando pedidos na Shopee..."):
+        try:
+            df = _buscar_vendas(cli, inicio, fim, registro["access_token"][:12])
+        except ShopeeError as e:
+            st.error(f"Erro na API da Shopee: {e}")
+            return
+
+    if df.empty:
+        st.info("Nenhum pedido encontrado no período.")
+        return
+
+    # ---------- custo, imposto, lucro ----------
+    df = _aplicar_custos_impostos(sb, user_id, df)
+    aprovadas = df[df["Categoria"] == "aprovada"]
+
+    receita  = aprovadas["Receita Bruta"].sum()
+    taxas    = aprovadas["Taxas Shopee"].sum()
+    frete    = aprovadas["Frete"].sum()
+    custo    = aprovadas["Custo Total"].sum()
+    imposto  = aprovadas["Imposto"].sum()
+    lucro    = aprovadas["Lucro"].sum()
+
+    # ---------- gasto com Shopee Ads (ao vivo, mesmo período) ----------
+    with st.spinner("Buscando gasto com Shopee Ads..."):
+        ads_cost, ads_erro = _buscar_gasto_ads(
+            cli, d_ini, d_fim, registro["access_token"][:12]
+        )
+
+    # Toggle: o card de ADS é clicável e liga/desliga a dedução no lucro
+    if "ads_on_shopee" not in st.session_state:
+        st.session_state["ads_on_shopee"] = True
+    ads_on  = st.session_state["ads_on_shopee"]
+    ads_eff = ads_cost if ads_on else 0.0
+
+    lucro_total = lucro - ads_eff
+    margem      = (lucro_total / receita * 100) if receita else 0.0
+
+    # ---------- hero ----------
+    canceladas_df = df[df["Cancelada"]]
+    fat_cancel = canceladas_df["Receita Bruta"].sum()
+    n_vendas = len(aprovadas)
+    ticket = receita / n_vendas if n_vendas else 0.0
+    lucro_venda = lucro_total / n_vendas if n_vendas else 0.0
+    # label_periodo vem do seletor de período, lá em cima
+
+    st.markdown(
+        f'<div class="hero">'
+        f'<div style="display:flex;justify-content:space-between;gap:30px;align-items:flex-start;">'
+        f'<div>'
+        f'<p class="hero-small">Resumo</p>'
+        f'<h1 class="hero-title">Operação Shopee</h1>'
+        f'<div style="background:rgba(255,255,255,.18);color:white;border:1px solid rgba(255,255,255,.35);'
+        f'border-radius:999px;padding:10px 16px;font-weight:900;width:fit-content;">'
+        f'Período selecionado: {label_periodo}</div>'
+        f'</div>'
+        f'<div style="min-width:320px;">'
+        f'<div class="hero-value-label">Faturamento</div>'
+        f'<div class="hero-value">R$ {receita:,.2f}</div>'
+        f'</div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True)
+
+    def metric_card(col, title, value, sub, color):
+        col.markdown(f"""<div class="metric-card" style="--accent:{color};">
+            <div class="metric-title">{title}</div>
+            <div class="metric-value">{value}</div>
+            <div class="metric-pill">{sub}</div>
+        </div>""", unsafe_allow_html=True)
+
+    def kpi_card(col, title, value, color="#1F2937"):
+        col.markdown(f"""<div style="background:#F4F1EA;border:1px solid transparent;border-radius:14px;
+                                     padding:18px 14px;text-align:center;min-height:150px;
+                                     display:flex;flex-direction:column;justify-content:center;">
+            <div style="font-size:13px;font-weight:800;color:#44403C;text-transform:uppercase;
+                        letter-spacing:.25px;margin-bottom:10px;">{title}</div>
+            <div style="font-size:24px;color:{color};font-weight:900;letter-spacing:-.8px;
+                        line-height:1.05;white-space:nowrap;">{value}</div>
+        </div>""", unsafe_allow_html=True)
+
+    pct = lambda v: f"{v/receita*100:.1f}%" if receita else "0%"
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    metric_card(c1, "Tarifas",    f"R$ {taxas:,.2f}",      pct(taxas),   "#FBBF24")
+    metric_card(c2, "Custos",     f"R$ {custo:,.2f}",      pct(custo),   "#8B5CF6")
+    metric_card(c3, "Impostos",   f"R$ {imposto:,.2f}",    pct(imposto), "#64748B")
+    metric_card(c4, "Canceladas", f"R$ {fat_cancel:,.2f}", f"{len(canceladas_df)} vendas", "#EF4444")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    left, right = st.columns([1, 1])
+    with left:
+        st.markdown(f"""<div class="metric-card" style="--accent:#E5E7EB;min-height:138px;">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                <div>
+                    <div style="font-size:22px;font-weight:900;color:#020617;margin-bottom:12px;">Ticket Médio</div>
+                    <div class="muted">De vendas</div>
+                    <div style="font-size:24px;font-weight:900;color:#020617;">R$ {ticket:,.2f}</div>
+                </div>
+                <div>
+                    <div class="muted">Lucro por venda</div>
+                    <div style="font-size:24px;font-weight:900;color:#020617;">R$ {lucro_venda:,.2f}</div>
+                </div>
+            </div>
+        </div>""", unsafe_allow_html=True)
+    with right:
+        box_cls = "green-box" if lucro_total >= 0 else "red-box"
+        _sub_ads = "" if ads_on else " · ADS fora do cálculo"
+        st.markdown(f"""<div class="{box_cls}">
+            <div class="green-title">Lucro Líquido Real</div>
+            <div class="green-value">R$ {lucro_total:,.2f}</div>
+            <div class="green-sub">Margem real: {margem:.2f}%{_sub_ads}</div>
+        </div>""", unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # KPI-cards bege
+    k1, k2, k3 = st.columns(3)
+    kpi_card(k1, "Receita Bruta", f"R$ {receita:,.2f}")
+    kpi_card(k2, "Tarifas Shopee", f"R$ {taxas:,.2f}", "#EF4444")
+    kpi_card(k3, "Frete", f"R$ {frete:,.2f}", "#EF4444")
+    st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
+    k4, k5, k6 = st.columns(3)
+    kpi_card(k4, "Custo dos Produtos", f"R$ {custo:,.2f}", "#EF4444")
+    kpi_card(k5, "Impostos", f"R$ {imposto:,.2f}", "#EF4444")
+    kpi_card(k6, "Pedidos", f"{aprovadas['Venda'].nunique()}")
+    st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
+
+    # Card ADS clicável (mesmo comportamento da Operação ML) + Lucro e Margem
+    k7, k8, k9 = st.columns(3)
+    _ads_color    = "#EF4444" if ads_on else "#9CA3AF"
+    _ads_val_html = (
+        f"R$ {ads_cost:,.2f}" if ads_on
+        else f"<span style='text-decoration:line-through;'>R$ {ads_cost:,.2f}</span>"
+    )
+    _ads_sub  = "contando no lucro" if ads_on else "ignorado no lucro"
+    _chip_bg  = "#16A34A" if ads_on else "#9CA3AF"
+    _chip_txt = "ON ⇋" if ads_on else "OFF ⇋"
+    _border   = "#EF4444" if ads_on else "#D1D5DB"
+    with k7:
+        _card_html = f"""
+        <style>
+            body{{margin:0;padding:0;}}
+            html,body{{height:100%;}}
+        </style>
+        <a href='#' id='ads_toggle_shopee' style='text-decoration:none;color:inherit;display:block;'>
+          <div style='background:#F4F1EA;border:1px solid {_border};border-radius:14px;
+                      padding:18px 14px;text-align:center;position:relative;cursor:pointer;
+                      min-height:150px;box-sizing:border-box;
+                      display:flex;flex-direction:column;justify-content:center;'>
+            <span style='position:absolute;top:10px;right:12px;background:{_chip_bg};color:white;
+                         font-size:9px;font-weight:700;letter-spacing:.5px;padding:3px 8px;
+                         border-radius:99px;text-transform:uppercase;'>{_chip_txt}</span>
+            <div style='font-size:13px;font-weight:800;color:#44403C;text-transform:uppercase;
+                        letter-spacing:.25px;margin-bottom:10px;'>ADS (Shopee Ads)</div>
+            <div style='font-size:24px;color:{_ads_color};font-weight:900;letter-spacing:-.8px;
+                        line-height:1.05;'>{_ads_val_html}</div>
+            <div style='font-size:11px;color:#64748B;margin-top:6px;'>{_ads_sub}</div>
+          </div>
+        </a>
+        """
+        _clicked = click_detector(_card_html, key=f"ads_click_shopee_{ads_on}")
+        if _clicked == "ads_toggle_shopee":
+            st.session_state["ads_on_shopee"] = not ads_on
+            st.rerun()
+    kpi_card(k8, "Lucro Real", f"R$ {lucro_total:,.2f}",
+             "#059669" if lucro_total >= 0 else "#DC2626")
+    kpi_card(k9, "Margem", f"{margem:.2f}%", "#B45309")
+
+    if ads_erro:
+        st.caption(
+            f"⚠️ Não foi possível ler o gasto com Shopee Ads ({ads_erro}). "
+            "O lucro está sem essa dedução. Se o erro for de permissão, habilite o "
+            "módulo **Ads** na autorização do app e reconecte a loja."
+        )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    sem_custo = aprovadas[aprovadas["Sem Custo"]]["SKU"].nunique()
+    if sem_custo:
+        st.warning(
+            f"{sem_custo} SKU(s) vendidos na Shopee não têm custo cadastrado em Custos. "
+            "A margem desses itens está superestimada."
+        )
+
+    # ---------- gráficos (mesmos do Financeiro) ----------
+    daily = aprovadas.copy()
+    daily["Dia"] = pd.to_datetime(daily["Data"]).dt.date
+    daily_agg = daily.groupby("Dia").agg(
+        Lucro=("Lucro", "sum"), Receita=("Receita Bruta", "sum"), Quantidade=("Quantidade", "sum")
+    ).reset_index()
+    daily_agg["Dia"] = pd.to_datetime(daily_agg["Dia"])
+    media_lucro = daily_agg["Lucro"].mean() if not daily_agg.empty else 0.0
+    daily_agg["Cor"] = daily_agg["Lucro"].apply(lambda x: "Acima" if x >= media_lucro else "Abaixo")
+
+    qty_agg = daily.groupby(["Dia", "SKU"]).agg(Quantidade=("Quantidade", "sum")).reset_index()
+    qty_agg["Dia"] = pd.to_datetime(qty_agg["Dia"])
+    cores_sku = ["#7C3AED", "#0EA5E9", "#F59E0B", "#16A34A", "#EF4444"]
+    skus = qty_agg["SKU"].unique().tolist() if not qty_agg.empty else []
+    cor_map = {s: cores_sku[i % len(cores_sku)] for i, s in enumerate(skus)}
+    media_sku = (qty_agg.groupby("SKU")["Quantidade"].mean().reset_index()
+                 .rename(columns={"Quantidade": "Media"})) if not qty_agg.empty else pd.DataFrame()
+
+    gc1, gc2 = st.columns(2)
+
+    with gc1:
+        st.markdown('<div class="card" style="height:100%;">', unsafe_allow_html=True)
+        st.markdown("**Resumo de Vendas**")
+        st.markdown(f'<div style="color:#64748B;font-size:13px;margin-bottom:16px;">{label_periodo}</div>',
+                    unsafe_allow_html=True)
+        qtd_unid = int(aprovadas["Quantidade"].sum())
+        m1, m2 = st.columns(2)
+        with m1:
+            st.markdown(f"""
+            <div style="margin-bottom:20px;">
+                <div style="font-size:12px;font-weight:700;color:#7C3AED;">Vendas</div>
+                <div style="font-size:36px;font-weight:900;color:#0F172A;line-height:1.1;">{n_vendas}</div>
+                <div style="font-size:12px;color:#64748B;">{qtd_unid} unidades</div>
+            </div>
+            <div>
+                <div style="font-size:12px;font-weight:700;color:#7C3AED;">Ticket médio</div>
+                <div style="font-size:28px;font-weight:900;color:#0F172A;line-height:1.1;">R$ {ticket:,.2f}</div>
+                <div style="font-size:12px;color:#64748B;">lucro/venda R$ {lucro_venda:,.2f}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with m2:
+            st.markdown(f"""
+            <div style="margin-bottom:20px;">
+                <div style="font-size:12px;font-weight:700;color:#EF4444;">Cancelamentos</div>
+                <div style="font-size:36px;font-weight:900;color:#0F172A;line-height:1.1;">{len(canceladas_df)}</div>
+                <div style="font-size:12px;color:#64748B;">R$ {fat_cancel:,.2f}</div>
+            </div>
+            <div>
+                <div style="font-size:12px;font-weight:700;color:#16A34A;">Receita</div>
+                <div style="font-size:28px;font-weight:900;color:#0F172A;line-height:1.1;">R$ {receita:,.2f}</div>
+                <div style="font-size:12px;color:#7C3AED;font-weight:700;">margem {margem:.2f}%</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        if len(daily_agg) > 1:
+            mini = alt.Chart(daily_agg).mark_area(
+                interpolate="monotone",
+                color=alt.Gradient(gradient="linear",
+                    stops=[alt.GradientStop(color="#8B5CF666", offset=0),
+                           alt.GradientStop(color="#FFFFFF00", offset=1)],
+                    x1=1, x2=1, y1=1, y2=0),
+                line={"color": "#7C3AED", "strokeWidth": 3}
+            ).encode(
+                x=alt.X("Dia:T", title=None, axis=alt.Axis(labelAngle=0, format="%d/%m", labelFontSize=10)),
+                y=alt.Y("Receita:Q", title=None),
+                tooltip=[alt.Tooltip("Dia:T", format="%d/%m/%Y", title="Data"),
+                         alt.Tooltip("Receita:Q", format=",.2f", title="Receita")]
+            ).properties(height=230)
+            st.altair_chart(mini, use_container_width=True)
+        else:
+            st.info("Gráfico disponível com 2+ dias de dados.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with gc2:
+        st.markdown('<div class="card" style="height:100%;">', unsafe_allow_html=True)
+        st.markdown("**Resumo do Período**")
+        st.markdown(f'<div style="color:#64748B;font-size:13px;margin-bottom:16px;">Quantidade vendida por dia no período selecionado — {label_periodo}</div>',
+                    unsafe_allow_html=True)
+        if len(qty_agg) > 1:
+            dsa = daily.groupby(["Dia", "SKU"]).agg(
+                Quantidade=("Quantidade", "sum"), Receita=("Receita Bruta", "sum"),
+                Lucro=("Lucro", "sum"), Frete=("Frete", "sum"), Tarifa=("Taxas Shopee", "sum"),
+            ).reset_index()
+            dsa["Dia"] = pd.to_datetime(dsa["Dia"])
+            dsa["Margem"] = (dsa["Lucro"] / dsa["Receita"].replace(0, 1) * 100).round(1)
+            dsa["Receita_fmt"] = dsa["Receita"].apply(lambda x: f"R$ {x:,.2f}")
+            dsa["Lucro_fmt"] = dsa["Lucro"].apply(lambda x: f"R$ {x:,.2f}")
+            esc = alt.Scale(domain=skus, range=[cor_map[s] for s in skus])
+            base_qty = alt.Chart(dsa)
+            area_qty = base_qty.mark_area(interpolate="monotone", opacity=0.18, line=True).encode(
+                x=alt.X("Dia:T", title=None, axis=alt.Axis(format="%d/%m", labelFontSize=10)),
+                y=alt.Y("Quantidade:Q", title="Quantidade vendida", stack=None, axis=alt.Axis(labelFontSize=10)),
+                color=alt.Color("SKU:N", scale=esc, legend=None),
+            )
+            pontos_qty = base_qty.mark_point(filled=True, size=70).encode(
+                x="Dia:T", y="Quantidade:Q", color=alt.Color("SKU:N", scale=esc, legend=None),
+                tooltip=[alt.Tooltip("Dia:T", title="Data", format="%d/%m/%Y"),
+                         alt.Tooltip("SKU:N", title="SKU"),
+                         alt.Tooltip("Quantidade:Q", title="Qtd vendida"),
+                         alt.Tooltip("Receita_fmt:N", title="Receita"),
+                         alt.Tooltip("Lucro_fmt:N", title="Lucro"),
+                         alt.Tooltip("Margem:Q", title="Margem %", format=".1f")]
+            )
+            regras = alt.Chart(media_sku).mark_rule(strokeDash=[4, 3], strokeWidth=1.5, opacity=0.5).encode(
+                y="Media:Q", color=alt.Color("SKU:N", scale=esc, legend=None))
+            st.altair_chart((area_qty + pontos_qty + regras).properties(height=240), use_container_width=True)
+        else:
+            st.info("Gráfico disponível com 2+ dias de dados.")
+
+        legenda = '<div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:4px;">'
+        for _, ms in media_sku.iterrows():
+            cor = cor_map.get(ms["SKU"], "#666")
+            legenda += (f'<div style="display:flex;align-items:center;gap:6px;">'
+                        f'<div style="width:10px;height:10px;border-radius:50%;background:{cor};opacity:.5;"></div>'
+                        f'<span style="font-size:12px;color:#64748B;font-weight:600;">'
+                        f'{ms["SKU"]} (média: {ms["Media"]:.1f}/dia)</span></div>')
+        st.markdown(legenda + '</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # GRÁFICO LUCRO POR DIA
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="small-title">Lucro real por dia (R$)</div><br>', unsafe_allow_html=True)
+    if len(daily_agg) > 1:
+        daily_agg["Margem"] = (daily_agg["Lucro"] / daily_agg["Receita"].replace(0, 1) * 100).round(1)
+        area_l = alt.Chart(daily_agg).mark_area(
+            interpolate="monotone",
+            color=alt.Gradient(gradient="linear",
+                stops=[alt.GradientStop(color="#16A34A44", offset=0),
+                       alt.GradientStop(color="#16A34A00", offset=1)],
+                x1=1, x2=1, y1=1, y2=0)
+        ).encode(x=alt.X("Dia:T", title=None), y=alt.Y("Lucro:Q", title=None))
+        linha_l = alt.Chart(daily_agg).mark_line(
+            interpolate="monotone", color="#16A34A", strokeWidth=3).encode(x="Dia:T", y="Lucro:Q")
+        pontos_l = alt.Chart(daily_agg).mark_point(filled=True, size=80).encode(
+            x=alt.X("Dia:T", title=None), y=alt.Y("Lucro:Q", title=None),
+            color=alt.Color("Cor:N", scale=alt.Scale(domain=["Acima", "Abaixo"], range=["#16A34A", "#EF4444"]),
+                            legend=alt.Legend(title="vs Média",
+                                labelExpr="datum.label === 'Acima' ? '▲ Acima' : '▼ Abaixo'", orient="top-right")),
+            tooltip=[alt.Tooltip("Dia:T", title="Data", format="%d/%m/%Y"),
+                     alt.Tooltip("Lucro:Q", title="Lucro R$", format=",.2f"),
+                     alt.Tooltip("Receita:Q", title="Receita R$", format=",.2f"),
+                     alt.Tooltip("Quantidade:Q", title="Qtd vendida", format=",.0f"),
+                     alt.Tooltip("Margem:Q", title="Margem média %", format=".1f")])
+        regra_m = alt.Chart(pd.DataFrame({"media": [media_lucro]})).mark_rule(
+            color="#94A3B8", strokeDash=[6, 4], strokeWidth=1.5
+        ).encode(y=alt.Y("media:Q"), tooltip=[alt.Tooltip("media:Q", title="Média do período R$", format=",.2f")])
+        texto_m = alt.Chart(pd.DataFrame({"media": [media_lucro], "Dia": [daily_agg["Dia"].max()]})).mark_text(
+            align="right", dy=-8, fontSize=11, fontWeight=700, color="#64748B"
+        ).encode(x=alt.X("Dia:T"), y=alt.Y("media:Q"), text=alt.value(f"Média: R$ {media_lucro:,.0f}"))
+        st.altair_chart((area_l + linha_l + pontos_l + regra_m + texto_m).properties(height=300),
+                        use_container_width=True)
+    else:
+        st.info("Gráfico disponível com 2+ dias de dados.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # MARGEM PONDERADA POR SKU
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="small-title">Margem ponderada por SKU</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="muted">Faturamento, participação e margem ponderada — {label_periodo}</div><br>',
+                unsafe_allow_html=True)
+    sku_pond = aprovadas.groupby("SKU").agg(
+        Vendas=("Venda", "count"), Unidades=("Quantidade", "sum"),
+        Receita=("Receita Bruta", "sum"), Lucro=("Lucro", "sum"),
+    ).reset_index()
+    sku_pond["Margem %"] = (sku_pond["Lucro"] / sku_pond["Receita"].replace(0, 1) * 100).round(2)
+    sku_pond["Participação %"] = (sku_pond["Receita"] / (sku_pond["Receita"].sum() or 1) * 100).round(1)
+    sku_pond = sku_pond.sort_values("Receita", ascending=False).reset_index(drop=True)
+    for _, sr in sku_pond.iterrows():
+        cor_m = "#16A34A" if sr["Margem %"] >= 15 else "#B45309" if sr["Margem %"] >= 8 else "#DC2626"
+        bar_w = min(int(sr["Participação %"] * 3), 100)
+        bg_m = "#DCFCE7" if sr["Margem %"] >= 15 else "#FEF9C3" if sr["Margem %"] >= 8 else "#FEE2E2"
+        st.markdown(f"""
+        <div style="display:flex;align-items:center;gap:16px;padding:12px 0;border-bottom:1px solid #F1F5F9;">
+            <div style="min-width:70px;font-weight:900;color:#7C3AED;font-size:15px;">{sr['SKU'] or '—'}</div>
+            <div style="flex:1;">
+                <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                    <span style="font-weight:700;color:#0F172A;">R$ {sr['Receita']:,.2f}</span>
+                    <span style="color:#64748B;font-size:13px;">{sr['Participação %']:.1f}% do faturamento</span>
+                </div>
+                <div style="background:#F1F5F9;border-radius:999px;height:6px;">
+                    <div style="background:#7C3AED;width:{bar_w}%;height:6px;border-radius:999px;"></div>
+                </div>
+            </div>
+            <div style="min-width:80px;text-align:center;">
+                <div style="font-size:12px;color:#64748B;font-weight:600;">Vendas / Unid</div>
+                <div style="font-weight:800;color:#0F172A;">{int(sr['Vendas'])} / {int(sr['Unidades'])}</div>
+            </div>
+            <div style="min-width:90px;text-align:right;">
+                <div style="font-size:12px;color:#64748B;font-weight:600;">Lucro</div>
+                <div style="font-weight:800;color:{cor_m};">R$ {sr['Lucro']:,.2f}</div>
+            </div>
+            <div style="min-width:70px;text-align:right;">
+                <span style="background:{bg_m};color:{cor_m};border-radius:999px;padding:4px 12px;
+                             font-size:14px;font-weight:900;">{sr['Margem %']:.2f}%</span>
+            </div>
+        </div>""", unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ---------- tabela (mesmo layout da aba Financeiro) ----------
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+
+    fat_total = receita or 1
+
+    def badge(valor, total, bg, txt):
+        pct = abs(valor / total * 100) if total else 0
+        return (f'<span style="font-weight:700;">R$ {valor:,.2f}</span> '
+                f'<span style="background:{bg};color:{txt};border-radius:999px;'
+                f'padding:2px 7px;font-size:11px;font-weight:800;">{pct:.0f}%</span>')
+
+    def margem_badge(pct, lucro=None):
+        bg  = "#DCFCE7" if pct >= 15 else "#FEF9C3" if pct >= 8 else "#FEE2E2"
+        txt = "#15803D" if pct >= 15 else "#854D0E" if pct >= 8 else "#DC2626"
+        val = f'<span style="font-weight:700;color:{txt};">R$ {lucro:,.2f}</span> ' if lucro is not None else ""
+        return (f'{val}<span style="background:{bg};color:{txt};border-radius:999px;'
+                f'padding:2px 9px;font-size:12px;font-weight:800;">{pct:.1f}%</span>')
+
+    def status_icon(s):
+        s = (s or "").upper()
+        if s in ("CANCELLED", "UNPAID"):
+            return "❌"
+        if s in ("COMPLETED", "SHIPPED", "TO_CONFIRM_RECEIVE"):
+            return "🚚"
+        return "⏳"
+
+    linhas = ""
+    for _, row in df.iterrows():
+        cancelada = row["Cancelada"]
+        bg_row = "#FFF5F5" if cancelada else "white"
+        rec = row["Receita Bruta"]
+        tag_custo = ('<span style="background:#EDE9FE;color:#5B21B6;border-radius:4px;'
+                     'padding:1px 5px;font-size:10px;font-weight:700;">FIFO</span> ') if row.get("FIFO") else ""
+
+        linhas += f"""<tr style="background:{bg_row};border-bottom:1px solid #F1F5F9;">
+            <td style="padding:10px 8px;font-weight:800;color:#7C3AED;white-space:nowrap;">{row['SKU'] or '—'}</td>
+            <td style="padding:10px 8px;color:#64748B;font-size:13px;white-space:nowrap;">{pd.to_datetime(row['Data']).strftime('%d/%m/%Y %H:%M')}</td>
+            <td style="padding:10px 8px;font-size:18px;text-align:center;">{status_icon(row['Status'])}</td>
+            <td style="padding:10px 8px;text-align:center;font-weight:700;">{int(row['Quantidade'])}</td>
+            <td style="padding:10px 8px;font-weight:700;">{badge(rec, fat_total,'#DCFCE7','#15803D')}</td>
+            <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Frete'], rec,'#DBEAFE','#1D4ED8')}</td>
+            <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Taxas Shopee'], rec,'#FEF3C7','#B45309')}</td>
+            <td style="padding:10px 8px;">{'–' if cancelada else f'{tag_custo}{badge(row["Custo Total"], rec, "#EDE9FE","#6D28D9")}'}</td>
+            <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Imposto'], rec,'#F1F5F9','#475569')}</td>
+            <td style="padding:10px 8px;text-align:center;">{'<span style="color:#DC2626;font-weight:700;">Cancelada</span>' if cancelada else margem_badge(row.get('Margem %',0), row.get('Lucro',0))}</td>
+            <td style="padding:10px 8px;color:#94A3B8;font-size:12px;white-space:nowrap;">{row['Venda']}</td>
+        </tr>"""
+
+    _th = "padding:10px 8px;font-size:11px;font-weight:800;text-transform:uppercase;"
+    st.markdown(f"""<div style="overflow-x:auto;">
+    <table style="width:100%;border-collapse:collapse;font-family:'Inter',sans-serif;font-size:13px;">
+        <thead><tr style="background:#F8FAFC;border-bottom:2px solid #E2E8F0;">
+            <th style="{_th}text-align:left;color:#64748B;">SKU</th>
+            <th style="{_th}text-align:left;color:#64748B;">Data</th>
+            <th style="{_th}text-align:center;color:#64748B;">Transp.</th>
+            <th style="{_th}text-align:center;color:#64748B;">Qnt.</th>
+            <th style="{_th}text-align:left;color:#16A34A;">Receita (=)</th>
+            <th style="{_th}text-align:left;color:#1D4ED8;">Frete (-)</th>
+            <th style="{_th}text-align:left;color:#B45309;">Tarifa (-)</th>
+            <th style="{_th}text-align:left;color:#6D28D9;">Custo (-)</th>
+            <th style="{_th}text-align:left;color:#475569;">Imposto (-)</th>
+            <th style="{_th}text-align:center;color:#64748B;">M. de Contrib. (=)</th>
+            <th style="{_th}text-align:left;color:#64748B;">N.º Venda</th>
+        </tr></thead>
+        <tbody>{linhas}</tbody>
+    </table></div>""", unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    _cols_csv = ["Venda", "Data", "SKU", "Produto", "Quantidade", "Receita Bruta",
+                 "Taxas Shopee", "Frete", "Custo Total", "Imposto", "Lucro",
+                 "Margem %", "Categoria"]
+    st.download_button(
+        "Baixar CSV",
+        df[_cols_csv].to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"shopee_{d_ini}_{d_fim}.csv",
+        mime="text/csv",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ███  FIM DO BLOCO SHOPEE  █████████████████████████████████████████████████
+# ═══════════════════════════════════════════════════════════════════════════
+
 # =========================
 # ESTILOS
 # =========================
@@ -404,6 +2405,11 @@ header[data-testid="stHeader"]{display:none!important;}
              border:1px solid #E2E8F0;color:#94A3B8;font-weight:800;font-size:14px;background:#FAFBFF;}
 .kpi-card{background:#F4F1EA;border-radius:14px;padding:18px 14px;text-align:center;
           min-height:112px;display:flex;flex-direction:column;justify-content:center;overflow:hidden;}
+/* Reset do iframe do click_detector (card ADS clicável) */
+iframe[title*="click_detector"], iframe[srcdoc*="ads_toggle"]{
+    margin:0 !important; padding:0 !important; border:none !important;
+    display:block !important; width:100% !important;
+}
 .kpi-title{font-size:13px;font-weight:800;color:#44403C;text-transform:uppercase;
            letter-spacing:.25px;margin-bottom:10px;white-space:nowrap;}
 .kpi-value{font-size:clamp(20px,2.05vw,28px);font-weight:900;color:#1F2937;
@@ -462,6 +2468,58 @@ div[data-baseweb="select"]>div{border-radius:12px!important;border-color:#D8E0EC
 # =========================
 query_params = st.query_params
 code = query_params.get("code", None)
+
+# ── Desambiguação de callback OAuth ────────────────────────────────────────
+# Mercado Livre e Shopee voltam no MESMO parâmetro ?code=. O que distingue os
+# dois é que a Shopee acompanha ?shop_id=. Sem esta guarda, o código da Shopee
+# seria enviado ao Mercado Livre e voltaria como invalid_grant.
+#
+# Guardamos no session_state (e não deixamos na URL) porque o redirect da
+# Shopee pode chegar numa sessão nova: se o usuário ainda precisar logar no
+# Mercado Livre, o código da Shopee sobrevive ao login e a aba o consome
+# depois.
+_shopee_shop_id = query_params.get("shop_id", None)
+if code and _shopee_shop_id:
+    # O código da Shopee vale poucos minutos e o session_state NÃO sobrevive a
+    # esta navegação (sessão nova, login do ML perdido). Por isso trocamos o
+    # código por token aqui mesmo e gravamos direto no Supabase, que é durável.
+    #
+    # Como ainda não sabemos o user_id do Mercado Livre, a linha entra como
+    # PENDENTE e a aba Shopee a reivindica no primeiro acesso.
+    # O desfecho é mostrado AQUI e a execução para. Não dá para adiar a
+    # mensagem para a aba: o session_state morre nesta navegação, então um erro
+    # guardado nele desapareceria sem deixar rastro.
+    try:
+        _cli = ShopeeClient(
+            st.secrets["SHOPEE_PARTNER_ID"], st.secrets["SHOPEE_PARTNER_KEY"]
+        )
+        _dados = _cli.trocar_code_por_token(code, int(_shopee_shop_id))
+        salvar_token(
+            get_supabase(), SHOPEE_USER_PENDENTE, int(_shopee_shop_id),
+            _dados["access_token"], _dados["refresh_token"], _dados["expira_em"],
+        )
+        st.query_params.clear()
+        st.success("✅ Loja Shopee conectada e salva.")
+        st.info(
+            "Faça o login no Mercado Livre e abra a aba Shopee — ela já vai "
+            "estar conectada. Este login extra acontece só desta vez."
+        )
+        if st.button("Continuar para o login", type="primary"):
+            st.rerun()
+        st.stop()
+    except Exception as _e:
+        st.query_params.clear()
+        st.error("❌ Não foi possível conectar a loja Shopee.")
+        st.code(f"{type(_e).__name__}: {_e}", language="text")
+        st.caption(
+            "Causas comuns: partner_id/key de TESTE no lugar dos de PRODUÇÃO, "
+            "domínio de redirect diferente do cadastrado no console, ou código "
+            "expirado (ele vale poucos minutos)."
+        )
+        if st.button("Voltar ao dashboard"):
+            st.rerun()
+        st.stop()
+# ───────────────────────────────────────────────────────────────────────────
 
 if code and "access_token" not in st.session_state:
     with st.spinner("Conectando com o Mercado Livre..."):
@@ -566,6 +2624,719 @@ if "access_token" not in st.session_state:
 # =========================
 st.markdown('<div class="navbar"><span style="font-size:20px;">🛒</span><span class="navbar-name">REOBOTE IMPORTS</span></div>', unsafe_allow_html=True)
 
+# =========================================================
+# PROMOÇÕES ML — seller-promotions API
+# =========================================================
+PROMO_LABELS = {
+    "DEAL": "Campanha tradicional",
+    "MARKETPLACE_CAMPAIGN": "Campanha cofinanciada",
+    "SELLER_CAMPAIGN": "Campanha do vendedor",
+    "PRICE_DISCOUNT": "Desconto individual",
+    "LIGHTNING": "Oferta relâmpago",
+    "DOD": "Oferta do dia",
+    "VOLUME": "Desconto por quantidade",
+    "PRE_NEGOTIATED": "Pré-negociada",
+    "SMART": "Campanha inteligente",
+    "PRICE_MATCHING": "Igualar preço",
+    "PRICE_MATCHING_MELI_ALL": "Igualar preço (Meli)",
+    "UNHEALTHY_STOCK": "Estoque parado (Full)",
+    "SELLER_COUPON_CAMPAIGN": "Cupom do vendedor",
+}
+
+# Tipos em que o vendedor NÃO define o preço (basta aderir com o offer_id)
+PROMO_SEM_PRECO = {"MARKETPLACE_CAMPAIGN", "SMART", "PRE_NEGOTIATED",
+                   "PRICE_MATCHING", "PRICE_MATCHING_MELI_ALL", "UNHEALTHY_STOCK"}
+
+
+def _promo_headers(token):
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+
+def _promo_label(tipo):
+    return PROMO_LABELS.get(tipo, tipo or "-")
+
+
+# Tipos que NÃO expõem a lista de anúncios em /promotions/{id}/items
+PROMO_SEM_LISTA_ITENS = {"SELLER_COUPON_CAMPAIGN"}
+
+# Status HTTP transitórios do ML — vale reenviar
+_PROMO_RETRY_STATUS = {409, 425, 429, 500, 502, 503, 504}
+
+
+def _promo_request(metodo, url, token, params=None, json_body=None,
+                   tentativas=4, timeout=30):
+    """
+    Chamada à API de promoções com retry/backoff em erros transitórios
+    (409 internal_capacity_conflict, 429 rate limit, 5xx).
+    Retorna (response|None, erro_str|None).
+    """
+    espera = 1.0
+    ultimo = None
+    for n in range(tentativas):
+        try:
+            r = requests.request(metodo, url, headers=_promo_headers(token),
+                                 params=params, json=json_body, timeout=timeout)
+            if r.status_code in _PROMO_RETRY_STATUS and n < tentativas - 1:
+                ultimo = f"HTTP {r.status_code} — {r.text[:200]}"
+                time.sleep(espera)
+                espera *= 2
+                continue
+            return r, None
+        except Exception as e:
+            ultimo = str(e)
+            if n < tentativas - 1:
+                time.sleep(espera)
+                espera *= 2
+                continue
+    return None, ultimo
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def promo_campanhas_disponiveis(user_id, token):
+    """GET /seller-promotions/users/{user_id} — campanhas que o vendedor pode participar."""
+    r, err = _promo_request("GET", f"{ML_API_BASE}/seller-promotions/users/{user_id}",
+                            token, params={"app_version": "v2"}, timeout=25)
+    if r is None:
+        return {"erro": err, "campanhas": []}
+    if r.status_code != 200:
+        return {"erro": f"HTTP {r.status_code} — {r.text[:300]}", "campanhas": []}
+    data = r.json()
+    campanhas = data if isinstance(data, list) else data.get("results", [])
+    return {"erro": None, "campanhas": campanhas}
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def promo_itens_da_campanha(promotion_id, promotion_type, token, status="candidate", limite=200):
+    """
+    GET /seller-promotions/promotions/{id}/items
+    status: candidate (pode entrar) | started | pending | finished
+    Pagina com o cursor searchAfter.
+    """
+    if promotion_type in PROMO_SEM_LISTA_ITENS:
+        return {"erro": None, "itens": [],
+                "aviso": "Este tipo de campanha não expõe a lista de anúncios pela API "
+                         "(a gestão é feita no painel do Mercado Livre)."}
+
+    itens, cursor, erro = [], None, None
+    while len(itens) < limite:
+        params = {"promotion_type": promotion_type, "app_version": "v2",
+                  "status": status, "limit": 50}
+        if cursor:
+            params["searchAfter"] = cursor
+        r, err = _promo_request(
+            "GET", f"{ML_API_BASE}/seller-promotions/promotions/{promotion_id}/items",
+            token, params=params)
+        if r is None:
+            erro = err
+            break
+        if r.status_code != 200:
+            erro = f"HTTP {r.status_code} — {r.text[:300]}"
+            break
+        data = r.json()
+        lote = data.get("results", []) or []
+        itens.extend(lote)
+        cursor = (data.get("paging") or {}).get("searchAfter")
+        if not lote or not cursor:
+            break
+    return {"erro": erro, "itens": itens[:limite], "aviso": None}
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def promo_ofertas_do_item(item_id, token):
+    """GET /seller-promotions/items/{item_id} — promoções ativas e disponíveis do anúncio."""
+    r, err = _promo_request("GET", f"{ML_API_BASE}/seller-promotions/items/{item_id}",
+                            token, params={"app_version": "v2"}, timeout=25)
+    if r is None:
+        return {"erro": err, "ofertas": []}
+    if r.status_code != 200:
+        return {"erro": f"HTTP {r.status_code} — {r.text[:300]}", "ofertas": []}
+    data = r.json()
+    ofertas = data if isinstance(data, list) else data.get("results", [])
+    return {"erro": None, "ofertas": ofertas}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def promo_meus_anuncios(user_id, token, status="active", limite=300):
+    """Lista os anúncios do vendedor (id, título, preço, estoque)."""
+    ids, offset, erro = [], 0, None
+    try:
+        while len(ids) < limite:
+            r = requests.get(f"{ML_API_BASE}/users/{user_id}/items/search",
+                             headers=_promo_headers(token),
+                             params={"status": status, "limit": 50, "offset": offset}, timeout=25)
+            if r.status_code != 200:
+                erro = f"HTTP {r.status_code} — {r.text[:200]}"
+                break
+            data = r.json()
+            lote = data.get("results", []) or []
+            ids.extend(lote)
+            offset += 50
+            if len(lote) < 50 or offset >= (data.get("paging", {}).get("total", 0) or 0):
+                break
+    except Exception as e:
+        erro = str(e)
+    return {"erro": erro, "itens": promo_detalhes_itens(tuple(ids[:limite]), token)}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def promo_detalhes_itens(ids_tuple, token):
+    """Multiget /items?ids= (lotes de 20) → dict {item_id: {...}}"""
+    out = {}
+    ids = list(ids_tuple)
+    campos = "id,title,price,original_price,available_quantity,status,permalink,thumbnail,seller_custom_field"
+    for i in range(0, len(ids), 20):
+        lote = ids[i:i + 20]
+        try:
+            r = requests.get(f"{ML_API_BASE}/items",
+                             headers=_promo_headers(token),
+                             params={"ids": ",".join(lote), "attributes": campos}, timeout=25)
+            if r.status_code != 200:
+                continue
+            for reg in r.json():
+                body = reg.get("body") or {}
+                if body.get("id"):
+                    out[body["id"]] = body
+        except Exception:
+            continue
+    return out
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def promo_offer_id_candidato(promotion_id, promotion_type, item_id, token):
+    """Procura o offer_id de candidato do anúncio dentro da campanha."""
+    d = promo_itens_da_campanha(promotion_id, promotion_type, token,
+                                status="candidate", limite=1000)
+    for it in d.get("itens", []):
+        if it.get("id") == item_id:
+            return it.get("offer_id")
+    return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def promo_diagnostico(token):
+    """Lê dados do app/usuário para ajudar a diagnosticar 403 de permissão."""
+    out = {"me": None, "app": None, "erro_app": None}
+    r, _ = _promo_request("GET", f"{ML_API_BASE}/users/me", token, tentativas=2, timeout=15)
+    if r is not None and r.status_code == 200:
+        d = r.json()
+        out["me"] = {"id": d.get("id"), "nickname": d.get("nickname"),
+                     "site_id": d.get("site_id"), "tags": d.get("tags")}
+    r2, _ = _promo_request("GET", f"{ML_API_BASE}/applications/{CLIENT_ID}", token,
+                           tentativas=2, timeout=15)
+    if r2 is not None and r2.status_code == 200:
+        d = r2.json()
+        out["app"] = {"id": d.get("id"), "name": d.get("name"),
+                      "scopes": d.get("scopes"), "permissions": d.get("permissions"),
+                      "topics": d.get("notifications_topics")}
+    elif r2 is not None:
+        out["erro_app"] = f"HTTP {r2.status_code} — {r2.text[:200]}"
+    return out
+
+
+def _promo_painel_permissoes():
+    """Explica o 403 do PolicyAgent e oferece reautorização."""
+    st.markdown("##### Por que o Mercado Livre bloqueou (HTTP 403 · PolicyAgent)")
+    st.markdown(
+        "- A aplicação precisa ter a **permissão funcional de Ofertas/Promoções** "
+        "habilitada em *Minhas aplicações* no painel de desenvolvedor do ML.\n"
+        "- Depois de habilitar, o vendedor precisa **autorizar o app de novo** — "
+        "tokens emitidos antes da mudança continuam sem a permissão de escrita.\n"
+        "- Leitura (listar campanhas e anúncios elegíveis) funciona sem essa permissão; "
+        "só a adesão (POST/PUT/DELETE) é bloqueada — que é exatamente o que você está vendo."
+    )
+    st.link_button("🔐 Reautorizar no Mercado Livre", get_auth_url(), type="primary")
+
+
+def promo_incluir_item(item_id, token, promotion_id, promotion_type,
+                       deal_price=None, top_deal_price=None, offer_id=None):
+    """POST /seller-promotions/items/{item_id} — inclui o anúncio na promoção."""
+    payload = {"promotion_id": promotion_id, "promotion_type": promotion_type}
+    if offer_id:
+        payload["offer_id"] = offer_id
+    if deal_price is not None:
+        payload["deal_price"] = round(float(deal_price), 2)
+    if top_deal_price is not None:
+        payload["top_deal_price"] = round(float(top_deal_price), 2)
+    r, err = _promo_request("POST", f"{ML_API_BASE}/seller-promotions/items/{item_id}",
+                            token, params={"app_version": "v2"}, json_body=payload)
+    if r is None:
+        return False, err
+    ok = r.status_code in (200, 201)
+    return ok, (r.json() if r.content else {}) if ok else f"HTTP {r.status_code} — {r.text[:300]}"
+
+
+def promo_atualizar_preco(item_id, token, promotion_id, promotion_type,
+                          deal_price, top_deal_price=None):
+    """PUT /seller-promotions/items/{item_id} — atualiza o preço promocional."""
+    payload = {"promotion_id": promotion_id, "promotion_type": promotion_type,
+               "deal_price": round(float(deal_price), 2)}
+    if top_deal_price is not None:
+        payload["top_deal_price"] = round(float(top_deal_price), 2)
+    r, err = _promo_request("PUT", f"{ML_API_BASE}/seller-promotions/items/{item_id}",
+                            token, params={"app_version": "v2"}, json_body=payload)
+    if r is None:
+        return False, err
+    ok = r.status_code in (200, 201)
+    return ok, (r.json() if r.content else {}) if ok else f"HTTP {r.status_code} — {r.text[:300]}"
+
+
+def promo_remover_item(item_id, token, promotion_id, promotion_type, offer_id=None):
+    """DELETE /seller-promotions/items/{item_id} — tira o anúncio da promoção."""
+    params = {"promotion_id": promotion_id, "promotion_type": promotion_type,
+              "app_version": "v2"}
+    if offer_id:
+        params["offer_id"] = offer_id
+    r, err = _promo_request("DELETE", f"{ML_API_BASE}/seller-promotions/items/{item_id}",
+                            token, params=params)
+    if r is None:
+        return False, err
+    ok = r.status_code in (200, 201, 204)
+    return ok, "" if ok else f"HTTP {r.status_code} — {r.text[:300]}"
+
+
+def _promo_limpar_cache():
+    for fn in (promo_campanhas_disponiveis, promo_itens_da_campanha,
+               promo_ofertas_do_item, promo_meus_anuncios, promo_detalhes_itens):
+        try:
+            fn.clear()
+        except Exception:
+            pass
+
+
+def _promo_data(txt):
+    if not txt:
+        return "-"
+    try:
+        return pd.to_datetime(txt).strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return str(txt)[:16]
+
+
+def _promo_feedback(ok, msg, texto_ok="Feito!"):
+    """Mostra sucesso/erro sem devolver DeltaGenerator (evita eco na tela)."""
+    if ok:
+        st.success(texto_ok)
+        return
+    txt = str(msg)
+    if "403" in txt and "POLICIES" in txt.upper():
+        st.error("HTTP 403 — o Mercado Livre bloqueou a operação por política.")
+        st.caption("Detalhe: " + txt[:300])
+        _promo_painel_permissoes()
+    elif "409" in txt:
+        st.warning("HTTP 409 — limite temporário do ML. Tente novamente em instantes.")
+    else:
+        st.error(txt[:500])
+
+
+class _PromoSkip(Exception):
+    """Interrompe apenas o bloco da aba, sem parar o resto da página."""
+
+
+import contextlib
+
+
+@contextlib.contextmanager
+def _promo_bloco():
+    try:
+        yield
+    except _PromoSkip:
+        pass
+
+
+def render_promocoes(user_id, token):
+    st.markdown("## 🏷️ Central de Promoções")
+    st.caption("Campanhas do Mercado Livre disponíveis para a sua conta, anúncios elegíveis e adesão via API.")
+
+    col_a, col_b = st.columns([1, 6])
+    with col_a:
+        if st.button("🔄 Atualizar", use_container_width=True):
+            _promo_limpar_cache()
+            st.rerun()
+
+    with st.expander("🩺 Diagnóstico de permissões (abra se receber HTTP 403)"):
+        dg = promo_diagnostico(token)
+        c_d1, c_d2 = st.columns(2)
+        with c_d1:
+            st.caption("Conta autenticada")
+            st.json(dg["me"] or {"erro": "não consegui ler /users/me"})
+        with c_d2:
+            st.caption("Aplicação (scopes e permissões)")
+            if dg["app"]:
+                st.json(dg["app"])
+            else:
+                st.write(dg["erro_app"] or "Sem acesso a /applications/{app_id} "
+                         "(só o dono da aplicação consegue ler).")
+        _promo_painel_permissoes()
+
+    res = promo_campanhas_disponiveis(user_id, token)
+    if res["erro"]:
+        st.error(f"Não consegui carregar as campanhas: {res['erro']}")
+        st.info("Se for HTTP 409, é limite temporário do ML — tente de novo em instantes. "
+                "Se for 401/403, revise o token e a permissão de ofertas do app.")
+        return
+
+    campanhas = res["campanhas"]
+    if not campanhas:
+        st.warning("Nenhuma campanha disponível para esta conta no momento.")
+        return
+
+    aba1, aba2, aba3 = st.tabs(["📢 Campanhas disponíveis",
+                                "📦 Meus anúncios",
+                                "✅ Participações ativas"])
+
+    # ─────────────────────────────────────────────
+    # ABA 1 — CAMPANHAS → ITENS CANDIDATOS → ADESÃO
+    # ─────────────────────────────────────────────
+    with aba1, _promo_bloco():
+        linhas = []
+        for c in campanhas:
+            linhas.append({
+                "Campanha": c.get("name") or c.get("id"),
+                "Tipo": _promo_label(c.get("type")),
+                "Status": c.get("status", "-"),
+                "Início": _promo_data(c.get("start_date")),
+                "Fim": _promo_data(c.get("finish_date")),
+                "Prazo p/ aderir": _promo_data(c.get("deadline_date")),
+                "Desconto ML": f'{c.get("meli_percentage") or 0}%',
+                "id": c.get("id"),
+                "type_raw": c.get("type"),
+            })
+        df_camp = pd.DataFrame(linhas)
+        st.dataframe(df_camp.drop(columns=["id", "type_raw"]),
+                     use_container_width=True, hide_index=True)
+
+        opcoes = {f'{l["Campanha"]}  ·  {l["Tipo"]}  ·  {l["Status"]}': (l["id"], l["type_raw"])
+                  for l in linhas}
+        escolha = st.selectbox("Escolha a campanha para participar:", list(opcoes.keys()))
+        promo_id, promo_type = opcoes[escolha]
+
+        status_item = st.radio("Anúncios:", ["candidate", "started", "pending", "finished"],
+                               horizontal=True, format_func=lambda s: {
+                                   "candidate": "Elegíveis (podem entrar)",
+                                   "started": "Participando",
+                                   "pending": "Aguardando início",
+                                   "finished": "Encerrados"}[s],
+                               key="promo_status_item")
+
+        with st.spinner("Buscando anúncios da campanha..."):
+            dados = promo_itens_da_campanha(promo_id, promo_type, token, status=status_item)
+
+        if dados.get("aviso"):
+            st.info(dados["aviso"])
+            raise _PromoSkip()
+        if dados["erro"]:
+            if "409" in str(dados["erro"]) or "internal_capacity" in str(dados["erro"]):
+                st.warning("⏳ O Mercado Livre está limitando as consultas agora "
+                           "(409 — capacidade interna). Já tentei 4 vezes com intervalo. "
+                           "Clique abaixo para tentar de novo em alguns segundos.")
+            else:
+                st.error(f"Erro ao listar anúncios da campanha: {dados['erro']}")
+            if st.button("🔁 Tentar novamente", key=f"retry_{promo_id}_{status_item}"):
+                promo_itens_da_campanha.clear()
+                st.rerun()
+            raise _PromoSkip()
+        itens = dados["itens"]
+        if not itens:
+            st.info("Nenhum anúncio nesse status para esta campanha.")
+            raise _PromoSkip()
+
+        detalhes = promo_detalhes_itens(tuple(i.get("id") for i in itens if i.get("id")), token)
+
+        base = []
+        for it in itens:
+            iid = it.get("id")
+            det = detalhes.get(iid, {})
+            preco = it.get("price") or det.get("price") or 0
+            orig = it.get("original_price") or det.get("original_price") or preco
+            sug = (it.get("suggested_discounted_price")
+                   or it.get("next_price") or it.get("discounted_price"))
+            minp = it.get("min_discounted_price")
+            maxp = it.get("max_discounted_price")
+            base.append({
+                "Incluir": False,
+                "Anúncio": iid,
+                "Título": (det.get("title") or "")[:70],
+                "SKU": det.get("seller_custom_field") or "",
+                "Estoque": det.get("available_quantity"),
+                "Preço atual": float(preco or 0),
+                "Preço sugerido": float(sug) if sug else None,
+                "Mín. permitido": float(minp) if minp else None,
+                "Máx. permitido": float(maxp) if maxp else None,
+                "Preço promo": float(sug) if sug else float(preco or 0),
+                "offer_id": it.get("offer_id"),
+                "_orig": float(orig or 0),
+            })
+        df_it = pd.DataFrame(base)
+
+        if status_item == "candidate":
+            st.markdown("#### Defina os preços e marque o que quer incluir")
+            c1, c2, c3 = st.columns([2, 2, 3])
+            with c1:
+                pct = st.number_input("Aplicar desconto (%) sobre o preço atual",
+                                      min_value=0.0, max_value=90.0, value=0.0, step=1.0)
+            with c2:
+                if st.button("Aplicar % em todos", use_container_width=True):
+                    st.session_state["promo_pct_aplicar"] = pct
+                    st.rerun()
+            with c3:
+                st.caption("Ou edite o campo **Preço promo** linha a linha. "
+                           "Deixe em branco para usar o sugerido pelo ML.")
+
+            pct_ap = st.session_state.get("promo_pct_aplicar")
+            if pct_ap:
+                df_it["Preço promo"] = (df_it["Preço atual"] * (1 - pct_ap / 100)).round(2)
+
+            sem_preco = promo_type in PROMO_SEM_PRECO
+            cols_show = ["Incluir", "Anúncio", "Título", "SKU", "Estoque", "Preço atual"]
+            if not sem_preco:
+                cols_show += ["Preço sugerido", "Mín. permitido", "Máx. permitido", "Preço promo"]
+
+            if sem_preco:
+                st.info("Nesta campanha o desconto é definido/cofinanciado pelo Mercado Livre — "
+                        "basta marcar os anúncios e confirmar a adesão.")
+
+            edit = st.data_editor(
+                df_it[cols_show],
+                use_container_width=True, hide_index=True, height=420,
+                disabled=[c for c in cols_show if c not in ("Incluir", "Preço promo")],
+                column_config={
+                    "Incluir": st.column_config.CheckboxColumn(required=True),
+                    "Preço atual": st.column_config.NumberColumn(format="R$ %.2f"),
+                    "Preço sugerido": st.column_config.NumberColumn(format="R$ %.2f"),
+                    "Mín. permitido": st.column_config.NumberColumn(format="R$ %.2f"),
+                    "Máx. permitido": st.column_config.NumberColumn(format="R$ %.2f"),
+                    "Preço promo": st.column_config.NumberColumn(format="R$ %.2f", min_value=0.0),
+                },
+                key=f"editor_promo_{promo_id}_{promo_type}_{status_item}",
+            )
+
+            marcados = edit[edit["Incluir"] == True]  # noqa: E712
+            st.markdown(f"**{len(marcados)}** anúncio(s) selecionado(s).")
+
+            if len(marcados) and st.button("🚀 Incluir na campanha", type="primary"):
+                barra = st.progress(0.0)
+                ok_n, erros = 0, []
+                total = len(marcados)
+                for n, (_, row) in enumerate(marcados.iterrows(), start=1):
+                    iid = row["Anúncio"]
+                    offer_id = df_it.loc[df_it["Anúncio"] == iid, "offer_id"].iloc[0]
+                    if sem_preco and not offer_id:
+                        offer_id = promo_offer_id_candidato(promo_id, promo_type, iid, token)
+                    preco_promo = None if sem_preco else float(row.get("Preço promo") or 0)
+                    ok, resp = promo_incluir_item(
+                        iid, token, promo_id, promo_type,
+                        deal_price=preco_promo, offer_id=offer_id)
+                    if ok:
+                        ok_n += 1
+                    else:
+                        erros.append(f"{iid}: {resp}")
+                    barra.progress(n / total)
+                _promo_limpar_cache()
+                if ok_n:
+                    st.success(f"✅ {ok_n} anúncio(s) incluído(s) na campanha.")
+                if erros:
+                    st.error("Falhas:")
+                    for e in erros:
+                        st.write(f"• {e}")
+                    if any("403" in e for e in erros):
+                        _promo_painel_permissoes()
+                if ok_n and not erros:
+                    st.rerun()
+        else:
+            st.dataframe(df_it[["Anúncio", "Título", "SKU", "Estoque",
+                                "Preço atual", "Preço promo"]],
+                         use_container_width=True, hide_index=True)
+            iid_rm = st.selectbox("Remover anúncio da campanha:",
+                                  ["—"] + list(df_it["Anúncio"]), key="promo_rm_camp")
+            if iid_rm != "—" and st.button("🗑️ Remover da campanha"):
+                offer_id = df_it.loc[df_it["Anúncio"] == iid_rm, "offer_id"].iloc[0]
+                ok, msg = promo_remover_item(iid_rm, token, promo_id, promo_type, offer_id)
+                _promo_limpar_cache()
+                _promo_feedback(ok, msg, "Removido.")
+                if ok:
+                    st.rerun()
+
+    # ─────────────────────────────────────────────
+    # ABA 2 — MEUS ANÚNCIOS → PROMOÇÕES DISPONÍVEIS
+    # ─────────────────────────────────────────────
+    with aba2, _promo_bloco():
+        anuncios = promo_meus_anuncios(str(user_id), token)
+        if anuncios["erro"]:
+            st.error(anuncios["erro"])
+            raise _PromoSkip()
+        itens = anuncios["itens"]
+        if not itens:
+            st.info("Nenhum anúncio ativo encontrado.")
+            raise _PromoSkip()
+
+        busca = st.text_input("Buscar por título, MLB ou SKU", key="promo_busca")
+        lista = []
+        for iid, d in itens.items():
+            alvo = f'{iid} {d.get("title","")} {d.get("seller_custom_field","")}'.lower()
+            if busca and busca.lower() not in alvo:
+                continue
+            lista.append({"Anúncio": iid, "Título": (d.get("title") or "")[:70],
+                          "SKU": d.get("seller_custom_field") or "",
+                          "Preço": d.get("price"), "Estoque": d.get("available_quantity")})
+        df_an = pd.DataFrame(lista)
+        st.dataframe(df_an, use_container_width=True, hide_index=True, height=320)
+
+        if df_an.empty:
+            st.info("Nenhum anúncio encontrado para essa busca.")
+            raise _PromoSkip()
+        sel = st.selectbox("Ver promoções disponíveis para o anúncio:",
+                           df_an["Anúncio"].tolist(),
+                           format_func=lambda i: f'{i} — {itens.get(i, {}).get("title", "")[:50]}',
+                           key="promo_item_sel")
+
+        of = promo_ofertas_do_item(sel, token)
+        if of["erro"]:
+            st.warning(f"Não consegui ler as promoções deste anúncio: {of['erro']}")
+            raise _PromoSkip()
+        ofertas = of["ofertas"]
+        if not ofertas:
+            st.info("Este anúncio não tem promoções disponíveis nem ativas.")
+            raise _PromoSkip()
+
+        preco_atual = float(itens.get(sel, {}).get("price") or 0)
+        for pos, o in enumerate(ofertas):
+            tipo = o.get("type") or o.get("promotion_type")
+            status = (o.get("status") or "").lower()
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([3, 2, 2])
+                with c1:
+                    st.markdown(f'**{o.get("name") or _promo_label(tipo)}**')
+                    st.caption(f'{_promo_label(tipo)} · status: {status or "-"} · id: {o.get("id")}')
+                with c2:
+                    st.caption(f'Início {_promo_data(o.get("start_date"))}')
+                    st.caption(f'Fim {_promo_data(o.get("finish_date"))}')
+                with c3:
+                    sug = o.get("suggested_discounted_price") or o.get("price")
+                    st.metric("Preço sugerido", f'R$ {float(sug):.2f}' if sug else "—")
+
+                # índice garante chave única mesmo se o ML devolver ofertas
+                # com o mesmo id/tipo (ou sem id) para o mesmo anúncio
+                chave = f'{sel}_{o.get("id") or "noid"}_{tipo or "notype"}_{o.get("offer_id") or ""}_{pos}'
+                # offer_id do candidato: obrigatório em SMART/LIGHTNING/DOD etc.
+                offer_id = (o.get("offer_id") or o.get("candidate_id")
+                            or (o.get("offer") or {}).get("id"))
+
+                if status in ("candidate", ""):
+                    if tipo in PROMO_SEM_PRECO:
+                        if st.button("Participar", key=f"btn_join_{chave}", type="primary"):
+                            oid = offer_id or promo_offer_id_candidato(
+                                o.get("id"), tipo, sel, token)
+                            if not oid:
+                                st.error("Não encontrei o `offer_id` de candidato deste "
+                                         "anúncio nesta campanha — o ML exige esse campo "
+                                         "para aderir. Tente pela aba **Campanhas disponíveis**.")
+                            else:
+                                ok, msg = promo_incluir_item(sel, token, o.get("id"), tipo,
+                                                             offer_id=oid)
+                                _promo_limpar_cache()
+                                _promo_feedback(ok, msg, "Incluído!")
+                                if ok:
+                                    st.rerun()
+                    else:
+                        cpa, cpb = st.columns([2, 1])
+                        with cpa:
+                            novo = st.number_input(
+                                "Preço promocional", min_value=0.0,
+                                value=float(o.get("suggested_discounted_price") or preco_atual),
+                                step=0.01, key=f"preco_{chave}")
+                        with cpb:
+                            st.write("")
+                            if st.button("Participar", key=f"btn_join_{chave}", type="primary"):
+                                ok, msg = promo_incluir_item(sel, token, o.get("id"), tipo,
+                                                            deal_price=novo,
+                                                            offer_id=offer_id)
+                                _promo_limpar_cache()
+                                _promo_feedback(ok, msg, "Incluído!")
+                                if ok:
+                                    st.rerun()
+                else:
+                    if st.button("🗑️ Sair desta promoção", key=f"btn_out_{chave}"):
+                        ok, msg = promo_remover_item(sel, token, o.get("id"), tipo,
+                                                     offer_id)
+                        _promo_limpar_cache()
+                        _promo_feedback(ok, msg, "Removido.")
+                        if ok:
+                            st.rerun()
+
+    # ─────────────────────────────────────────────
+    # ABA 3 — PARTICIPAÇÕES ATIVAS
+    # ─────────────────────────────────────────────
+    with aba3, _promo_bloco():
+        st.caption("Anúncios que já estão em campanhas (status started/pending). "
+                   "A varredura consulta todas as campanhas, por isso roda sob demanda.")
+        if not st.session_state.get("promo_scan_ativas"):
+            if st.button("🔎 Varrer participações ativas", type="primary"):
+                st.session_state["promo_scan_ativas"] = True
+                st.rerun()
+            raise _PromoSkip()
+
+        linhas, falhas = [], []
+        ativas = [c for c in campanhas
+                  if (c.get("status") or "").lower() != "finished"
+                  and c.get("type") not in PROMO_SEM_LISTA_ITENS]
+        barra_scan = st.progress(0.0, text="Varrendo campanhas...")
+        for n_c, c in enumerate(ativas, start=1):
+            for st_i in ("started", "pending"):
+                d = promo_itens_da_campanha(c.get("id"), c.get("type"), token, status=st_i, limite=100)
+                if d["erro"]:
+                    falhas.append(f'{c.get("name") or c.get("id")} ({st_i}): {d["erro"][:80]}')
+                    continue
+                time.sleep(0.2)  # respira entre chamadas para não tomar 409
+                for it in d["itens"]:
+                    linhas.append({
+                        "Campanha": c.get("name") or c.get("id"),
+                        "Tipo": _promo_label(c.get("type")),
+                        "Status": st_i,
+                        "Anúncio": it.get("id"),
+                        "Preço promo": it.get("price"),
+                        "Preço original": it.get("original_price"),
+                        "promotion_id": c.get("id"),
+                        "promotion_type": c.get("type"),
+                        "offer_id": it.get("offer_id"),
+                    })
+            barra_scan.progress(n_c / max(len(ativas), 1), text=f"Varrendo campanhas... {n_c}/{len(ativas)}")
+        barra_scan.empty()
+
+        if falhas:
+            with st.expander(f"⚠️ {len(falhas)} campanha(s) não puderam ser lidas agora"):
+                for f in falhas:
+                    st.write(f"• {f}")
+
+        c_re1, c_re2 = st.columns([1, 5])
+        with c_re1:
+            if st.button("🔄 Refazer varredura"):
+                promo_itens_da_campanha.clear()
+                st.rerun()
+
+        if not linhas:
+            st.info("Nenhuma participação ativa no momento.")
+        else:
+            df_p = pd.DataFrame(linhas)
+            detalhes = promo_detalhes_itens(tuple(df_p["Anúncio"].dropna().unique()), token)
+            df_p["Título"] = df_p["Anúncio"].map(lambda i: (detalhes.get(i, {}).get("title") or "")[:60])
+            st.dataframe(df_p[["Campanha", "Tipo", "Status", "Anúncio", "Título",
+                               "Preço original", "Preço promo"]],
+                         use_container_width=True, hide_index=True)
+
+            st.markdown("##### Remover participação")
+            idx = st.selectbox("Selecione:", df_p.index,
+                               format_func=lambda i: f'{df_p.loc[i,"Anúncio"]} — {df_p.loc[i,"Campanha"]}',
+                               key="promo_rm_ativa")
+            if st.button("🗑️ Remover"):
+                r = df_p.loc[idx]
+                ok, msg = promo_remover_item(r["Anúncio"], token, r["promotion_id"],
+                                             r["promotion_type"], r["offer_id"])
+                _promo_limpar_cache()
+                _promo_feedback(ok, msg, "Removido.")
+                if ok:
+                    st.rerun()
+
+
 # =========================
 # DASHBOARD
 # =========================
@@ -576,15 +3347,15 @@ nickname = get_user_info(str(user_id), token).get("nickname", "Vendedor")
 if "aba_ativa" not in st.session_state:
     st.session_state["aba_ativa"] = "financeiro"
 
-nav_cols = st.columns([2, 2, 2, 2, 4])
-abas = [("financeiro","📊 Financeiro"), ("custos","📦 Custos"), ("regime","🏛️ Regime"), ("caixa","💰 Caixa")]
-for col, (aba_id, aba_label) in zip(nav_cols[:4], abas):
+nav_cols = st.columns([3, 3, 2, 2, 2, 2, 2, 2])
+abas = [("financeiro","📊 Operação ML"), ("shopee","🛍️ Operação Shopee"), ("custos","📦 Custos"), ("regime","🏛️ Regime"), ("caixa","💰 Caixa"), ("fechamento","📅 Fechamento"), ("promocoes","🏷️ Promoções")]
+for col, (aba_id, aba_label) in zip(nav_cols[:7], abas):
     with col:
         if st.button(aba_label, use_container_width=True,
                      type="primary" if st.session_state["aba_ativa"] == aba_id else "secondary"):
             st.session_state["aba_ativa"] = aba_id
             st.rerun()
-with nav_cols[4]:
+with nav_cols[7]:
     c1, c2 = st.columns([1,1])
     with c2:
         if st.button("🔓 Sair", use_container_width=True):
@@ -636,20 +3407,24 @@ if st.session_state["aba_ativa"] == "financeiro":
 
     if not orders:
         st.info("Nenhuma venda encontrada no período.")
-        st.stop()
+        raise _PromoSkip()
 
     shipping_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in orders if o.get("shipping",{}).get("id")}))
     token_hash   = token[-8:] if token else ""
 
     with st.spinner("Buscando fretes..."):
-        fretes       = fetch_fretes_batch(shipping_ids, token_hash, token)
+        shipments_info = fetch_shipments_batch(shipping_ids, token_hash, token)
+        fretes = {sid: info.get("cost", 0.0) for sid, info in shipments_info.items()}
     # Detecta reembolsos nas orders já buscadas — sem chamada extra à API
     reembolsados = get_orders_reembolsados(orders)
 
-    df_raw = parse_orders(orders, fretes, reembolsados)
+    ids_devolucao = tuple(sorted(str(o.get("id")) for o in orders
+        if o.get("status") == "cancelled" or str(o.get("id")) in reembolsados))
+    custos_devolucao = get_custos_devolucao(ids_devolucao, token_hash, token)
+    df_raw = parse_orders(orders, fretes, reembolsados, shipments_info, custos_devolucao)
     if df_raw.empty:
         st.info("Nenhuma venda encontrada.")
-        st.stop()
+        raise _PromoSkip()
 
     with st.spinner("Calculando custos e margens..."):
         df = apply_costs_online(df_raw, str(user_id))
@@ -661,31 +3436,68 @@ if st.session_state["aba_ativa"] == "financeiro":
     fretes_sum  = aprovadas["Frete"].sum()
     custos      = aprovadas["Custo Total"].sum()
     impostos    = aprovadas["Imposto"].sum()
-    lucro_total = aprovadas["Lucro"].sum()
+
+    # Gasto com ADS no mesmo período (ao vivo)
+    _adv_id_fin   = get_advertiser_id(token[-8:] if token else "", token)
+    _ads_from_fin = date_from[:10]  # YYYY-MM-DD
+    _ads_to_fin   = date_to[:10]
+    ads_cost      = fetch_ads_cost(_adv_id_fin, token[-8:] if token else "", token, _ads_from_fin, _ads_to_fin)
+
+    # Toggle ADS no lucro (clicável no card de ADS abaixo)
+    if "ads_on" not in st.session_state:
+        st.session_state["ads_on"] = True
+    ads_on  = st.session_state["ads_on"]
+    ads_eff = ads_cost if ads_on else 0.0
+
+    lucro_total = aprovadas["Lucro"].sum() - ads_eff
     margem_real = (lucro_total / faturamento * 100) if faturamento > 0 else 0
     # Salva lucro no session_state para uso no ROI do Caixa
     if "lucro_acumulado" not in st.session_state or periodo == "Personalizar":
         st.session_state["lucro_acumulado"] = lucro_total
 
+    # ── Descoberta: buscar dados dos sensores (exibidos no painel de diagnóstico abaixo) ──
+    _diag = None
+    _sensor_erro = None
+    _hist_erro = None
+    try:
+        _info = get_user_info(str(user_id), token) if token else {}
+        if not _info:
+            _sensor_erro = f"get_user_info retornou vazio (user_id={user_id}, token_ok={bool(token)})"
+        if _info:
+            _mk = extrair_marcadores_conta(_info)
+            _snap = montar_snapshot_sensores(_mk)
+            # histórico e persistência são OPCIONAIS: se a tabela não existir,
+            # os sensores atuais continuam aparecendo (só não há detecção de mudança).
+            _mud = {}
+            try:
+                _hist = load_sensores_hist(str(user_id))
+                _mud = detectar_mudancas_sensores(_hist, _snap)
+                salvar_snapshot_sensores(str(user_id), _snap)
+            except Exception as _he:
+                _hist_erro = f"{type(_he).__name__}: {_he}"
+            _diag = (_mk, _snap, _mud, _info)
+    except Exception as _e:
+        _sensor_erro = f"Exceção ao ler /users/id: {type(_e).__name__}: {_e}"
+
     # HERO
-    st.markdown(f"""
-    <div class="hero">
-      <div style="display:flex;justify-content:space-between;gap:30px;align-items:flex-start;">
-        <div>
-          <p class="hero-small">Resumo</p>
-          <h1 class="hero-title">Financeiro</h1>
-          <div style="background:rgba(255,255,255,.18);color:white;border:1px solid rgba(255,255,255,.35);
-                      border-radius:999px;padding:10px 16px;font-weight:900;width:fit-content;">
-              Período selecionado: {label_periodo}
-          </div>
-        </div>
-        <div style="min-width:320px;">
-          <div class="hero-value-label">Faturamento</div>
-          <div class="hero-value">R$ {faturamento:,.2f}</div>
-        </div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="hero">'
+        f'<div style="display:flex;justify-content:space-between;gap:30px;align-items:flex-start;">'
+        f'<div>'
+        f'<p class="hero-small">Resumo</p>'
+        f'<h1 class="hero-title">Operação ML</h1>'
+        f'<div style="background:rgba(255,255,255,.18);color:white;border:1px solid rgba(255,255,255,.35);'
+        f'border-radius:999px;padding:10px 16px;font-weight:900;width:fit-content;">'
+        f'Período selecionado: {label_periodo}</div>'
+        f'</div>'
+        f'<div style="min-width:320px;">'
+        f'<div class="hero-value-label">Faturamento</div>'
+        f'<div class="hero-value">R$ {faturamento:,.2f}</div>'
+        f'</div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True)
+
 
     # KPIs — metric-card estilo local (dashed border + barra colorida)
     def metric_card(col, title, value, sub, color):
@@ -696,9 +3508,13 @@ if st.session_state["aba_ativa"] == "financeiro":
         </div>""", unsafe_allow_html=True)
 
     def kpi_card(col, title, value, color="#1F2937"):
-        col.markdown(f"""<div class="kpi-card">
-            <div class="kpi-title">{title}</div>
-            <div class="kpi-value" style="color:{color};">{value}</div>
+        col.markdown(f"""<div style="background:#F4F1EA;border:1px solid transparent;border-radius:14px;
+                                     padding:18px 14px;text-align:center;min-height:150px;
+                                     display:flex;flex-direction:column;justify-content:center;">
+            <div style="font-size:13px;font-weight:800;color:#44403C;text-transform:uppercase;
+                        letter-spacing:.25px;margin-bottom:10px;">{title}</div>
+            <div style="font-size:24px;color:{color};font-weight:900;letter-spacing:-.8px;
+                        line-height:1.05;white-space:nowrap;">{value}</div>
         </div>""", unsafe_allow_html=True)
 
     pct = lambda v: f"{v/faturamento*100:.1f}%" if faturamento else "0%"
@@ -738,15 +3554,55 @@ if st.session_state["aba_ativa"] == "financeiro":
         </div>""", unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # 6 KPI-cards bege (Receita, Taxas, Frete, Custo, Lucro, Margem)
+    # 7 KPI-cards bege em grade 3+3+1 simétrica
     k1, k2, k3 = st.columns(3)
     kpi_card(k1, "Receita Bruta",  f"R$ {faturamento:,.2f}")
     kpi_card(k2, "Taxas ML",       f"R$ {tarifas:,.2f}",    "#EF4444")
     kpi_card(k3, "Frete ML",       f"R$ {fretes_sum:,.2f}", "#EF4444")
+    st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
     k4, k5, k6 = st.columns(3)
-    kpi_card(k4, "Custo Produto",  f"R$ {custos:,.2f}",     "#EF4444")
-    kpi_card(k5, "Lucro Real",     f"R$ {lucro_total:,.2f}", "#059669" if lucro_total >= 0 else "#DC2626")
-    kpi_card(k6, "Margem",         f"{margem_real:.2f}%",   "#B45309")
+    # Card ADS clicável: chip ON/OFF no canto superior direito
+    # Usa st_click_detector para o card inteiro virar clicável
+    _ads_color = "#EF4444" if ads_on else "#9CA3AF"
+    _ads_val_html = (
+        f"R$ {ads_cost:,.2f}" if ads_on
+        else f"<span style='text-decoration:line-through;'>R$ {ads_cost:,.2f}</span>"
+    )
+    _ads_sub   = "contando no lucro" if ads_on else "ignorado no lucro"
+    _chip_bg   = "#16A34A" if ads_on else "#9CA3AF"
+    _chip_txt  = "ON ⇋" if ads_on else "OFF ⇋"
+    _border    = "#EF4444" if ads_on else "#D1D5DB"
+    with k4:
+        _card_html = f"""
+        <style>
+            body{{margin:0;padding:0;}}
+            html,body{{height:100%;}}
+        </style>
+        <a href='#' id='ads_toggle' style='text-decoration:none;color:inherit;display:block;'>
+          <div style='background:#F4F1EA;border:1px solid {_border};border-radius:14px;
+                      padding:18px 14px;text-align:center;position:relative;cursor:pointer;
+                      min-height:150px;box-sizing:border-box;
+                      display:flex;flex-direction:column;justify-content:center;'>
+            <span style='position:absolute;top:10px;right:12px;background:{_chip_bg};color:white;
+                         font-size:9px;font-weight:700;letter-spacing:.5px;padding:3px 8px;
+                         border-radius:99px;text-transform:uppercase;'>{_chip_txt}</span>
+            <div style='font-size:13px;font-weight:800;color:#44403C;text-transform:uppercase;
+                        letter-spacing:.25px;margin-bottom:10px;'>ADS (Product Ads)</div>
+            <div style='font-size:24px;color:{_ads_color};font-weight:900;letter-spacing:-.8px;
+                        line-height:1.05;'>{_ads_val_html}</div>
+            <div style='font-size:11px;color:#64748B;margin-top:6px;'>{_ads_sub}</div>
+          </div>
+        </a>
+        """
+        _clicked = click_detector(_card_html, key=f"ads_click_{ads_on}")
+        if _clicked == "ads_toggle":
+            st.session_state["ads_on"] = not ads_on
+            st.rerun()
+    kpi_card(k5, "Custo Produto",  f"R$ {custos:,.2f}",     "#EF4444")
+    kpi_card(k6, "Lucro Real",     f"R$ {lucro_total:,.2f}", "#059669" if lucro_total >= 0 else "#DC2626")
+    st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
+    k7, _, _ = st.columns(3)
+    kpi_card(k7, "Margem",         f"{margem_real:.2f}%",   "#B45309")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -861,7 +3717,7 @@ if st.session_state["aba_ativa"] == "financeiro":
 
             area_qty = base_qty.mark_area(interpolate="monotone", opacity=0.18, line=True).encode(
                 x=alt.X("Dia:T", title=None, axis=alt.Axis(format="%d/%m", labelFontSize=10)),
-                y=alt.Y("Quantidade:Q", title="Quantidade vendida", axis=alt.Axis(labelFontSize=10)),
+                y=alt.Y("Quantidade:Q", title="Quantidade vendida", stack=None, axis=alt.Axis(labelFontSize=10)),
                 color=alt.Color("SKU:N", scale=alt.Scale(domain=skus, range=[cor_map[s] for s in skus]), legend=None),
             )
             pontos_qty = base_qty.mark_point(filled=True, size=70).encode(
@@ -913,6 +3769,201 @@ if st.session_state["aba_ativa"] == "financeiro":
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
+
+    # ─── QUADRO COMPARATIVO SEMANAL (só quando filtro é mês completo) ───
+    import calendar as _cal_sw
+    try:
+        _df_dt = pd.to_datetime(date_from)
+        _dt_dt = pd.to_datetime(date_to)
+        _ult_ref = _cal_sw.monthrange(_df_dt.year, _df_dt.month)[1]
+        _eh_mes_completo_sw = (
+            _df_dt.year == _dt_dt.year and _df_dt.month == _dt_dt.month
+            and _df_dt.day == 1 and _dt_dt.day == _ult_ref
+        )
+    except Exception:
+        _eh_mes_completo_sw = False
+
+    if _eh_mes_completo_sw:
+        _ano_ref, _mes_num_ref = _df_dt.year, _df_dt.month
+        # Mês anterior
+        if _mes_num_ref == 1:
+            _ano_prev, _mes_prev = _ano_ref - 1, 12
+        else:
+            _ano_prev, _mes_prev = _ano_ref, _mes_num_ref - 1
+        _ultimo_prev = _cal_sw.monthrange(_ano_prev, _mes_prev)[1]
+        _from_prev = f"{_ano_prev}-{_mes_prev:02d}-01T00:00:00.000-03:00"
+        _to_prev   = f"{_ano_prev}-{_mes_prev:02d}-{_ultimo_prev:02d}T23:59:59.000-03:00"
+
+        with st.spinner("Buscando dados do mês anterior..."):
+            _orders_prev = get_orders(str(user_id), token, _from_prev, _to_prev)
+            _ship_ids_prev = tuple(sorted({o.get("shipping",{}).get("id") for o in _orders_prev if o.get("shipping",{}).get("id")}))
+            _shipinfo_prev = fetch_shipments_batch(_ship_ids_prev, token[-8:] if token else "", token)
+            _fretes_prev = {sid: info.get("cost", 0.0) for sid, info in _shipinfo_prev.items()}
+            _reimb_prev  = get_orders_reembolsados(_orders_prev)
+            _ids_dev_prev = tuple(sorted(str(o.get("id")) for o in _orders_prev
+                if o.get("status") == "cancelled" or str(o.get("id")) in _reimb_prev))
+            _custos_dev_prev = get_custos_devolucao(_ids_dev_prev, token[-8:] if token else "", token)
+            _df_raw_prev = parse_orders(_orders_prev, _fretes_prev, _reimb_prev,
+                                        _shipinfo_prev, _custos_dev_prev)
+            _aprov_prev  = _df_raw_prev[~_df_raw_prev["Cancelada"]] if not _df_raw_prev.empty else _df_raw_prev
+
+        # Função auxiliar: agrega faturamento e unidades por semana (dias 1-7, 8-14, 15-21, 22-fim)
+        def _agrega_semanas(df_aprov, ano, mes):
+            _ult_dia = _cal_sw.monthrange(ano, mes)[1]
+            _semanas = [
+                ("Semana 1", 1, 7),
+                ("Semana 2", 8, 14),
+                ("Semana 3", 15, 21),
+                ("Semana 4", 22, _ult_dia),
+            ]
+            _out = []
+            for _label, _di, _df_dia in _semanas:
+                if df_aprov.empty:
+                    _out.append({"label": _label, "di": _di, "df": _df_dia, "fat": 0.0, "qtd": 0})
+                    continue
+                _df_s = df_aprov[
+                    (df_aprov["Data"].dt.year == ano) &
+                    (df_aprov["Data"].dt.month == mes) &
+                    (df_aprov["Data"].dt.day >= _di) &
+                    (df_aprov["Data"].dt.day <= _df_dia)
+                ]
+                _fat = float(_df_s["Receita Bruta"].sum())
+                _qtd = int(_df_s["Quantidade"].sum()) if "Quantidade" in _df_s.columns else len(_df_s)
+                _out.append({"label": _label, "di": _di, "df": _df_dia, "fat": _fat, "qtd": _qtd})
+            return _out
+
+        _semanas_atual = _agrega_semanas(aprovadas, _ano_ref, _mes_num_ref)
+        _semanas_prev  = _agrega_semanas(_aprov_prev, _ano_prev, _mes_prev)
+
+        # Detecta se o mês de referência é o mês corrente (para marcar semana em curso)
+        import zoneinfo as _zi_sw
+        _tz_sw = _zi_sw.ZoneInfo("America/Sao_Paulo")
+        _hoje_sw = pd.Timestamp.now(_tz_sw).date()
+        _mes_ref_completo = (_hoje_sw.year, _hoje_sw.month) != (_ano_ref, _mes_num_ref)
+
+        _meses_pt_sw = ["","jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"]
+        _rot_atual = f"{_meses_pt_sw[_mes_num_ref]}/{str(_ano_ref)[2:]}"
+        _rot_prev  = f"{_meses_pt_sw[_mes_prev]}/{str(_ano_prev)[2:]}"
+
+        # Monta os 4 cards
+        _cards_html = ""
+        for _s_at, _s_pr in zip(_semanas_atual, _semanas_prev):
+            _di, _df_dia = _s_at["di"], _s_at["df"]
+            _fat_at, _fat_pr = _s_at["fat"], _s_pr["fat"]
+            _qtd_at, _qtd_pr = _s_at["qtd"], _s_pr["qtd"]
+
+            _parcial = (not _mes_ref_completo) and (_di <= _hoje_sw.day <= _df_dia) and (_hoje_sw.month == _mes_num_ref)
+            _futura  = (not _mes_ref_completo) and (_hoje_sw.day < _di) and (_hoje_sw.month == _mes_num_ref)
+
+            if _fat_pr > 0 and not _parcial and not _futura:
+                _delta_fat = (_fat_at - _fat_pr) / _fat_pr * 100
+            else:
+                _delta_fat = None
+            if _qtd_pr > 0 and not _parcial and not _futura:
+                _delta_qtd = (_qtd_at - _qtd_pr) / _qtd_pr * 100
+            else:
+                _delta_qtd = None
+
+            if _parcial:
+                _border_c = "#FCD34D"; _bg_c = "#FFFBEB"
+                _badge_bg = "#F59E0B"; _badge_txt = "parcial"
+            elif _futura:
+                _border_c = "#E2E8F0"; _bg_c = "#F8FAFC"
+                _badge_bg = "#94A3B8"; _badge_txt = "próxima"
+            elif _delta_fat is None:
+                _border_c = "#E2E8F0"; _bg_c = "#F8FAFC"
+                _badge_bg = "#94A3B8"; _badge_txt = "sem dados"
+            elif _delta_fat >= 0:
+                _border_c = "#86EFAC"; _bg_c = "#F0FDF4"
+                _badge_bg = "#16A34A"; _badge_txt = ("▲ %.1f%%" % _delta_fat).replace(".",",")
+            else:
+                _border_c = "#FCA5A5"; _bg_c = "#FEF2F2"
+                _badge_bg = "#DC2626"; _badge_txt = ("▼ %.1f%%" % abs(_delta_fat)).replace(".",",")
+
+            _max_fat = max(_fat_at, _fat_pr, 1)
+            _flex_at = _fat_at / _max_fat if _max_fat > 0 else 0
+            _flex_pr = _fat_pr / _max_fat if _max_fat > 0 else 0
+
+            if _delta_qtd is None:
+                _delta_qtd_html = ""
+            elif _delta_qtd >= 0:
+                _delta_qtd_html = " · <span style='color:#16A34A;'>" + ("▲ %.1f%%" % _delta_qtd).replace(".",",") + "</span>"
+            else:
+                _delta_qtd_html = " · <span style='color:#DC2626;'>" + ("▼ %.1f%%" % abs(_delta_qtd)).replace(".",",") + "</span>"
+
+            _cards_html += (
+                f"<div style='border:1px solid {_border_c};background:{_bg_c};border-radius:12px;padding:14px 14px 12px;'>"
+                f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;'>"
+                f"<div><div style='font-size:13px;font-weight:800;color:#0F172A;'>{_s_at['label']}</div>"
+                f"<div style='font-size:10px;color:#64748B;margin-top:1px;'>{_di:02d}–{_df_dia:02d} {_meses_pt_sw[_mes_num_ref]}</div></div>"
+                f"<div style='background:{_badge_bg};color:white;font-size:10px;font-weight:700;padding:3px 8px;border-radius:99px;white-space:nowrap;'>{_badge_txt}</div>"
+                f"</div>"
+                f"<div style='margin-bottom:10px;'>"
+                f"<div style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:.3px;margin-bottom:3px;'>Faturamento</div>"
+                f"<div style='font-size:16px;font-weight:800;color:#0F172A;'>R$ {_fat_at:,.0f}</div>"
+                f"<div style='display:flex;gap:2px;height:4px;margin-top:6px;'>"
+                f"<div style='flex:{_flex_at:.3f};background:#7C3AED;border-radius:2px;min-width:2px;'></div>"
+                f"<div style='flex:{_flex_pr:.3f};background:#CBD5E1;border-radius:2px;min-width:2px;'></div>"
+                f"</div>"
+                f"<div style='font-size:10px;color:#94A3B8;margin-top:3px;'>vs R$ {_fat_pr:,.0f}</div>"
+                f"</div>"
+                f"<div>"
+                f"<div style='font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:.3px;margin-bottom:3px;'>Unidades</div>"
+                f"<div style='font-size:16px;font-weight:800;color:#0F172A;'>{_qtd_at}</div>"
+                f"<div style='font-size:10px;color:#94A3B8;margin-top:2px;'>vs {_qtd_pr}{_delta_qtd_html}</div>"
+                f"</div>"
+                f"</div>"
+            )
+
+        _fat_tot_at = sum(s["fat"] for s in _semanas_atual)
+        _fat_tot_pr = sum(s["fat"] for s in _semanas_prev)
+        _qtd_tot_at = sum(s["qtd"] for s in _semanas_atual)
+        _qtd_tot_pr = sum(s["qtd"] for s in _semanas_prev)
+        _d_fat_tot = ((_fat_tot_at - _fat_tot_pr) / _fat_tot_pr * 100) if _fat_tot_pr > 0 else None
+        _d_qtd_tot = ((_qtd_tot_at - _qtd_tot_pr) / _qtd_tot_pr * 100) if _qtd_tot_pr > 0 else None
+
+        def _fmt_delta(d):
+            if d is None:
+                return "<span style='color:#94A3B8;'>—</span>"
+            if d >= 0:
+                return "<span style='color:#16A34A; font-weight:700;'>" + ("▲ %.1f%%" % d).replace(".",",") + "</span>"
+            return "<span style='color:#DC2626; font-weight:700;'>" + ("▼ %.1f%%" % abs(d)).replace(".",",") + "</span>"
+
+        st.markdown(
+            "<div style='background:white;border:0.5px solid #E2E8F0;border-radius:12px;padding:20px 22px;'>"
+            "<div style='display:flex;justify-content:space-between;align-items:baseline;margin-bottom:20px;'>"
+            "<div>"
+            "<div style='font-size:15px;font-weight:800;color:#0F172A;'>Comparativo semanal</div>"
+            f"<div style='font-size:12px;color:#64748B;margin-top:2px;'>{_rot_atual} <span style='color:#CBD5E1;'>·</span> vs mesma semana de {_rot_prev}</div>"
+            "</div>"
+            "<div style='display:flex;gap:16px;font-size:11px;color:#64748B;'>"
+            "<span style='display:flex;align-items:center;gap:4px;'><span style='width:8px;height:8px;border-radius:2px;background:#7C3AED;'></span>atual</span>"
+            "<span style='display:flex;align-items:center;gap:4px;'><span style='width:8px;height:8px;border-radius:2px;background:#CBD5E1;'></span>anterior</span>"
+            "</div>"
+            "</div>"
+            "<div style='display:grid;grid-template-columns:repeat(4,1fr);gap:12px;'>"
+            f"{_cards_html}"
+            "</div>"
+            "<div style='margin-top:14px;background:#F8FAFC;border-radius:10px;padding:14px 16px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;align-items:center;'>"
+            "<div>"
+            "<div style='font-size:11px;color:#64748B;text-transform:uppercase;letter-spacing:.3px;'>Total do mês</div>"
+            f"<div style='font-size:11px;color:#94A3B8;margin-top:1px;'>{_rot_atual}</div>"
+            "</div>"
+            "<div>"
+            f"<div style='font-size:16px;font-weight:800;color:#0F172A;'>R$ {_fat_tot_at:,.0f}</div>"
+            f"<div style='font-size:10px;color:#94A3B8;'>vs R$ {_fat_tot_pr:,.0f} · {_fmt_delta(_d_fat_tot)}</div>"
+            "</div>"
+            "<div>"
+            f"<div style='font-size:16px;font-weight:800;color:#0F172A;'>{_qtd_tot_at} unid.</div>"
+            f"<div style='font-size:10px;color:#94A3B8;'>vs {_qtd_tot_pr} · {_fmt_delta(_d_qtd_tot)}</div>"
+            "</div>"
+            "</div>"
+            "</div>",
+            unsafe_allow_html=True
+        )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+    # ─── FIM QUADRO COMPARATIVO SEMANAL ───
 
     # GRÁFICO LUCRO POR DIA — gradiente verde + label de média
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -1040,6 +4091,7 @@ if st.session_state["aba_ativa"] == "financeiro":
     linhas = ""
     for _, row in df.iterrows():
         cancelada = row["Cancelada"]
+        devolvida = row.get("Categoria") == "devolvida"
         bg_row    = "#FFF5F5" if cancelada else "white"
         rec       = row["Receita Bruta"]
         corrigido = row.get("Corrigido", False)
@@ -1057,11 +4109,11 @@ if st.session_state["aba_ativa"] == "financeiro":
             <td style="padding:10px 8px;font-size:18px;text-align:center;">{status_icon(row['Status'])}</td>
             <td style="padding:10px 8px;text-align:center;font-weight:700;">{int(row['Quantidade'])}</td>
             <td style="padding:10px 8px;font-weight:700;">{badge(rec, fat_total,'#DCFCE7','#15803D')}</td>
-            <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Frete'], rec,'#DBEAFE','#1D4ED8')}</td>
+            <td style="padding:10px 8px;">{('<span style="color:#16A34A;font-weight:800;">Grátis · R$ 0,00</span>' if float(row['Frete']) == 0 else '<span style="color:#DC2626;font-weight:800;">Reverso · R$ ' + f'{float(row["Frete"]):,.2f}' + '</span>') if devolvida else ('–' if cancelada else badge(row['Frete'], rec,'#DBEAFE','#1D4ED8'))}</td>
             <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Taxas ML'], rec,'#FEF3C7','#B45309')}</td>
             <td style="padding:10px 8px;">{'–' if cancelada else f'{tag_custo}{badge(row["Custo Total"], rec, "#EDE9FE","#6D28D9")}'}</td>
             <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Imposto'], rec,'#F1F5F9','#475569')}</td>
-            <td style="padding:10px 8px;text-align:center;">{'<span style="color:#DC2626;font-weight:700;">Cancelada</span>' if cancelada else margem_badge(row.get('Margem %',0), row.get('Lucro',0))}</td>
+            <td style="padding:10px 8px;text-align:center;">{('<span style="color:#B45309;font-weight:700;">Devolvida</span>' if devolvida else '<span style="color:#DC2626;font-weight:700;">Cancelada</span>') if cancelada else margem_badge(row.get('Margem %',0), row.get('Lucro',0))}</td>
             <td style="padding:10px 8px;color:#94A3B8;font-size:12px;white-space:nowrap;">{row['Venda']}</td>
         </tr>"""
 
@@ -1116,6 +4168,174 @@ if st.session_state["aba_ativa"] == "financeiro":
 
     st.markdown('</div>', unsafe_allow_html=True)
 
+
+    # ═══════════════════════════════════════════════════════════════
+    # PAINEL DE SAÚDE DA CONTA
+    # ═══════════════════════════════════════════════════════════════
+    st.markdown("### 🏥 Saúde da Conta")
+    if _sensor_erro:
+        st.warning(f"⚠️ {_sensor_erro}")
+
+    if _diag is not None:
+        _mk, _snap, _mud, _info = _diag
+        _exp = _mk.get("seller_experience")
+
+        # Alerta do Programa Decola: enquanto NEWBIE, exposição é protegida.
+        if str(_exp).upper() == "NEWBIE":
+            st.info("🛡️ **Programa Decola ativo.** Enquanto sua experiência for NEWBIE, seus anúncios "
+                    "não perdem exposição por notas baixas. O momento crítico é quando você **sair do NEWBIE** — "
+                    "aí as notas de experiência passam a valer exposição de verdade. Vigie essa mudança.")
+
+        # ── Linha 1: velocímetros de estágio (régua ordinal real) ──
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown(_svg_estagios("Experiência da conta",
+                        ["Newbie", "Intermediate", "Advanced"], _exp,
+                        mudou=("seller_experience" in _mud)), unsafe_allow_html=True)
+        with col2:
+            _cor = (_mk.get("level_id") or "").replace("_", " ").title() or "—"
+            st.markdown(_svg_estagios("Reputação (cor)",
+                        ["1 Red", "2 Orange", "3 Yellow", "4 L.Green", "5 Green"],
+                        _mapa_cor(_mk.get("level_id")), mudou=False), unsafe_allow_html=True)
+        with col3:
+            st.markdown(_svg_estagios("MercadoLíder",
+                        ["—", "Silver", "Gold", "Platinum"],
+                        (_mk.get("power_seller_status") or "—").title(), mudou=False),
+                        unsafe_allow_html=True)
+
+        # ── Linha 2: métricas com zona de perigo (o fôlego que você tem) ──
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        st.caption("Métricas de qualidade — ponteiro na zona verde = saudável. "
+                   "⚠️ Tetos são configuráveis (confirme os limites oficiais no seu Seller Central).")
+        m1, m2, m3 = st.columns(3)
+        # tetos conservadores (fração). Ajustáveis quando confirmar os oficiais.
+        with m1:
+            st.markdown(_svg_gauge_meta("Reclamações", _mk.get("claims_rate"), 0.02, 0.07),
+                        unsafe_allow_html=True)
+        with m2:
+            st.markdown(_svg_gauge_meta("Atraso no envio", _mk.get("delayed_rate"), 0.15, 0.25),
+                        unsafe_allow_html=True)
+        with m3:
+            st.markdown(_svg_gauge_meta("Cancelamentos", _mk.get("cancel_rate"), 0.01, 0.03),
+                        unsafe_allow_html=True)
+
+        # ── Linha 3: cartões informativos (sem régua honesta) ──
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        i1, i2, i3, i4 = st.columns(4)
+        i1.metric("Crédito (rank)", (_mk.get("credit_rank") or "—").title())
+        i2.metric("Faixa de crédito", _mk.get("credit_level_id") or "—")
+        i3.metric("Transações", f"{_mk.get('transactions_total') or 0:,}".replace(",", "."))
+        _neg = ((_info.get("seller_reputation", {}) or {}).get("transactions", {}) or {}).get("ratings", {}) or {}
+        i4.metric("Avaliações negativas", _neg.get("negative", "—"))
+
+        # ── Mudanças detectadas (histórico) ──
+        if _mud:
+            _linhas = " · ".join(f"{k}: {v['de']}→{v['para']} ({v['quando']})" for k, v in _mud.items())
+            st.success(f"📈 Mudanças desde o último registro: {_linhas}")
+        elif _hist_erro:
+            st.caption("ℹ️ Detecção de mudança inativa — crie a tabela `sensores_conta` no Supabase para ligar o histórico.")
+
+    # ── Saúde dos anúncios ATIVOS (validado: só ativos importam) ──
+    _saude = get_saude_anuncios(str(user_id), token) if token else {}
+    if _saude and not _saude.get("erro"):
+        _ua = _saude.get("unhealthy_ativos"); _wa = _saude.get("warning_ativos")
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+        s1, s2 = st.columns(2)
+        _cor_u = "#DC2626" if (_ua or 0) > 0 else "#16A34A"
+        s1.markdown(f"""<div style="background:#fff;border:1px solid #EEE;border-radius:14px;padding:12px 16px;">
+<div style="font-size:11px;font-weight:800;color:#6B7280;">🔴 Anúncios ATIVOS perdendo exposição</div>
+<div style="font-size:26px;font-weight:900;color:{_cor_u};">{_ua if _ua is not None else '—'}</div></div>""",
+                    unsafe_allow_html=True)
+        s2.markdown(f"""<div style="background:#fff;border:1px solid #EEE;border-radius:14px;padding:12px 16px;">
+<div style="font-size:11px;font-weight:800;color:#6B7280;">⚠️ Anúncios ATIVOS em risco</div>
+<div style="font-size:26px;font-weight:900;color:#D97706;">{_wa if _wa is not None else '—'}</div></div>""",
+                    unsafe_allow_html=True)
+        if _saude.get("ids_unhealthy_ativos"):
+            st.caption("Perdendo exposição (revise no Seller Central → Experiência de compra): "
+                       + ", ".join(_saude["ids_unhealthy_ativos"][:10]))
+
+    # ── Experiência de compra por anúncio: reclamações a cada X vendas ──
+    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+    st.markdown("#### 🎯 Experiência de Compra por Anúncio (últimos 60 dias)")
+    st.caption("Reclamações abertas no período cruzadas com os pedidos de cada anúncio — mesma janela de "
+               "60 dias que o próprio Mercado Livre usa pro claims_rate da conta. Anúncios com menos de "
+               "15 vendas no período mostram só a contagem bruta: amostra pequena demais pra virar %.")
+
+    _d60_from = (agora_br - timedelta(days=60)).strftime("%Y-%m-%dT00:00:00.000-03:00")
+    _d60_to   = agora_br.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+
+    with st.spinner("Calculando experiência de compra por anúncio..."):
+        _orders_60 = get_orders(str(user_id), token, _d60_from, _d60_to)
+        # Só consulta reclamação de pedidos aprovados — cancelado não entra no
+        # denominador de vendas mesmo, então nem vale gastar chamada com ele.
+        _order_ids_60 = tuple(sorted({str(o.get("id")) for o in _orders_60
+                                       if o.get("id") and o.get("status") != "cancelled"}))
+        _token_hash_claims = token[-8:] if token else ""
+        _claims_por_pedido, _erro_claims, _n_falhas_claims = get_claims_por_pedidos(_order_ids_60, _token_hash_claims, token)
+
+    if not _orders_60:
+        st.info("Sem vendas nos últimos 60 dias pra calcular a experiência de compra por anúncio.")
+    elif _n_falhas_claims and not _claims_por_pedido:
+        st.warning(f"⚠️ Não consegui buscar as reclamações (claims) agora — {_n_falhas_claims} de "
+                   f"{len(_order_ids_60)} pedido(s) falharam mesmo após 3 tentativas.")
+        with st.expander("Ver erro técnico (pra ajustarmos juntos)"):
+            st.code(_erro_claims)
+    else:
+        _df_reclamacoes = montar_ranking_reclamacoes(_orders_60, _claims_por_pedido, min_vendas=15)
+        if _n_falhas_claims:
+            st.caption(f"⚠️ {_n_falhas_claims} de {len(_order_ids_60)} pedido(s) não puderam ser verificados "
+                       f"(rate limit, mesmo após 3 tentativas) — os números abaixo podem estar levemente "
+                       f"subestimados. Recarregue em alguns minutos pra tentar de novo com esses pedidos.")
+        if _df_reclamacoes.empty:
+            st.info("Nenhuma venda encontrada nos últimos 60 dias pra montar o ranking por anúncio.")
+        else:
+            def _badge_taxa(row):
+                if row["Amostra suficiente"] and row["Taxa (%)"] is not None:
+                    taxa = row["Taxa (%)"]
+                    bg, txt = ("#DCFCE7", "#15803D") if taxa <= 2 else ("#FEF9C3", "#854D0E") if taxa <= 7 else ("#FEE2E2", "#DC2626")
+                    taxa_html = (f'<span style="background:{bg};color:{txt};border-radius:999px;'
+                                 f'padding:2px 9px;font-size:12px;font-weight:800;">{taxa:.1f}%</span>')
+                    vpr = row["Vendas por reclamação"]
+                    vpr_html = f"1 a cada {vpr:.0f}" if vpr else "—"
+                else:
+                    taxa_html = ('<span style="background:#F1F5F9;color:#64748B;border-radius:999px;'
+                                 'padding:2px 9px;font-size:11px;font-weight:800;">amostra pequena</span>')
+                    vpr_html = "—"
+                return taxa_html, vpr_html
+
+            _linhas_html = ""
+            for _, _row in _df_reclamacoes.iterrows():
+                _taxa_html, _vpr_html = _badge_taxa(_row)
+                _linhas_html += f"""<tr style="border-bottom:1px solid #F1F5F9;">
+                    <td style="padding:10px 8px;font-weight:700;">{_row['Anúncio']}</td>
+                    <td style="padding:10px 8px;color:#94A3B8;font-size:12px;white-space:nowrap;">{_row['SKU']}</td>
+                    <td style="padding:10px 8px;text-align:center;">{_row['Vendas (pedidos)']}</td>
+                    <td style="padding:10px 8px;text-align:center;font-weight:700;">{_row['Reclamações']}</td>
+                    <td style="padding:10px 8px;text-align:center;">{_taxa_html}</td>
+                    <td style="padding:10px 8px;text-align:center;color:#64748B;font-size:12px;">{_vpr_html}</td>
+                    <td style="padding:10px 8px;color:#64748B;font-size:12px;">{_row['Motivo predominante']}</td>
+                </tr>"""
+
+            _tabela_reclamacoes_html = f"""<div style="overflow-x:auto;">
+            <table style="width:100%;border-collapse:collapse;font-family:'Inter',sans-serif;font-size:13px;">
+                <thead><tr style="background:#F8FAFC;border-bottom:2px solid #E2E8F0;">
+                    <th style="padding:10px 8px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Anúncio</th>
+                    <th style="padding:10px 8px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">SKU</th>
+                    <th style="padding:10px 8px;text-align:center;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Vendas</th>
+                    <th style="padding:10px 8px;text-align:center;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Reclamações</th>
+                    <th style="padding:10px 8px;text-align:center;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Taxa</th>
+                    <th style="padding:10px 8px;text-align:center;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Vendas / reclamação</th>
+                    <th style="padding:10px 8px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Motivo predominante</th>
+                </tr></thead>
+                <tbody>{_linhas_html}</tbody>
+            </table></div>"""
+            st.markdown(_tabela_reclamacoes_html, unsafe_allow_html=True)
+
+    st.markdown("---")
+    # ═══════════════════════════════════════════════════════════════
+    # FIM DO PAINEL DE SAÚDE DA CONTA
+    # ═══════════════════════════════════════════════════════════════
+
 # ══════════════════════════════════════════
 # ABA: CADASTRO DE CUSTOS
 # ══════════════════════════════════════════
@@ -1169,19 +4389,142 @@ elif st.session_state["aba_ativa"] == "custos":
     st.markdown('</div>', unsafe_allow_html=True)
 
     if not custos_df.empty:
+        if "editing_lote" not in st.session_state:
+            st.session_state["editing_lote"] = None
+
+        # CSS da tabela de lotes
+        st.markdown("""
+        <style>
+        .lote-id {
+            font-size: 11px; font-weight: 700; color: #94A3B8;
+            background: #F1F5F9; border-radius: 6px;
+            padding: 3px 8px; display:inline-block;
+        }
+        .lote-sku {
+            font-size: 11px; font-weight: 800; color: #7C3AED;
+            background: #EDE9FE; border-radius: 6px;
+            padding: 3px 8px; display:inline-block;
+            white-space: nowrap;
+        }
+        .lote-produto { font-weight: 700; color: #0F172A; font-size:13px; }
+        .lote-vig { font-size: 11.5px; color: #64748B; white-space:nowrap; }
+        .lote-qtd { font-weight: 700; color: #0F172A; font-size:13px; }
+        .lote-esgotado {
+            font-size: 9px; font-weight: 800; letter-spacing:.8px;
+            color: #DC2626; background: #FEE2E2;
+            border-radius: 999px; padding: 3px 10px;
+            white-space: nowrap; display:inline-block;
+        }
+        .lote-valor {
+            font-family: 'Courier New',monospace; font-size: 11.5px;
+            color: #334155; font-weight: 600; white-space:nowrap;
+        }
+        .lote-margem { font-weight: 800; color: #059669; font-size:13px; }
+        .lote-margem-zero { font-weight: 700; color: #94A3B8; font-size:13px; }
+        .lote-obs { font-size: 11px; color: #94A3B8; font-style: italic; }
+        .lote-row-divider {
+            height: 1px;
+            background: linear-gradient(90deg, #E2E8F0 0%, #F8FAFC 60%, transparent 100%);
+            margin: 0;
+        }
+        .lote-header-cell {
+            font-size: 9.5px; font-weight: 800; letter-spacing: 1.2px;
+            text-transform: uppercase; color: #94A3B8;
+            padding: 6px 4px 8px 4px;
+            border-bottom: 2px solid #E2E8F0;
+        }
+        .lote-cell {
+            padding: 10px 4px;
+            display: flex; align-items: center;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("**📋 Lotes cadastrados**")
-        exibir = custos_df[["id","sku","produto","vigencia","qtd_comprada","qtd_disponivel",
-                             "custo_produto","frete_fornecedor","embalagem","outros_custos","margem_alvo","observacao"]].copy()
-        exibir["vigencia"]       = exibir["vigencia"].apply(lambda x: x.strftime("%d/%m/%Y") if pd.notna(x) else "Sem data")
-        exibir["qtd_disponivel"] = exibir["qtd_disponivel"].apply(lambda x: "ESGOTADO" if float(x)<0 else str(int(float(x))))
-        for c in ["custo_produto","frete_fornecedor","embalagem","outros_custos"]:
-            exibir[c] = exibir[c].apply(lambda x: f"R$ {float(x):.4f}")
-        exibir["margem_alvo"] = exibir["margem_alvo"].apply(lambda x: f"{float(x):.1f}%")
-        st.dataframe(exibir.rename(columns={"id":"ID","sku":"SKU","produto":"Produto","vigencia":"Vigência",
-            "qtd_comprada":"Qtd Comprada","qtd_disponivel":"Qtd Disponível","custo_produto":"Custo Unit.",
-            "frete_fornecedor":"Frete Forn.","embalagem":"Embalagem","outros_custos":"Outros",
-            "margem_alvo":"Margem Alvo","observacao":"Obs."}), use_container_width=True, hide_index=True)
+        st.markdown("""
+        <div style='display:flex;align-items:center;gap:10px;margin-bottom:16px;'>
+          <span style='font-size:18px;'>📋</span>
+          <span style='font-size:15px;font-weight:800;color:#0F172A;'>Lotes cadastrados</span>
+          <span style='font-size:12px;color:#94A3B8;font-weight:500;margin-left:4px;'>Clique no ✏️ para editar uma linha</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        COLS = [0.45, 0.7, 1.1, 0.75, 0.6, 0.85, 0.85, 0.85, 0.7, 0.65, 0.65, 1.0, 0.35]
+        HDRS = ["ID","SKU","Produto","Vigência","Qtd Comp.","Qtd Disp.","Custo Unit.","Frete Forn.","Embalagem","Outros","Margem","Obs.",""]
+
+        # Cabeçalho estilizado
+        hrow = st.columns(COLS)
+        for col, lbl in zip(hrow, HDRS):
+            col.markdown(f"<div class='lote-header-cell'>{lbl}</div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:2px;background:linear-gradient(90deg,#7C3AED22,#E2E8F0,transparent);margin:0 0 4px 0;'></div>", unsafe_allow_html=True)
+
+        for i, (_, lote) in enumerate(custos_df.iterrows()):
+            lote_id  = int(lote["id"])
+            is_edit  = st.session_state["editing_lote"] == lote_id
+            vig_str  = lote["vigencia"].strftime("%d/%m/%Y") if pd.notna(lote["vigencia"]) else "–"
+            qtd_d    = float(lote["qtd_disponivel"] or 0)
+            esgotado = qtd_d < 0
+            bg       = "#FFF7ED" if is_edit else ("#F8FAFC" if i % 2 == 0 else "#FFFFFF")
+            border   = "border-left:3px solid #F59E0B;" if is_edit else "border-left:3px solid transparent;"
+
+            row = st.columns(COLS)
+
+            if not is_edit:
+                qtd_disp_html = f"<span class='lote-esgotado'>ESGOTADO</span>" if esgotado else f"<span class='lote-qtd'>{int(qtd_d)}</span>"
+                for col, html in zip(row, [
+                    f"<div style='background:{bg};padding:8px 4px;{border}'><span class='lote-id'>#{lote_id}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-sku'>{lote['sku']}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-produto'>{lote['produto']}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-vig'>📅 {vig_str}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-qtd'>{int(lote['qtd_comprada'] or 0)}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'>{qtd_disp_html}</div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-valor'>R$ {float(lote['custo_produto']):.4f}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-valor'>R$ {float(lote['frete_fornecedor']):.4f}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-valor'>R$ {float(lote['embalagem']):.2f}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-valor'>R$ {float(lote['outros_custos']):.2f}</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='{"lote-margem" if float(lote['margem_alvo'])>0 else "lote-margem-zero"}'>{float(lote['margem_alvo']):.1f}%</span></div>",
+                    f"<div style='background:{bg};padding:8px 4px;'><span class='lote-obs'>{str(lote['observacao'] or '')}</span></div>",
+                ]):
+                    col.markdown(html, unsafe_allow_html=True)
+                if row[-1].button("✏️", key=f"edit_btn_{lote_id}", help="Editar linha"):
+                    st.session_state["editing_lote"] = lote_id
+                    st.rerun()
+            else:
+                row[0].markdown(f"<div style='padding:8px 4px;{border}'><span class='lote-id'>#{lote_id}</span></div>", unsafe_allow_html=True)
+                e_sku    = row[1].text_input("",  value=str(lote["sku"]),     key=f"e_sku_{lote_id}",    label_visibility="collapsed")
+                e_prod   = row[2].text_input("",  value=str(lote["produto"]), key=f"e_prod_{lote_id}",   label_visibility="collapsed")
+                e_vig    = row[3].text_input("",  value=vig_str,              key=f"e_vig_{lote_id}",    label_visibility="collapsed", help="DD/MM/AAAA")
+                e_qtdc   = row[4].number_input("", value=int(lote["qtd_comprada"] or 0), min_value=0, step=1, key=f"e_qtdc_{lote_id}", label_visibility="collapsed")
+                e_qtdd   = row[5].number_input("", value=qtd_d, step=1.0, key=f"e_qtdd_{lote_id}", label_visibility="collapsed")
+                e_custo  = row[6].number_input("", value=float(lote["custo_produto"] or 0), min_value=0.0, step=0.01, format="%.4f", key=f"e_custo_{lote_id}", label_visibility="collapsed")
+                e_frete  = row[7].number_input("", value=float(lote["frete_fornecedor"] or 0), min_value=0.0, step=0.01, format="%.4f", key=f"e_frete_{lote_id}", label_visibility="collapsed")
+                e_embal  = row[8].number_input("", value=float(lote["embalagem"] or 0), min_value=0.0, step=0.01, format="%.2f", key=f"e_embal_{lote_id}", label_visibility="collapsed")
+                e_outros = row[9].number_input("", value=float(lote["outros_custos"] or 0), min_value=0.0, step=0.01, format="%.2f", key=f"e_outros_{lote_id}", label_visibility="collapsed")
+                e_margem = row[10].number_input("", value=float(lote["margem_alvo"] or 0), min_value=0.0, step=0.1, format="%.1f", key=f"e_margem_{lote_id}", label_visibility="collapsed")
+                e_obs    = row[11].text_input("", value=str(lote["observacao"] or ""), key=f"e_obs_{lote_id}", label_visibility="collapsed")
+
+                if row[-1].button("💾", key=f"save_btn_{lote_id}", help="Salvar"):
+                    try:
+                        from datetime import datetime as _dt
+                        vig_parsed = _dt.strptime(e_vig, "%d/%m/%Y").strftime("%Y-%m-%d")
+                    except Exception:
+                        vig_parsed = lote["vigencia"].strftime("%Y-%m-%d") if pd.notna(lote["vigencia"]) else None
+                    save_custo(str(user_id), {
+                        "id": lote_id, "sku": e_sku, "produto": e_prod,
+                        "vigencia": vig_parsed,
+                        "qtd_comprada": int(e_qtdc), "qtd_disponivel": float(e_qtdd),
+                        "custo_produto": round(float(e_custo), 4),
+                        "frete_fornecedor": round(float(e_frete), 4),
+                        "embalagem": round(float(e_embal), 4),
+                        "outros_custos": round(float(e_outros), 4),
+                        "margem_alvo": round(float(e_margem), 2),
+                        "observacao": e_obs,
+                    })
+                    st.session_state["editing_lote"] = None
+                    st.rerun()
+
+            st.markdown("<div class='lote-row-divider'></div>", unsafe_allow_html=True)
+
         st.markdown('</div>', unsafe_allow_html=True)
 
 # ══════════════════════════════════════════
@@ -1234,7 +4577,9 @@ elif st.session_state["aba_ativa"] == "caixa":
         "Transferência do ML", "Fornecedor", "Frete / Logística",
         "Mercado Ads", "Embalagem", "Operacional",
         "Impostos / Taxas", "Pró-labore / Retirada", "Outros",
+        "🚫 Ignorar (não conta no caixa)",
     ]
+    CAT_IGNORAR = "🚫 Ignorar (não conta no caixa)"
 
     # ── Supabase helpers para extrato Inter ──
     def load_extrato(uid):
@@ -1246,6 +4591,13 @@ elif st.session_state["aba_ativa"] == "caixa":
         df["data"]       = pd.to_datetime(df["data"], errors="coerce")
         df["valor"]      = pd.to_numeric(df["valor"], errors="coerce").fillna(0)
         df["conciliado"] = df["conciliado"].astype(bool)
+        # Neutraliza transferências internas (porquinho/CDB): aplicação e resgate
+        # não são entrada nem saída de caixa — o dinheiro só muda de "quadrado",
+        # mas continua na mesma conta. Preserva rendimento (descrição diferente).
+        if "memo" in df.columns:
+            _m = df["memo"].fillna("").str.strip().str.lower()
+            _transf = _m.str.startswith("aplicacao") | _m.str.startswith("aplicação") | _m.str.startswith("resgate")
+            df = df[~_transf].copy()
         return df
 
     def save_lancamento(uid, row):
@@ -1275,6 +4627,10 @@ elif st.session_state["aba_ativa"] == "caixa":
     def save_agendamento(uid, row):
         sb = get_supabase()
         sb.table("agendamentos_inter").insert({"user_id": uid, **row}).execute()
+
+    def excluir_agendamento(uid, ag_id):
+        sb = get_supabase()
+        sb.table("agendamentos_inter").delete().eq("user_id", uid).eq("id", str(ag_id)).execute()
 
     def parse_ofx(content_bytes):
         """Extrai lançamentos de um arquivo OFX/QFX."""
@@ -1308,10 +4664,13 @@ elif st.session_state["aba_ativa"] == "caixa":
     agend_df      = load_agendamentos_inter(str(user_id))
 
     # ── Cards de resumo ──
-    entradas  = extrato_df["valor"].sum() if not extrato_df.empty and "valor" in extrato_df.columns else 0.0
-    entradas  = extrato_df[extrato_df["valor"] > 0]["valor"].sum() if not extrato_df.empty else 0.0
-    saidas    = extrato_df[extrato_df["valor"] < 0]["valor"].abs().sum() if not extrato_df.empty else 0.0
-    saldo     = extrato_df["valor"].sum() if not extrato_df.empty else 0.0
+    # Para os TOTAIS, ignora lançamentos marcados como "Ignorar" (continuam na lista abaixo).
+    _calc_df = extrato_df.copy()
+    if not _calc_df.empty and "categoria" in _calc_df.columns:
+        _calc_df = _calc_df[_calc_df["categoria"] != CAT_IGNORAR]
+    entradas  = _calc_df[_calc_df["valor"] > 0]["valor"].sum() if not _calc_df.empty else 0.0
+    saidas    = _calc_df[_calc_df["valor"] < 0]["valor"].abs().sum() if not _calc_df.empty else 0.0
+    saldo     = _calc_df["valor"].sum() if not _calc_df.empty else 0.0
     pendentes = extrato_df[~extrato_df["conciliado"]] if not extrato_df.empty and "conciliado" in extrato_df.columns else pd.DataFrame()
     a_pagar   = agend_df[~agend_df["pago"]]["valor"].abs().sum() if not agend_df.empty and "pago" in agend_df.columns else 0.0
 
@@ -1351,6 +4710,134 @@ elif st.session_state["aba_ativa"] == "caixa":
 
     st.markdown("<br>", unsafe_allow_html=True)
 
+    # ── Calendário de Recebimentos Futuros ──
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("**📅 Calendário de Recebimentos (Mercado Pago)**")
+    st.caption("Previsão de liberação do dinheiro das vendas dos últimos 90 dias, agrupado por dia.")
+    _rec_df = get_recebimentos_futuros(str(user_id), token[-8:] if token else "", token)
+    if _rec_df.empty:
+        st.info("Nenhum recebimento futuro previsto.")
+    else:
+        from datetime import date, timedelta
+        _hoje_d = date.today()
+        _total_futuro = float(_rec_df["valor"].sum())
+        _prox_7  = float(_rec_df[_rec_df["data"] <= _hoje_d + timedelta(days=7)]["valor"].sum())
+        _prox_30 = float(_rec_df[_rec_df["data"] <= _hoje_d + timedelta(days=30)]["valor"].sum())
+
+        r1, r2, r3 = st.columns(3)
+        r1.markdown(f"""<div class="kpi-card"><div class="kpi-title">Próximos 7 dias</div><div class="kpi-value" style="color:#16A34A;">R$ {_prox_7:,.2f}</div></div>""", unsafe_allow_html=True)
+        r2.markdown(f"""<div class="kpi-card"><div class="kpi-title">Próximos 30 dias</div><div class="kpi-value" style="color:#16A34A;">R$ {_prox_30:,.2f}</div></div>""", unsafe_allow_html=True)
+        r3.markdown(f"""<div class="kpi-card"><div class="kpi-title">Total a liberar</div><div class="kpi-value" style="color:#7C3AED;">R$ {_total_futuro:,.2f}</div></div>""", unsafe_allow_html=True)
+
+        st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+
+        # Timeline dia a dia
+        _rec_df_view = _rec_df.copy()
+        _rec_df_view["Acumulado"] = _rec_df_view["valor"].cumsum()
+        _rec_df_view["Data"] = _rec_df_view["data"].astype(str)
+        _chart_rec = alt.Chart(_rec_df_view).mark_bar(color="#16A34A", cornerRadius=3).encode(
+            x=alt.X("Data:N", title=None, axis=alt.Axis(labelAngle=-45, labelFontSize=10)),
+            y=alt.Y("valor:Q", title="R$ a liberar", axis=alt.Axis(format=",.0f")),
+            tooltip=[
+                alt.Tooltip("Data:N", title="Dia"),
+                alt.Tooltip("valor:Q", title="Libera", format=",.2f"),
+                alt.Tooltip("Acumulado:Q", title="Acumulado até aqui", format=",.2f"),
+            ]
+        ).properties(height=220)
+        st.altair_chart(_chart_rec, use_container_width=True)
+
+        # Tabela expandível
+        with st.expander(f"📋 Ver detalhamento dia a dia ({len(_rec_df)} datas)", expanded=False):
+            _rec_show = _rec_df.copy()
+            _rec_show["Data"]  = _rec_show["data"].apply(lambda d: d.strftime("%d/%m/%Y (%a)"))
+            _rec_show["Valor"] = _rec_show["valor"].apply(lambda v: f"R$ {v:,.2f}")
+            _rec_show["Acumulado"] = _rec_show["valor"].cumsum().apply(lambda v: f"R$ {v:,.2f}")
+            st.dataframe(_rec_show[["Data","Valor","Acumulado"]], hide_index=True, use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Caixa Projetado (piso conservador) ──
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("**🔮 Caixa Projetado (piso conservador)**")
+    st.caption("Linha minimamente garantida: média móvel dos repasses dos últimos 15 dias × fator conservador, "
+               "projetada para os próximos 30 dias e descontando as contas agendadas. Tende a vir mais que o previsto.")
+
+    cfg1, cfg2 = st.columns([1, 1])
+    with cfg1:
+        caixa_inicial = st.number_input("💰 Caixa hoje (R$)", min_value=0.0, value=10000.0, step=500.0, key="cx_ini")
+    with cfg2:
+        haircut = st.slider("🛡️ Conservadorismo (% da média)", 50, 100, 78, key="cx_hair") / 100.0
+
+    _df_pass = get_repasses_passados(str(user_id), token[-8:] if token else "", token, dias=15)
+    if _df_pass.empty:
+        st.info("Ainda não há repasses liberados nos últimos 15 dias para calcular a média.")
+    else:
+        # média sobre 15 dias CORRIDOS (zeros dos dias sem repasse já embutidos na projeção futura)
+        media_15d_corridos = float(_df_pass["valor"].sum()) / 15.0
+        p25 = float(_df_pass["valor"].quantile(0.25))
+        piso_diario = media_15d_corridos * haircut
+
+        # saídas datadas — vêm dos agendamentos do Inter, se houver.
+        # IMPORTANTE: só os NÃO pagos. Um agendamento pago já saiu do caixa;
+        # descontá-lo de novo no futuro contaria a saída em dobro.
+        saidas = {}
+        try:
+            _ag = load_agendamentos_inter(str(user_id))
+            if not _ag.empty:
+                _ag_pend = _ag[~_ag["pago"]] if "pago" in _ag.columns else _ag
+                for _, a in _ag_pend.iterrows():
+                    dt = pd.to_datetime(a["data"]).date()
+                    saidas[dt] = saidas.get(dt, 0.0) + abs(float(a["valor"]))
+        except Exception:
+            pass
+
+        proj = projetar_caixa(caixa_inicial, piso_diario, saidas_por_dia=saidas, horizonte_dias=30)
+
+        saldo_min = float(proj["saldo"].min())
+        dia_min   = proj.loc[proj["saldo"].idxmin(), "data"]
+        saldo_fim = float(proj["saldo"].iloc[-1])
+        cor_min   = "#16A34A" if saldo_min >= 0 else "#DC2626"
+
+        k1, k2, k3 = st.columns(3)
+        k1.markdown(f"""<div class="kpi-card"><div class="kpi-title">Piso de entrada/dia</div><div class="kpi-value">R$ {piso_diario:,.0f}</div></div>""", unsafe_allow_html=True)
+        k2.markdown(f"""<div class="kpi-card"><div class="kpi-title">Menor saldo (30d)</div><div class="kpi-value" style="color:{cor_min};">R$ {saldo_min:,.0f}</div><div class="kpi-title">em {dia_min.strftime('%d/%m')}</div></div>""", unsafe_allow_html=True)
+        k3.markdown(f"""<div class="kpi-card"><div class="kpi-title">Saldo em 30 dias</div><div class="kpi-value">R$ {saldo_fim:,.0f}</div></div>""", unsafe_allow_html=True)
+
+        if saldo_min < 0:
+            st.error(f"⚠️ No piso conservador, o caixa fica negativo em {dia_min.strftime('%d/%m')} "
+                     f"(R$ {saldo_min:,.0f}). Vale antecipar recebíveis ou renegociar uma conta desse dia.")
+
+        st.caption(f"💡 Média 15d (corridos): R$ {media_15d_corridos:,.0f}/dia · "
+                   f"seu P25 (dia ruim típico) é R$ {p25:,.0f}. Se o P25 ficar perto do piso, seus {int(haircut*100)}% estão calibrados pelos seus dados.")
+
+        # gráfico: curva do piso nos 30 dias + linha do zero
+        _pv = proj.copy()
+        _pv["Data"] = _pv["data"].astype(str)
+        _linha_zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#DC2626", strokeDash=[4, 4]).encode(y="y:Q")
+        _area = alt.Chart(_pv).mark_area(opacity=0.22, color="#7C3AED").encode(
+            x=alt.X("Data:N", title=None, axis=alt.Axis(labelAngle=-45, labelFontSize=9)),
+            y=alt.Y("saldo:Q", title="Saldo mínimo projetado (R$)", axis=alt.Axis(format=",.0f")),
+            tooltip=[alt.Tooltip("Data:N"), alt.Tooltip("entra:Q", title="Entra (piso)", format=",.0f"),
+                     alt.Tooltip("sai:Q", title="Sai", format=",.0f"),
+                     alt.Tooltip("saldo:Q", title="Saldo", format=",.0f")]
+        ).properties(height=240)
+        st.altair_chart(_area + _linha_zero, use_container_width=True)
+
+        # tabela dia a dia em portlet com scroll (altura fixa)
+        with st.expander("📋 Ver projeção dia a dia", expanded=False):
+            _show = proj.copy()
+            _show["Data"] = _show["data"].apply(lambda d: d.strftime("%d/%m/%Y (%a)"))
+            for c in ["entra", "sai", "saldo"]:
+                _show[c] = _show[c].apply(lambda v: f"R$ {v:,.2f}")
+            st.dataframe(
+                _show[["Data", "entra", "sai", "saldo"]].rename(
+                    columns={"entra": "Entra (piso)", "sai": "Sai", "saldo": "Saldo"}),
+                hide_index=True, use_container_width=True, height=320)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
     # ── Upload OFX ──
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("**📂 Importar Extrato Inter (OFX)**")
@@ -1381,64 +4868,67 @@ elif st.session_state["aba_ativa"] == "caixa":
 
     # ── Conciliação do Extrato ──
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="small-title">Conciliação do Extrato</div>', unsafe_allow_html=True)
-    st.caption("Categorize cada lançamento. Entradas em verde, saídas em vermelho. Marque como conciliado após identificar.")
+    pendentes_count = len(extrato_df[~extrato_df["conciliado"]]) if not extrato_df.empty and "conciliado" in extrato_df.columns else 0
+    total_count = len(extrato_df) if not extrato_df.empty else 0
+    _status_label = f"· {pendentes_count} pendentes" if pendentes_count > 0 else "· tudo conciliado ✅"
+    with st.expander(f"📋 Conciliação do Extrato — {total_count} lançamentos {_status_label}", expanded=False):
+        st.caption("Categorize cada lançamento. Entradas em verde, saídas em vermelho. Marque como conciliado após identificar.")
+        if extrato_df.empty:
+            st.info("Nenhum lançamento importado ainda. Faça upload do OFX acima.")
+        else:
+            # Filtros
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                filtro_status = st.radio("Filtrar por:", ["Todos", "Pendentes", "Conciliados"],
+                                         horizontal=True, key="filtro_conciliacao")
+            with fc2:
+                filtro_cat = st.selectbox("Categoria:", ["Todas"] + CATEGORIAS_INTER, key="filtro_cat")
 
-    if extrato_df.empty:
-        st.info("Nenhum lançamento importado ainda. Faça upload do OFX acima.")
-    else:
-        # Filtros
-        fc1, fc2 = st.columns(2)
-        with fc1:
-            filtro_status = st.radio("Filtrar por:", ["Todos", "Pendentes", "Conciliados"],
-                                     horizontal=True, key="filtro_conciliacao")
-        with fc2:
-            filtro_cat = st.selectbox("Categoria:", ["Todas"] + CATEGORIAS_INTER, key="filtro_cat")
+            df_show = extrato_df.copy()
+            if filtro_status == "Pendentes":
+                df_show = df_show[~df_show["conciliado"]]
+            elif filtro_status == "Conciliados":
+                df_show = df_show[df_show["conciliado"]]
+            if filtro_cat != "Todas":
+                df_show = df_show[df_show["categoria"] == filtro_cat]
 
-        df_show = extrato_df.copy()
-        if filtro_status == "Pendentes":
-            df_show = df_show[~df_show["conciliado"]]
-        elif filtro_status == "Conciliados":
-            df_show = df_show[df_show["conciliado"]]
-        if filtro_cat != "Todas":
-            df_show = df_show[df_show["categoria"] == filtro_cat]
+            st.markdown(f"**{len(df_show)} lançamentos**")
 
-        st.markdown(f"**{len(df_show)} lançamentos**")
+            # Tabela de conciliação
+            for idx, row in df_show.iterrows():
+                cor_val = "#16A34A" if row["valor"] >= 0 else "#DC2626"
+                sinal   = "+" if row["valor"] >= 0 else ""
+                concil  = row["conciliado"]
+                bg      = "#F0FDF4" if concil else "white"
 
-        # Tabela de conciliação
-        for idx, row in df_show.iterrows():
-            cor_val = "#16A34A" if row["valor"] >= 0 else "#DC2626"
-            sinal   = "+" if row["valor"] >= 0 else ""
-            concil  = row["conciliado"]
-            bg      = "#F0FDF4" if concil else "white"
+                with st.container():
+                    c1, c2, c3, c4, c5 = st.columns([1.2, 1, 3, 2, 1.5])
+                    with c1:
+                        st.markdown(f"<div style='padding:8px 0;font-size:13px;color:#64748B;'>{pd.to_datetime(row['data']).strftime('%d/%m/%Y') if pd.notna(row['data']) else '–'}</div>", unsafe_allow_html=True)
+                    with c2:
+                        st.markdown(f"<div style='padding:8px 0;font-weight:800;color:{cor_val};'>{sinal}R$ {abs(row['valor']):,.2f}</div>", unsafe_allow_html=True)
+                    with c3:
+                        st.markdown(f"<div style='padding:8px 0;font-size:13px;color:#0F172A;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;'>{str(row['memo'])[:60]}</div>", unsafe_allow_html=True)
+                    with c4:
+                        cat_sel = st.selectbox("", [""] + CATEGORIAS_INTER,
+                                               index=([""] + CATEGORIAS_INTER).index(row["categoria"]) if row["categoria"] in CATEGORIAS_INTER else 0,
+                                               key=f"cat_{row['id']}", label_visibility="collapsed")
+                    with c5:
+                        concil_btn = st.checkbox("✅ Conciliado", value=bool(concil), key=f"conc_{row['id']}")
 
-            with st.container():
-                c1, c2, c3, c4, c5 = st.columns([1.2, 1, 3, 2, 1.5])
-                with c1:
-                    st.markdown(f"<div style='padding:8px 0;font-size:13px;color:#64748B;'>{pd.to_datetime(row['data']).strftime('%d/%m/%Y') if pd.notna(row['data']) else '–'}</div>", unsafe_allow_html=True)
-                with c2:
-                    st.markdown(f"<div style='padding:8px 0;font-weight:800;color:{cor_val};'>{sinal}R$ {abs(row['valor']):,.2f}</div>", unsafe_allow_html=True)
-                with c3:
-                    st.markdown(f"<div style='padding:8px 0;font-size:13px;color:#0F172A;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;'>{str(row['memo'])[:60]}</div>", unsafe_allow_html=True)
-                with c4:
-                    cat_sel = st.selectbox("", [""] + CATEGORIAS_INTER,
-                                           index=([""] + CATEGORIAS_INTER).index(row["categoria"]) if row["categoria"] in CATEGORIAS_INTER else 0,
-                                           key=f"cat_{row['id']}", label_visibility="collapsed")
-                with c5:
-                    concil_btn = st.checkbox("✅ Conciliado", value=bool(concil), key=f"conc_{row['id']}")
+                    obs_key = f"obs_{row['id']}"
+                    obs_val = st.text_input("", value=str(row["observacao"] or ""),
+                                            placeholder="Observação (opcional)",
+                                            key=obs_key, label_visibility="collapsed")
 
-                obs_key = f"obs_{row['id']}"
-                obs_val = st.text_input("", value=str(row["observacao"] or ""),
-                                        placeholder="Observação (opcional)",
-                                        key=obs_key, label_visibility="collapsed")
+                    if cat_sel != row["categoria"] or concil_btn != concil or obs_val != str(row["observacao"] or ""):
+                        update_lancamento(str(user_id), str(row["id"]), cat_sel, obs_val, concil_btn)
+                        st.rerun()
 
-                if cat_sel != row["categoria"] or concil_btn != concil or obs_val != str(row["observacao"] or ""):
-                    update_lancamento(str(user_id), str(row["id"]), cat_sel, obs_val, concil_btn)
-                    st.rerun()
-
-                st.markdown("<hr style='margin:4px 0;border:none;border-top:1px solid #F1F5F9;'>", unsafe_allow_html=True)
+                    st.markdown("<hr style='margin:4px 0;border:none;border-top:1px solid #F1F5F9;'>", unsafe_allow_html=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
+
 
     # ── Agendamentos ──
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -1488,6 +4978,26 @@ elif st.session_state["aba_ativa"] == "caixa":
                     st.rerun()
     else:
         st.info("Nenhum agendamento pendente.")
+
+    # Agendamentos JÁ PAGOS — ficam ocultos da lista principal, mas podem ser
+    # excluídos aqui (ex.: lançamento duplicado marcado como pago por engano).
+    if not agend_df.empty and "pago" in agend_df.columns:
+        _pagos = agend_df[agend_df["pago"] == True]
+        if not _pagos.empty:
+            with st.expander(f"✅ Agendamentos pagos ({len(_pagos)}) — clique para ver ou excluir"):
+                for _, ag in _pagos.iterrows():
+                    venc = pd.to_datetime(ag["data"])
+                    pc1, pc2, pc3, pc4 = st.columns([1.5, 3, 1.5, 1])
+                    with pc1:
+                        st.markdown(f"<div style='color:#64748B;font-size:13px;padding:6px 0;'>{venc.strftime('%d/%m/%Y')}</div>", unsafe_allow_html=True)
+                    with pc2:
+                        st.markdown(f"<div style='padding:6px 0;font-size:13px;'>{ag['descricao']} <span style='color:#94A3B8;'>{ag['categoria']}</span></div>", unsafe_allow_html=True)
+                    with pc3:
+                        st.markdown(f"<div style='color:#16A34A;font-weight:800;padding:6px 0;'>R$ {abs(ag['valor']):,.2f} ✓</div>", unsafe_allow_html=True)
+                    with pc4:
+                        if st.button("🗑️ Excluir", key=f"del_{ag['id']}"):
+                            excluir_agendamento(str(user_id), ag["id"])
+                            st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
     # ── Capital Investido ──
@@ -1603,3 +5113,492 @@ elif st.session_state["aba_ativa"] == "caixa":
     else:
         st.info("Nenhum lançamento registrado ainda. Use o formulário acima para começar.")
     st.markdown('</div>', unsafe_allow_html=True)
+
+# ══════════════════════════════════════════
+# ABA: FECHAMENTO MENSAL
+# ══════════════════════════════════════════
+elif st.session_state["aba_ativa"] == "fechamento":
+    import calendar
+    from datetime import date as _date
+
+    # ── Funções Supabase para fechamentos ──
+    def get_fechamentos(uid):
+        try:
+            r = get_supabase().table("fechamentos_mensais")\
+                .select("*").eq("user_id", uid).order("ano_mes", desc=True).execute()
+            return r.data or []
+        except Exception:
+            return []
+
+    def save_fechamento(uid, dados):
+        sb = get_supabase()
+        payload = {"user_id": uid, **dados}
+        try:
+            r = sb.table("fechamentos_mensais").upsert(payload).execute()
+            st.session_state["fech_erro"] = None
+            return True
+        except Exception as e1:
+            try:
+                sb.table("fechamentos_mensais")\
+                    .delete().eq("user_id", uid).eq("ano_mes", dados["ano_mes"]).execute()
+                sb.table("fechamentos_mensais").insert(payload).execute()
+                st.session_state["fech_erro"] = None
+                return True
+            except Exception as e2:
+                st.session_state["fech_erro"] = str(e2)
+                return False
+
+    fechamentos = get_fechamentos(str(user_id))
+    fechamentos_map = {f["ano_mes"]: f for f in fechamentos}
+
+    # ── Navegação de mês ──
+    hoje = _date.today()
+    if "fech_ano" not in st.session_state:
+        st.session_state["fech_ano"]  = hoje.year
+        st.session_state["fech_mes"]  = hoje.month - 1 if hoje.month > 1 else 12
+        if hoje.month == 1:
+            st.session_state["fech_ano"] = hoje.year - 1
+
+    ano  = st.session_state["fech_ano"]
+    mes  = st.session_state["fech_mes"]
+    ano_mes = f"{ano}-{mes:02d}"
+    nome_mes = ["", "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+                "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"][mes]
+
+    fechado = ano_mes in fechamentos_map
+    dados_fech = fechamentos_map.get(ano_mes, {})
+
+    # ── Topo ──
+    st.markdown('<div style="padding:0 0 1.5rem 0;">', unsafe_allow_html=True)
+    t1, t2, t3 = st.columns([0.5, 2, 1])
+    with t1:
+        if st.button("◀", key="fech_prev"):
+            if mes == 1:
+                st.session_state["fech_mes"] = 12
+                st.session_state["fech_ano"] = ano - 1
+            else:
+                st.session_state["fech_mes"] = mes - 1
+            st.rerun()
+    with t2:
+        st.markdown(f"""
+        <div style='text-align:center;'>
+          <div style='font-size:22px;font-weight:700;color:var(--color-text-primary,#0F172A);'>{nome_mes} {ano}</div>
+          <div style='font-size:12px;color:#64748B;margin-top:2px;'>
+            {"✅ Fechado em " + dados_fech.get("fechado_em","")[:10] if fechado else "⏳ Aguardando fechamento"}
+          </div>
+        </div>""", unsafe_allow_html=True)
+    with t3:
+        if st.button("▶", key="fech_next"):
+            if mes == 12:
+                st.session_state["fech_mes"] = 1
+                st.session_state["fech_ano"] = ano + 1
+            else:
+                st.session_state["fech_mes"] = mes + 1
+            st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if fechado:
+        # ── Exibir fechamento salvo ──
+        d = dados_fech
+        fat         = float(d.get("faturamento_bruto", 0))
+        devol       = float(d.get("devolucoes", 0))
+        cancel_val  = float(d.get("cancelamentos_valor", 0))
+        fat_liq     = fat - devol  # cancelamentos não entram no faturamento, só devoluções saem
+        tarifas     = float(d.get("tarifas_ml", 0))
+        fretes      = float(d.get("frete_ml", 0))
+        ads_cost    = float(d.get("ads_cost", 0))
+        custos      = float(d.get("custo_produto", 0))
+        impostos    = float(d.get("impostos", 0))
+        lucro       = float(d.get("lucro_liquido", 0))
+        margem      = float(d.get("margem", 0))
+        pedidos     = int(d.get("pedidos", 0))
+        canceladas_n = int(d.get("canceladas", 0))
+        devolvidas_n = int(d.get("devolvidas", 0))
+        ticket      = float(d.get("ticket_medio", 0))
+        estoque     = float(d.get("estoque_valor", 0))
+
+        # Waterfall (7 colunas: Faturamento | Cancel | Devol | Receita Líq | Tarif+Frete | Custo+Imp | Lucro)
+        st.markdown(f"""
+        <div style='display:grid;grid-template-columns:repeat(7,1fr);border:1px solid #E2E8F0;border-radius:16px;overflow:hidden;margin-bottom:20px;'>
+          <div style='padding:16px 14px;background:white;border-right:1px solid #E2E8F0;'>
+            <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Faturamento bruto</div>
+            <div style='font-size:20px;font-weight:800;color:#0F172A;'>R$ {fat:,.0f}</div>
+            <div style='font-size:11px;color:#64748B;margin-top:2px;'>{pedidos} aprovados</div>
+            <div style='height:3px;background:#7C3AED;border-radius:99px;margin-top:10px;'></div>
+          </div>
+          <div style='padding:16px 14px;background:white;border-right:1px solid #E2E8F0;'>
+            <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Cancelamentos</div>
+            <div style='font-size:20px;font-weight:800;color:#94A3B8;'>R$ {cancel_val:,.0f}</div>
+            <div style='font-size:11px;color:#64748B;margin-top:2px;'>{canceladas_n} não enviados</div>
+            <div style='height:3px;background:#CBD5E1;border-radius:99px;margin-top:10px;'></div>
+          </div>
+          <div style='padding:16px 14px;background:white;border-right:1px solid #E2E8F0;'>
+            <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Devoluções</div>
+            <div style='font-size:20px;font-weight:800;color:#DC2626;'>− R$ {devol:,.0f}</div>
+            <div style='font-size:11px;color:#64748B;margin-top:2px;'>{devolvidas_n} devolvidos</div>
+            <div style='height:3px;background:#FCA5A5;border-radius:99px;margin-top:10px;'></div>
+          </div>
+          <div style='padding:16px 14px;background:#F8FAFC;border-right:1px solid #E2E8F0;'>
+            <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Receita líquida</div>
+            <div style='font-size:20px;font-weight:800;color:#0F172A;'>R$ {fat_liq:,.0f}</div>
+            <div style='font-size:11px;color:#64748B;margin-top:2px;'>após devoluções</div>
+            <div style='height:3px;background:#94A3B8;border-radius:99px;margin-top:10px;'></div>
+          </div>
+          <div style='padding:16px 14px;background:white;border-right:1px solid #E2E8F0;'>
+            <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Tarifas + Frete + ADS</div>
+            <div style='font-size:20px;font-weight:800;color:#DC2626;'>− R$ {tarifas+fretes+ads_cost:,.0f}</div>
+            <div style='font-size:11px;color:#64748B;margin-top:2px;'>ML + envios + ads</div>
+            <div style='height:3px;background:#FCA5A5;border-radius:99px;margin-top:10px;'></div>
+          </div>
+          <div style='padding:16px 14px;background:white;border-right:1px solid #E2E8F0;'>
+            <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Custo + Impostos</div>
+            <div style='font-size:20px;font-weight:800;color:#DC2626;'>− R$ {custos+impostos:,.0f}</div>
+            <div style='font-size:11px;color:#64748B;margin-top:2px;'>produto + 4%</div>
+            <div style='height:3px;background:#FCA5A5;border-radius:99px;margin-top:10px;'></div>
+          </div>
+          <div style='padding:16px 14px;background:#F0FDF4;'>
+            <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Lucro líquido</div>
+            <div style='font-size:20px;font-weight:800;color:#16A34A;'>R$ {lucro:,.0f}</div>
+            <div style='font-size:11px;color:#16A34A;font-weight:700;margin-top:2px;'>margem {margem:.1f}%</div>
+            <div style='height:3px;background:#16A34A;border-radius:99px;margin-top:10px;'></div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Métricas rápidas
+        _total_coorte = pedidos + canceladas_n + devolvidas_n
+        _taxa_devol   = (devolvidas_n / _total_coorte * 100) if _total_coorte else 0
+        _taxa_cancel  = (canceladas_n / _total_coorte * 100) if _total_coorte else 0
+        _ads_pct = (ads_cost / fat * 100) if fat else 0
+        m1, m2, m3, m4 = st.columns(4)
+        for col, label, val, sub in [
+            (m1, "Ticket médio",        f"R$ {ticket:,.2f}",     f"lucro/venda R$ {lucro/pedidos:.2f}" if pedidos else "–"),
+            (m2, "Taxa de devolução",   f"{_taxa_devol:.1f}%",   f"{devolvidas_n} devol · {_total_coorte} total · {_taxa_cancel:.1f}% cancel"),
+            (m3, "ADS (Product Ads)",   f"R$ {ads_cost:,.0f}",   f"{_ads_pct:.1f}% do faturamento"),
+            (m4, "Margem líquida",      f"{margem:.1f}%",        f"lucro R$ {lucro:,.0f}"),
+        ]:
+            col.markdown(f"""
+            <div style='background:#F8FAFC;border-radius:12px;padding:14px 16px;'>
+              <div style='font-size:11px;color:#64748B;margin-bottom:6px;'>{label}</div>
+              <div style='font-size:22px;font-weight:800;color:#0F172A;'>{val}</div>
+              <div style='font-size:11px;color:#94A3B8;margin-top:3px;'>{sub}</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # DRE + Histórico lado a lado
+        col_dre, col_hist = st.columns(2)
+
+        with col_dre:
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown(f"**📋 DRE · {nome_mes} {ano}**")
+            linhas_dre = [
+                ("Receita bruta",     f"R$ {fat:,.2f}",              False),
+                ("  Cancelamentos",   f"(R$ {cancel_val:,.2f} · não enviados)", "info"),
+                ("  Devoluções",      f"− R$ {devol:,.2f}",          True),
+                ("Receita líquida",   f"R$ {fat_liq:,.2f}",          False),
+                ("  Tarifas ML",      f"− R$ {tarifas:,.2f}",        True),
+                ("  Frete ML",        f"− R$ {fretes:,.2f}",         True),
+                ("  ADS (Product Ads)", f"− R$ {ads_cost:,.2f}",     True),
+                ("  Custo produto",   f"− R$ {custos:,.2f}",         True),
+                ("  Impostos (4%)",   f"− R$ {impostos:,.2f}",       True),
+                ("Lucro líquido",     f"R$ {lucro:,.2f}",            False),
+            ]
+            for label, valor, negativo in linhas_dre:
+                peso = "font-weight:800;" if "líquido" in label or "bruta" in label else ""
+                if negativo == "info":
+                    cor = "color:#94A3B8;font-style:italic;"
+                elif negativo:
+                    cor = "color:#DC2626;"
+                elif "Lucro" in label:
+                    cor = "color:#16A34A;"
+                else:
+                    cor = ""
+                borda = "border-top:2px solid #E2E8F0;margin-top:4px;padding-top:8px;" if "líquido" in label or "Lucro" in label else ""
+                st.markdown(f"""
+                <div style='display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #F1F5F9;font-size:13px;{borda}'>
+                  <span style='color:#64748B;{peso}'>{label}</span>
+                  <span style='{cor}{peso}'>{valor}</span>
+                </div>""", unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        with col_hist:
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown("**📈 Histórico mensal**")
+            if fechamentos:
+                max_fat = max(float(f.get("faturamento_bruto", 0)) for f in fechamentos)
+                # Helper: gera HTML do delta (seta + %)
+                def _delta_html(atual, anterior):
+                    if anterior is None or anterior == 0:
+                        return ""
+                    var = (atual - anterior) / abs(anterior) * 100
+                    if abs(var) < 0.05:
+                        return ""
+                    if var > 0:
+                        return f"<span style='color:#16A34A;font-size:10px;font-weight:700;margin-left:4px;white-space:nowrap;'>▲ {var:.1f}%</span>"
+                    else:
+                        return f"<span style='color:#DC2626;font-size:10px;font-weight:700;margin-left:4px;white-space:nowrap;'>▼ {abs(var):.1f}%</span>"
+
+                fech_list = fechamentos[:6]
+                for i, f in enumerate(fech_list):
+                    fm = f["ano_mes"]
+                    ano_h, mes_h = int(fm[:4]), int(fm[5:7])
+                    nome_h = ["","Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"][mes_h]
+                    fat_h  = float(f.get("faturamento_bruto", 0))
+                    luc_h  = float(f.get("lucro_liquido", 0))
+                    mar_h  = float(f.get("margem", 0))
+                    pct    = int(fat_h / max_fat * 100) if max_fat > 0 else 0
+                    atual  = fm == ano_mes
+                    # Mês anterior (lista vem ordenada do mais recente pro mais antigo)
+                    prev = fechamentos[i+1] if i+1 < len(fechamentos) else None
+                    fat_prev = float(prev.get("faturamento_bruto", 0)) if prev else None
+                    luc_prev = float(prev.get("lucro_liquido", 0))    if prev else None
+                    mar_prev = float(prev.get("margem", 0))           if prev else None
+                    d_fat = _delta_html(fat_h, fat_prev)
+                    d_luc = _delta_html(luc_h, luc_prev)
+                    d_mar = _delta_html(mar_h, mar_prev)
+
+                    st.markdown(f"""
+                    <div style='display:grid;grid-template-columns:55px 1fr 110px 90px;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #F1F5F9;font-size:12px;'>
+                      <span style='{"font-weight:800;color:#7C3AED;" if atual else "color:#64748B;"}'>{nome_h} {str(ano_h)[2:]}</span>
+                      <div>
+                        <div style='font-size:10px;color:#94A3B8;margin-bottom:2px;'>R$ {fat_h:,.0f}{d_fat}</div>
+                        <div style='background:#F1F5F9;border-radius:99px;height:6px;overflow:hidden;'>
+                          <div style='height:6px;border-radius:99px;background:#7C3AED;width:{pct}%;'></div>
+                        </div>
+                      </div>
+                      <span style='color:{"#16A34A" if luc_h >= 0 else "#DC2626"};font-weight:700;'>R$ {luc_h:,.0f}{d_luc}</span>
+                      <span style='text-align:right;color:{"#16A34A" if mar_h >= 15 else "#64748B"};font-weight:700;'>{mar_h:.1f}%{d_mar}</span>
+                    </div>""", unsafe_allow_html=True)
+
+                # ── Gráfico de linhas: Faturamento vs Lucro (duplo eixo) ──
+                st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
+                _meses_pt = ["","Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"]
+                _df_hist = pd.DataFrame([{
+                    "ano_mes":  f["ano_mes"],
+                    "label":    f"{_meses_pt[int(f['ano_mes'][5:7])]}/{f['ano_mes'][2:4]}",
+                    "Faturamento": float(f.get("faturamento_bruto", 0)),
+                    "Lucro":       float(f.get("lucro_liquido", 0)),
+                } for f in fechamentos])
+                _df_hist = _df_hist.sort_values("ano_mes")
+
+                _base = alt.Chart(_df_hist).encode(
+                    x=alt.X("label:N", title=None, sort=list(_df_hist["label"]),
+                            axis=alt.Axis(labelAngle=0, labelFontSize=10))
+                )
+                _l_fat = _base.mark_line(color="#7C3AED", strokeWidth=2.5, point=alt.OverlayMarkDef(filled=True, size=60, color="#7C3AED")).encode(
+                    y=alt.Y("Faturamento:Q", title="Faturamento (R$)", axis=alt.Axis(titleColor="#7C3AED", labelColor="#7C3AED", format=",.0f")),
+                    tooltip=[alt.Tooltip("label:N", title="Mês"), alt.Tooltip("Faturamento:Q", format=",.2f")]
+                )
+                _l_luc = _base.mark_line(color="#16A34A", strokeWidth=2.5, point=alt.OverlayMarkDef(filled=True, size=60, color="#16A34A")).encode(
+                    y=alt.Y("Lucro:Q", title="Lucro (R$)", axis=alt.Axis(titleColor="#16A34A", labelColor="#16A34A", format=",.0f")),
+                    tooltip=[alt.Tooltip("label:N", title="Mês"), alt.Tooltip("Lucro:Q", format=",.2f")]
+                )
+                _chart = alt.layer(_l_fat, _l_luc).resolve_scale(y="independent").properties(height=220)
+                st.altair_chart(_chart, use_container_width=True)
+            else:
+                st.info("Nenhum mês fechado ainda.")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        # Botão reabrir
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔓 Reabrir e editar este fechamento", key="reabrir_fech"):
+            del fechamentos_map[ano_mes]
+            fechados_novos = [f for f in fechamentos if f["ano_mes"] != ano_mes]
+            get_supabase().table("fechamentos_mensais")\
+                .delete().eq("user_id", str(user_id)).eq("ano_mes", ano_mes).execute()
+            st.rerun()
+
+    else:
+        # ── Formulário de fechamento ──
+        if st.session_state.get("fech_erro"):
+            st.error(f"❌ Erro ao salvar: {st.session_state['fech_erro']}")
+            st.info("💡 Verifique se a tabela 'fechamentos_mensais' foi criada no Supabase.")
+
+        st.info(f"ℹ️ {nome_mes} {ano} ainda não foi fechado. Preencha os dados abaixo ou clique em **Fechar automaticamente** para importar do dashboard.")
+        # Botão fechar automático
+        if st.button("⚡ Fechar automaticamente (importar do dashboard)", type="primary", key="auto_fech"):
+            # Buscar dados do período
+            import zoneinfo as _zi
+            _tz = _zi.ZoneInfo("America/Sao_Paulo")
+            from datetime import datetime as _dtt
+            import calendar as _cal
+            _ultimo_dia = _cal.monthrange(ano, mes)[1]
+            _df_from = f"{ano}-{mes:02d}-01T00:00:00.000-03:00"
+            _df_to   = f"{ano}-{mes:02d}-{_ultimo_dia:02d}T23:59:59.000-03:00"
+
+            with st.spinner("Buscando dados do período..."):
+                _headers_ml = {"Authorization": f"Bearer {token}"}
+
+                # ── QUERY 1: orders por date_created (coorte do mês) ──
+                _orders_dc = []
+                _offset, _limit = 0, 50
+                while True:
+                    _r = requests.get(f"{ML_API_BASE}/orders/search",
+                        headers=_headers_ml,
+                        params={"seller": user_id,
+                                "order.date_created.from": _df_from,
+                                "order.date_created.to": _df_to,
+                                "sort": "date_desc",
+                                "offset": _offset, "limit": _limit},
+                        timeout=30)
+                    if _r.status_code != 200: break
+                    _data = _r.json()
+                    _res  = _data.get("results", [])
+                    _orders_dc.extend(_res)
+                    _offset += _limit
+                    if _offset >= _data.get("paging", {}).get("total", 0) or not _res:
+                        break
+
+                # ── QUERY 2: canceladas com date_closed no mês (fechadas tardiamente) ──
+                _orders_dcl = []
+                _offset, _limit = 0, 50
+                while True:
+                    _r = requests.get(f"{ML_API_BASE}/orders/search",
+                        headers=_headers_ml,
+                        params={"seller": user_id,
+                                "order.date_closed.from": _df_from,
+                                "order.date_closed.to": _df_to,
+                                "order.status": "cancelled",
+                                "sort": "date_desc",
+                                "offset": _offset, "limit": _limit},
+                        timeout=30)
+                    if _r.status_code != 200: break
+                    _data = _r.json()
+                    _res  = _data.get("results", [])
+                    _orders_dcl.extend(_res)
+                    _offset += _limit
+                    if _offset >= _data.get("paging", {}).get("total", 0) or not _res:
+                        break
+
+                # ── Mesclar e deduplicar por order_id ──
+                _seen_ids   = set()
+                _all_orders = []
+                for o in _orders_dc + _orders_dcl:
+                    oid = str(o.get("id"))
+                    if oid in _seen_ids:
+                        continue
+                    _seen_ids.add(oid)
+                    _all_orders.append(o)
+
+                if _all_orders:
+                    _ship_ids = tuple(sorted({o.get("shipping",{}).get("id") for o in _all_orders if o.get("shipping",{}).get("id")}))
+                    _tok_hash = token[-8:] if token else ""
+                    _shipinfo = fetch_shipments_batch(_ship_ids, _tok_hash, token)
+                    _fretes   = {sid: info.get("cost", 0.0) for sid, info in _shipinfo.items()}
+                    _reimb    = get_orders_reembolsados(_all_orders)
+
+                    _ids_dev = tuple(sorted(str(o.get("id")) for o in _all_orders
+                        if o.get("status") == "cancelled" or str(o.get("id")) in _reimb))
+                    _custos_dev = get_custos_devolucao(_ids_dev, _tok_hash, token)
+                    _df_raw = parse_orders(_all_orders, _fretes, _reimb, _shipinfo,
+                                           _custos_dev)
+                    _df     = apply_costs_online(_df_raw, str(user_id))
+
+                    _aprov  = _df[_df["Categoria"] == "aprovada"]
+                    _cancel = _df[_df["Categoria"] == "cancelada"]
+                    _devol  = _df[_df["Categoria"] == "devolvida"]
+
+                    _fat        = _aprov["Receita Bruta"].sum()
+                    _cancel_val = abs(_cancel["Receita Bruta"].sum())
+                    _devol_val  = abs(_devol["Receita Bruta"].sum())
+                    _tar        = _aprov["Taxas ML"].sum()
+                    _frt        = _aprov["Frete"].sum()
+                    _cst        = _aprov["Custo Total"].sum()
+                    _imp        = _aprov["Imposto"].sum()
+
+                    # Gasto com ADS (Product Ads) no período
+                    _adv_id     = get_advertiser_id(token[-8:] if token else "", token)
+                    _ads_from   = f"{ano}-{mes:02d}-01"
+                    _ads_to     = f"{ano}-{mes:02d}-{_ultimo_dia:02d}"
+                    _ads_cost   = fetch_ads_cost(_adv_id, token[-8:] if token else "", token, _ads_from, _ads_to)
+
+                    _luc        = _aprov["Lucro"].sum() + _devol["Lucro"].sum() - _ads_cost
+                    _mar        = (_luc / _fat * 100) if _fat > 0 else 0
+                    _ped        = len(_aprov)
+                    _can_n      = len(_cancel)
+                    _dev_n      = len(_devol)
+                    _tick       = _fat / _ped if _ped else 0
+                    _cdf        = load_custos(str(user_id))
+                    _est        = sum(float(r.get("qtd_disponivel",0)) * float(r.get("custo_produto",0))
+                                    for _, r in _cdf.iterrows() if float(r.get("qtd_disponivel",0)) > 0) if not _cdf.empty else 0
+
+                    _saved = save_fechamento(str(user_id), {
+                        "ano_mes": ano_mes,
+                        "faturamento_bruto": round(_fat, 2),
+                        "devolucoes": round(_devol_val, 2),
+                        "cancelamentos_valor": round(_cancel_val, 2),
+                        "tarifas_ml": round(_tar, 2),
+                        "frete_ml": round(_frt, 2),
+                        "ads_cost": round(_ads_cost, 2),
+                        "custo_produto": round(_cst, 2),
+                        "impostos": round(_imp, 2),
+                        "lucro_liquido": round(_luc, 2),
+                        "margem": round(_mar, 2),
+                        "pedidos": _ped,
+                        "canceladas": _can_n,
+                        "devolvidas": _dev_n,
+                        "ticket_medio": round(_tick, 2),
+                        "estoque_valor": round(_est, 2),
+                        "fechado_em": _dtt.now(_tz).strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                    if _saved:
+                        st.success(f"✅ {nome_mes} {ano} fechado! Aprovadas: {_ped} · Cancel: {_can_n} (R$ {_cancel_val:,.0f}) · Devol: {_dev_n} (R$ {_devol_val:,.0f}) · ADS: R$ {_ads_cost:,.0f}")
+                        st.rerun()
+                else:
+                    st.warning("Nenhuma venda encontrada no período.")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("**Ou preencha manualmente:**")
+
+        with st.form(f"form_fech_{ano_mes}"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                f_fat   = st.number_input("Faturamento bruto (R$)",  min_value=0.0, step=0.01, format="%.2f")
+                f_devol = st.number_input("Devoluções (R$)",          min_value=0.0, step=0.01, format="%.2f")
+                f_ped   = st.number_input("Pedidos aprovados",        min_value=0, step=1)
+            with c2:
+                f_tar   = st.number_input("Tarifas ML (R$)",          min_value=0.0, step=0.01, format="%.2f")
+                f_frt   = st.number_input("Frete ML (R$)",            min_value=0.0, step=0.01, format="%.2f")
+                f_can   = st.number_input("Pedidos cancelados",       min_value=0, step=1)
+            with c3:
+                f_cst   = st.number_input("Custo produto (R$)",       min_value=0.0, step=0.01, format="%.2f")
+                f_imp   = st.number_input("Impostos (R$)",            min_value=0.0, step=0.01, format="%.2f")
+                f_est   = st.number_input("Estoque em caixa (R$)",    min_value=0.0, step=0.01, format="%.2f")
+
+            if st.form_submit_button("💾 Salvar fechamento", type="primary", use_container_width=True):
+                from datetime import datetime as _dtt2
+                import zoneinfo as _zi2
+                _tz2 = _zi2.ZoneInfo("America/Sao_Paulo")
+                _luc_m  = f_fat - f_devol - f_tar - f_frt - f_cst - f_imp
+                _mar_m  = (_luc_m / f_fat * 100) if f_fat > 0 else 0
+                save_fechamento(str(user_id), {
+                    "ano_mes": ano_mes,
+                    "faturamento_bruto": round(f_fat, 2),
+                    "devolucoes": round(f_devol, 2),
+                    "tarifas_ml": round(f_tar, 2),
+                    "frete_ml": round(f_frt, 2),
+                    "custo_produto": round(f_cst, 2),
+                    "impostos": round(f_imp, 2),
+                    "lucro_liquido": round(_luc_m, 2),
+                    "margem": round(_mar_m, 2),
+                    "pedidos": int(f_ped),
+                    "canceladas": int(f_can),
+                    "ticket_medio": round(f_fat / f_ped if f_ped else 0, 2),
+                    "estoque_valor": round(f_est, 2),
+                    "fechado_em": _dtt2.now(_tz2).strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                st.success(f"✅ {nome_mes} {ano} fechado!")
+                st.rerun()
+
+# ══════════════════════════════════════════
+# ABA: SHOPEE
+# ══════════════════════════════════════════
+elif st.session_state["aba_ativa"] == "shopee":
+    render_shopee(get_supabase(), user_id)
+
+# ══════════════════════════════════════════
+# ABA: PROMOÇÕES
+# ══════════════════════════════════════════
+elif st.session_state["aba_ativa"] == "promocoes":
+    render_promocoes(str(user_id), token)
