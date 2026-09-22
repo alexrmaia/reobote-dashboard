@@ -854,7 +854,7 @@ def projetar_caixa(caixa_inicial, piso_diario, saidas_por_dia=None, horizonte_di
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_custos_devolucao(order_ids_tuple, token_hash, token):
-    """Custo efetivamente cobrado do vendedor por pedido devolvido."""
+    """Custo original e custo líquido da devolução, por pedido."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     if not order_ids_tuple:
@@ -878,17 +878,51 @@ def get_custos_devolucao(order_ids_tuple, token_hash, token):
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("currency_id") == "BRL":
-                    return order_id, max(float(data.get("amount") or 0), 0), True
+                    liquido = max(float(data.get("amount") or 0), 0)
+
+                    # O shipment da devolução preserva o custo original mesmo
+                    # quando a cobrança foi posteriormente reembolsada.
+                    original = 0.0
+                    ret = requests.get(
+                        f"{ML_API_BASE}/post-purchase/v2/claims/{claim_id}/returns",
+                        headers=headers, timeout=15,
+                    )
+                    if ret.status_code == 200:
+                        ret_data = ret.json() or {}
+                        shipment_ids = [s.get("shipment_id") for s in (ret_data.get("shipments") or [])
+                                        if s.get("shipment_id") and s.get("type") in (None, "return")]
+                        old_shipping = ret_data.get("shipping") or {}
+                        if old_shipping.get("id"):
+                            shipment_ids.append(old_shipping["id"])
+                        for shipment_id in set(shipment_ids):
+                            cost_resp = requests.get(
+                                f"{ML_API_BASE}/shipments/{shipment_id}/costs",
+                                headers={**headers, "x-format-new": "true"}, timeout=15,
+                            )
+                            if cost_resp.status_code == 200:
+                                original += sum(max(float(s.get("cost") or 0), 0)
+                                                for s in (cost_resp.json().get("senders") or []))
+
+                    situacao = "reembolsado" if original > 0 and liquido == 0 else (
+                        "cobrado" if liquido > 0 else "gratis")
+                    return order_id, {"amount": liquido, "original_amount": original,
+                                      "status": situacao, "confirmed": True}
         except (requests.RequestException, ValueError, TypeError):
             pass
-        return order_id, 0.0, False
+        return order_id, {"amount": 0.0, "original_amount": 0.0,
+                          "status": "nao_confirmado", "confirmed": False}
 
     custos = {}
     with ThreadPoolExecutor(max_workers=4) as executor:
         for future in as_completed([executor.submit(consultar, t) for t in tarefas]):
-            order_id, amount, confirmado = future.result()
-            if confirmado:
-                custos[order_id] = custos.get(order_id, 0.0) + amount
+            order_id, info = future.result()
+            if order_id in custos:
+                custos[order_id]["amount"] += info["amount"]
+                custos[order_id]["original_amount"] += info["original_amount"]
+                if info["status"] == "reembolsado":
+                    custos[order_id]["status"] = "reembolsado"
+            else:
+                custos[order_id] = info
     return custos
 
 
@@ -915,6 +949,17 @@ def parse_orders(orders, fretes=None, reembolsados=None, shipments_info=None, cu
         _sinfo      = shipments_info.get(shipping_id, {}) if shipping_id else {}
         ship_status = (_sinfo.get("status") or shipping.get("status") or "").lower()
         rev_fee     = float(_sinfo.get("reverse_fee") or 0)
+        custo_dev = custos_devolucao.get(str(order_id))
+        if isinstance(custo_dev, dict):
+            custo_dev_val = float(custo_dev.get("amount") or 0)
+            custo_dev_original = float(custo_dev.get("original_amount") or 0)
+            custo_dev_status = custo_dev.get("status", "nao_confirmado")
+            custo_dev_ok = bool(custo_dev.get("confirmed"))
+        else:
+            custo_dev_val = float(custo_dev if custo_dev is not None else rev_fee)
+            custo_dev_original = custo_dev_val
+            custo_dev_status = "cobrado" if custo_dev_val > 0 else "nao_confirmado"
+            custo_dev_ok = custo_dev_val > 0
         paid_amount = float(order.get("paid_amount") or 0)
         reemb_val   = float(reembolsados.get(str(order_id), 0) or 0)
         
@@ -949,7 +994,7 @@ def parse_orders(orders, fretes=None, reembolsados=None, shipments_info=None, cu
                 # Zero confirmado é gratuito; nunca substituir pelo frete de ida.
                 # O custo é do pedido: lançar uma vez, mesmo com vários itens.
                 if item_idx == 0:
-                    frete = float(custos_devolucao.get(str(order_id), rev_fee) or 0)
+                    frete = custo_dev_val
                 
                 # O repasse do ML é apenas o débito do frete reverso (prejuízo)
                 total_ml = -frete
@@ -972,6 +1017,9 @@ def parse_orders(orders, fretes=None, reembolsados=None, shipments_info=None, cu
                 "Cancelada": cancelada,
                 "Categoria": categoria,
                 "Reembolsado": reemb_val,
+                "Frete reverso original": custo_dev_original if categoria == "devolvida" else 0.0,
+                "Situação frete reverso": custo_dev_status if categoria == "devolvida" else "",
+                "Frete reverso confirmado": custo_dev_ok if categoria == "devolvida" else True,
             })
 
     return pd.DataFrame(rows) if rows else pd.DataFrame()
@@ -3431,6 +3479,7 @@ if st.session_state["aba_ativa"] == "financeiro":
 
     aprovadas   = df[~df["Cancelada"]]
     canceladas  = df[df["Cancelada"]]
+    devolvidas  = df[df["Categoria"] == "devolvida"]
     faturamento = aprovadas["Receita Bruta"].sum()
     tarifas     = aprovadas["Taxas ML"].sum()
     fretes_sum  = aprovadas["Frete"].sum()
@@ -3449,7 +3498,7 @@ if st.session_state["aba_ativa"] == "financeiro":
     ads_on  = st.session_state["ads_on"]
     ads_eff = ads_cost if ads_on else 0.0
 
-    lucro_total = aprovadas["Lucro"].sum() - ads_eff
+    lucro_total = aprovadas["Lucro"].sum() + devolvidas["Lucro"].sum() - ads_eff
     margem_real = (lucro_total / faturamento * 100) if faturamento > 0 else 0
     # Salva lucro no session_state para uso no ROI do Caixa
     if "lucro_acumulado" not in st.session_state or periodo == "Personalizar":
@@ -4092,6 +4141,18 @@ if st.session_state["aba_ativa"] == "financeiro":
     for _, row in df.iterrows():
         cancelada = row["Cancelada"]
         devolvida = row.get("Categoria") == "devolvida"
+        status_frete_reverso = row.get("Situação frete reverso", "")
+        frete_reverso_original = float(row.get("Frete reverso original", 0) or 0)
+        if status_frete_reverso == "reembolsado":
+            frete_reverso_html = (f'<span style="color:#2563EB;font-weight:800;">'
+                                  f'Reembolsado · R$ {frete_reverso_original:,.2f}</span>')
+        elif status_frete_reverso == "cobrado":
+            frete_reverso_html = (f'<span style="color:#DC2626;font-weight:800;">'
+                                  f'Reverso · R$ {float(row["Frete"]):,.2f}</span>')
+        elif status_frete_reverso == "gratis":
+            frete_reverso_html = '<span style="color:#16A34A;font-weight:800;">Grátis · R$ 0,00</span>'
+        else:
+            frete_reverso_html = '<span style="color:#B45309;font-weight:800;">Custo não confirmado</span>'
         bg_row    = "#FFF5F5" if cancelada else "white"
         rec       = row["Receita Bruta"]
         corrigido = row.get("Corrigido", False)
@@ -4109,7 +4170,7 @@ if st.session_state["aba_ativa"] == "financeiro":
             <td style="padding:10px 8px;font-size:18px;text-align:center;">{status_icon(row['Status'])}</td>
             <td style="padding:10px 8px;text-align:center;font-weight:700;">{int(row['Quantidade'])}</td>
             <td style="padding:10px 8px;font-weight:700;">{badge(rec, fat_total,'#DCFCE7','#15803D')}</td>
-            <td style="padding:10px 8px;">{('<span style="color:#16A34A;font-weight:800;">Grátis · R$ 0,00</span>' if float(row['Frete']) == 0 else '<span style="color:#DC2626;font-weight:800;">Reverso · R$ ' + f'{float(row["Frete"]):,.2f}' + '</span>') if devolvida else ('–' if cancelada else badge(row['Frete'], rec,'#DBEAFE','#1D4ED8'))}</td>
+            <td style="padding:10px 8px;">{frete_reverso_html if devolvida else ('–' if cancelada else badge(row['Frete'], rec,'#DBEAFE','#1D4ED8'))}</td>
             <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Taxas ML'], rec,'#FEF3C7','#B45309')}</td>
             <td style="padding:10px 8px;">{'–' if cancelada else f'{tag_custo}{badge(row["Custo Total"], rec, "#EDE9FE","#6D28D9")}'}</td>
             <td style="padding:10px 8px;">{'–' if cancelada else badge(row['Imposto'], rec,'#F1F5F9','#475569')}</td>
