@@ -831,7 +831,7 @@ def get_repasses_passados(user_id, token_hash, token, dias=30):
 
 def projetar_caixa(caixa_inicial, piso_diario, saidas_por_dia=None, horizonte_dias=90,
                    recebimentos_por_dia=None, data_inicio=None):
-    """Hoje até D+6: calendário; D+7 em diante: média, sem sobreposição."""
+    """Hoje até D+7: calendário; D+8 em diante: estimativa, sem sobreposição."""
     from zoneinfo import ZoneInfo
     hoje = data_inicio or datetime.now(ZoneInfo("America/Sao_Paulo")).date()
     saidas_por_dia = saidas_por_dia or {}
@@ -839,12 +839,12 @@ def projetar_caixa(caixa_inicial, piso_diario, saidas_por_dia=None, horizonte_di
     linhas, saldo = [], float(caixa_inicial)
     for i in range(horizonte_dias):
         d = hoje + timedelta(days=i)
-        entra = float(recebimentos_por_dia.get(d, 0.0)) if i < 7 else float(piso_diario)
+        entra = float(recebimentos_por_dia.get(d, 0.0)) if i < 8 else float(piso_diario)
         sai = float(saidas_por_dia.get(d, 0.0))
         saldo += entra - sai
         linhas.append({"data": d, "entra": entra, "sai": sai,
                        "fluxo": entra - sai, "saldo": saldo,
-                       "origem": "Programado" if i < 7 else "Estimado"})
+                       "origem": "Programado" if i < 8 else "Estimado"})
     return pd.DataFrame(linhas)
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -4780,11 +4780,11 @@ elif st.session_state["aba_ativa"] == "caixa":
             from datetime import date, timedelta
             _hoje_d = datetime.now(__import__("zoneinfo").ZoneInfo("America/Sao_Paulo")).date()
             _total_futuro = float(_rec_df["valor"].sum())
-            _prox_7  = float(_rec_df[(_rec_df["data"] >= _hoje_d) & (_rec_df["data"] < _hoje_d + timedelta(days=7))]["valor"].sum())
+            _prox_7  = float(_rec_df[(_rec_df["data"] >= _hoje_d) & (_rec_df["data"] <= _hoje_d + timedelta(days=7))]["valor"].sum())
             _prox_30 = float(_rec_df[(_rec_df["data"] >= _hoje_d) & (_rec_df["data"] < _hoje_d + timedelta(days=30))]["valor"].sum())
 
             r1, r2, r3 = st.columns(3)
-            r1.markdown(f"""<div class="kpi-card"><div class="kpi-title">Próximos 7 dias</div><div class="kpi-value" style="color:#16A34A;">R$ {_prox_7:,.2f}</div></div>""", unsafe_allow_html=True)
+            r1.markdown(f"""<div class="kpi-card"><div class="kpi-title">Hoje + próximos 7 dias</div><div class="kpi-value" style="color:#16A34A;">R$ {_prox_7:,.2f}</div></div>""", unsafe_allow_html=True)
             r2.markdown(f"""<div class="kpi-card"><div class="kpi-title">Próximos 30 dias</div><div class="kpi-value" style="color:#16A34A;">R$ {_prox_30:,.2f}</div></div>""", unsafe_allow_html=True)
             r3.markdown(f"""<div class="kpi-card"><div class="kpi-title">Total a liberar</div><div class="kpi-value" style="color:#7C3AED;">R$ {_total_futuro:,.2f}</div></div>""", unsafe_allow_html=True)
 
@@ -4835,10 +4835,20 @@ elif st.session_state["aba_ativa"] == "caixa":
                 get_recebimentos_futuros.clear(str(user_id), token[-8:] if token else "", token)
                 st.rerun()
             historico = get_repasses_passados(str(user_id), token[-8:] if token else "", token, dias=30)
+            media = float(historico["valor"].sum()) / 30 if not historico.empty else 0.0
+            modo = st.radio("Como definir a entrada diária após hoje + 7 dias?",
+                            ["Média dos últimos 30 dias", "Informar valor manualmente"],
+                            horizontal=True, key="cx_modo_entrada")
+            manual = modo == "Informar valor manualmente"
+            valor_manual = None
+            if manual:
+                valor_manual = st.number_input("Entrada diária que deseja considerar (R$)",
+                    min_value=0.0, value=round(media, 2), step=100.0, format="%.2f", key="cx_valor_manual")
+                st.caption("O valor informado será usado integralmente após o período programado, sem redução por percentual. Os recebimentos de hoje até hoje + 7 dias continuam vindo do calendário.")
             if historico.empty:
-                st.warning("Sem histórico retornado: pode não haver repasses ou a consulta pode ter falhado. Não é possível estimar as entradas.")
-                return
-            media = float(historico["valor"].sum()) / 30
+                st.warning("Histórico indisponível ou sem repasses. Você pode informar uma entrada diária manual; não há média histórica validada.")
+                if not manual:
+                    return
             saidas = {}
             vencidos = 0.0
             invalidos = 0
@@ -4859,26 +4869,31 @@ elif st.session_state["aba_ativa"] == "caixa":
                 return
             if vencidos:
                 st.warning(f"R$ {vencidos:,.2f} em contas vencidas não pagas foram considerados como saída hoje.")
-            st.warning("A projeção desconta somente contas cadastradas. Cadastre todas as parcelas dos 90 dias, inclusive despesas mensais: marcar 'recorrente' não gera parcelas automaticamente. Nos primeiros 7 dias usamos somente o calendário; do 8º dia em diante, somente a média histórica.")
+            st.warning("A projeção desconta somente contas cadastradas. Cadastre todas as parcelas dos 90 dias, inclusive despesas mensais: marcar 'recorrente' não gera parcelas automaticamente. De hoje até hoje + 7 dias (8 datas) usamos somente o calendário; a partir de hoje + 8 dias, somente a entrada diária escolhida.")
             programados = {pd.to_datetime(r["data"]).date(): float(r["valor"])
                            for _, r in _rec_df.iterrows()}
             if _rec_df.empty:
-                st.warning("Calendário vazio: os primeiros 7 dias terão entrada zero. Atualize e confira a consulta antes de decidir.")
+                st.warning("Calendário vazio: hoje e os próximos 7 dias terão entrada zero. Atualize e confira a consulta antes de decidir.")
             entradas = {"Base": media, "Conservador": media * fator,
                         "Estresse": media * fator * (1 - queda)}
             cenarios = {nome: projetar_caixa(caixa, entrada, saidas, 90, programados, hoje)
                         for nome, entrada in entradas.items()}
-            selecionado = st.radio("Cenário para os indicadores", list(cenarios), index=0, horizontal=True, key="cx_cenario")
+            if manual:
+                entradas = {"Manual": valor_manual}
+                cenarios = {"Manual": projetar_caixa(caixa, valor_manual, saidas, 90, programados, hoje)}
+                selecionado = "Manual"
+            else:
+                selecionado = st.radio("Cenário para os indicadores", list(cenarios), index=0, horizontal=True, key="cx_cenario")
             proj = cenarios[selecionado]
             m1, m2, m3 = st.columns(3)
-            m1.metric("Programado nos primeiros 7 dias", f"R$ {proj.iloc[:7]['entra'].sum():,.2f}")
-            m2.metric("Média diária dos últimos 30 dias", f"R$ {media:,.2f}")
-            m3.metric("Entrada diária utilizada do 8º dia em diante", f"R$ {entradas[selecionado]:,.2f}")
+            m1.metric("Programado: hoje + 7 dias", f"R$ {proj.iloc[:8]['entra'].sum():,.2f}")
+            m2.metric("Média diária dos últimos 30 dias", f"R$ {media:,.2f}" if not historico.empty else "Indisponível")
+            m3.metric("Entrada diária após hoje + 7 dias", f"R$ {entradas[selecionado]:,.2f}")
             st.caption(f"Histórico: {hoje - timedelta(days=30):%d/%m/%Y} a {hoje - timedelta(days=1):%d/%m/%Y}. "
                        f"Total encontrado: R$ {historico['valor'].sum():,.2f} ÷ 30 dias corridos (inclui dias sem repasse). "
-                       f"Calendário: {hoje:%d/%m} a {hoje + timedelta(days=6):%d/%m}. "
-                       f"Projeção pela média a partir de {hoje + timedelta(days=7):%d/%m}. "
-                       "Percentuais alteram somente a projeção após os 7 dias; os valores programados são iguais nos três cenários.")
+                       f"Calendário: {hoje:%d/%m} a {hoje + timedelta(days=7):%d/%m}. "
+                       f"Projeção pela entrada diária escolhida a partir de {hoje + timedelta(days=8):%d/%m}. "
+                       "No modo automático, percentuais alteram somente a projeção após o período programado. No modo manual, usamos exatamente o valor informado.")
             minimo = min(caixa, float(proj["saldo"].min()))
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Menor saldo (inclui saldo inicial)", f"R$ {minimo:,.2f}")
