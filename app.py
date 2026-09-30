@@ -750,7 +750,7 @@ def get_recebimentos_futuros(user_id, token_hash, token):
     return df
 
 @st.cache_data(ttl=900, show_spinner=False)
-def get_repasses_passados(user_id, token_hash, token, dias=15):
+def get_repasses_passados(user_id, token_hash, token, dias=30):
     """
     Repasses (net_received_amount) que JÁ foram liberados nos últimos `dias`.
     Mesma mecânica de get_recebimentos_futuros, mas com money_release_date no
@@ -830,19 +830,21 @@ def get_repasses_passados(user_id, token_hash, token, dias=15):
 
 
 def projetar_caixa(caixa_inicial, piso_diario, saidas_por_dia=None, horizonte_dias=90,
-                   atraso_dias=0, data_inicio=None):
-    """Estimativa diária; atrasos deslocam entradas para além do horizonte quando necessário."""
+                   recebimentos_por_dia=None, data_inicio=None):
+    """Hoje até D+6: calendário; D+7 em diante: média, sem sobreposição."""
     from zoneinfo import ZoneInfo
     hoje = data_inicio or datetime.now(ZoneInfo("America/Sao_Paulo")).date()
     saidas_por_dia = saidas_por_dia or {}
+    recebimentos_por_dia = recebimentos_por_dia or {}
     linhas, saldo = [], float(caixa_inicial)
     for i in range(horizonte_dias):
         d = hoje + timedelta(days=i)
-        entra = float(piso_diario) if i >= atraso_dias else 0.0
+        entra = float(recebimentos_por_dia.get(d, 0.0)) if i < 7 else float(piso_diario)
         sai = float(saidas_por_dia.get(d, 0.0))
         saldo += entra - sai
         linhas.append({"data": d, "entra": entra, "sai": sai,
-                       "fluxo": entra - sai, "saldo": saldo})
+                       "fluxo": entra - sai, "saldo": saldo,
+                       "origem": "Programado" if i < 7 else "Estimado"})
     return pd.DataFrame(linhas)
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -4776,10 +4778,10 @@ elif st.session_state["aba_ativa"] == "caixa":
             st.info("Nenhum recebimento futuro previsto.")
         else:
             from datetime import date, timedelta
-            _hoje_d = date.today()
+            _hoje_d = datetime.now(__import__("zoneinfo").ZoneInfo("America/Sao_Paulo")).date()
             _total_futuro = float(_rec_df["valor"].sum())
-            _prox_7  = float(_rec_df[_rec_df["data"] <= _hoje_d + timedelta(days=7)]["valor"].sum())
-            _prox_30 = float(_rec_df[_rec_df["data"] <= _hoje_d + timedelta(days=30)]["valor"].sum())
+            _prox_7  = float(_rec_df[(_rec_df["data"] >= _hoje_d) & (_rec_df["data"] < _hoje_d + timedelta(days=7))]["valor"].sum())
+            _prox_30 = float(_rec_df[(_rec_df["data"] >= _hoje_d) & (_rec_df["data"] < _hoje_d + timedelta(days=30))]["valor"].sum())
 
             r1, r2, r3 = st.columns(3)
             r1.markdown(f"""<div class="kpi-card"><div class="kpi-title">Próximos 7 dias</div><div class="kpi-value" style="color:#16A34A;">R$ {_prox_7:,.2f}</div></div>""", unsafe_allow_html=True)
@@ -4826,16 +4828,17 @@ elif st.session_state["aba_ativa"] == "caixa":
             fator = c2.slider("Entrada conservadora (% da média)", 0, 100, 78, key="cx_hair") / 100
             reserva = c3.number_input("Reserva mínima desejada (R$)", min_value=0.0, value=0.0, step=500.0, key="cx_reserva")
             c1, c2 = st.columns(2)
-            atraso = c1.slider("Atraso das entradas no cenário de estresse (dias)", 0, 30, 7, key="cx_atraso")
             queda = c2.slider("Queda adicional no cenário de estresse (%)", 0, 100, 20, key="cx_queda") / 100
-            st.caption("Informe o saldo atual e mantenha apenas pagamentos ainda não realizados nos agendamentos. A entrada de hoje representa uma estimativa do restante do dia; ajuste o saldo e as hipóteses para não contar repasses já recebidos novamente.")
-            if st.button("Atualizar histórico de repasses", key="cx_refresh"):
-                get_repasses_passados.clear(str(user_id), token[-8:] if token else "", token, dias=15)
-            historico = get_repasses_passados(str(user_id), token[-8:] if token else "", token, dias=15)
+            st.caption("Informe o saldo atual e mantenha apenas pagamentos ainda não realizados nos agendamentos. O calendário inclui hoje: confira se algum repasse de hoje já está no saldo informado para não contá-lo novamente.")
+            if st.button("Atualizar recebimentos e histórico", key="cx_refresh"):
+                get_repasses_passados.clear(str(user_id), token[-8:] if token else "", token, dias=30)
+                get_recebimentos_futuros.clear(str(user_id), token[-8:] if token else "", token)
+                st.rerun()
+            historico = get_repasses_passados(str(user_id), token[-8:] if token else "", token, dias=30)
             if historico.empty:
                 st.warning("Sem histórico retornado: pode não haver repasses ou a consulta pode ter falhado. Não é possível estimar as entradas.")
                 return
-            media = float(historico["valor"].sum()) / 15
+            media = float(historico["valor"].sum()) / 30
             saidas = {}
             vencidos = 0.0
             invalidos = 0
@@ -4856,13 +4859,26 @@ elif st.session_state["aba_ativa"] == "caixa":
                 return
             if vencidos:
                 st.warning(f"R$ {vencidos:,.2f} em contas vencidas não pagas foram considerados como saída hoje.")
-            st.warning("A projeção desconta somente contas cadastradas. Cadastre todas as parcelas dos 90 dias, inclusive despesas mensais: marcar 'recorrente' não gera parcelas automaticamente. Recebíveis do calendário não são somados à média para evitar dupla contagem.")
-            cenarios = {}
-            for nome, entrada, dias_atraso in [("Base", media, 0), ("Conservador", media * fator, 0),
-                                             ("Estresse", media * fator * (1 - queda), atraso)]:
-                cenarios[nome] = projetar_caixa(caixa, entrada, saidas, 90, dias_atraso, hoje)
-            selecionado = st.radio("Cenário para os indicadores", list(cenarios), index=1, horizontal=True, key="cx_cenario")
+            st.warning("A projeção desconta somente contas cadastradas. Cadastre todas as parcelas dos 90 dias, inclusive despesas mensais: marcar 'recorrente' não gera parcelas automaticamente. Nos primeiros 7 dias usamos somente o calendário; do 8º dia em diante, somente a média histórica.")
+            programados = {pd.to_datetime(r["data"]).date(): float(r["valor"])
+                           for _, r in _rec_df.iterrows()}
+            if _rec_df.empty:
+                st.warning("Calendário vazio: os primeiros 7 dias terão entrada zero. Atualize e confira a consulta antes de decidir.")
+            entradas = {"Base": media, "Conservador": media * fator,
+                        "Estresse": media * fator * (1 - queda)}
+            cenarios = {nome: projetar_caixa(caixa, entrada, saidas, 90, programados, hoje)
+                        for nome, entrada in entradas.items()}
+            selecionado = st.radio("Cenário para os indicadores", list(cenarios), index=0, horizontal=True, key="cx_cenario")
             proj = cenarios[selecionado]
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Programado nos primeiros 7 dias", f"R$ {proj.iloc[:7]['entra'].sum():,.2f}")
+            m2.metric("Média diária dos últimos 30 dias", f"R$ {media:,.2f}")
+            m3.metric("Entrada diária utilizada do 8º dia em diante", f"R$ {entradas[selecionado]:,.2f}")
+            st.caption(f"Histórico: {hoje - timedelta(days=30):%d/%m/%Y} a {hoje - timedelta(days=1):%d/%m/%Y}. "
+                       f"Total encontrado: R$ {historico['valor'].sum():,.2f} ÷ 30 dias corridos (inclui dias sem repasse). "
+                       f"Calendário: {hoje:%d/%m} a {hoje + timedelta(days=6):%d/%m}. "
+                       f"Projeção pela média a partir de {hoje + timedelta(days=7):%d/%m}. "
+                       "Percentuais alteram somente a projeção após os 7 dias; os valores programados são iguais nos três cenários.")
             minimo = min(caixa, float(proj["saldo"].min()))
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Menor saldo (inclui saldo inicial)", f"R$ {minimo:,.2f}")
@@ -4875,7 +4891,7 @@ elif st.session_state["aba_ativa"] == "caixa":
             else:
                 st.success("O saldo diário permanece não negativo neste cenário, considerando as contas cadastradas.")
             st.metric("Valor adicional para preservar a reserva em todo o período", f"R$ {max(0.0, reserva - minimo):,.2f}")
-            st.caption(f"Média estimada: R$ {media:,.2f}/dia, usando 15 dias corridos. Histórico curto e possíveis falhas/parcialidade da API limitam a previsão de 90 dias. Estresse desloca as entradas; valores após o dia 90 ficam fora do período.")
+            st.caption("O gráfico mostra saldos ao fim de cada dia. A média é uma estimativa e depende da cobertura do histórico retornado pela API.")
             linhas = pd.concat([df.assign(cenario=nome) for nome, df in cenarios.items()], ignore_index=True)
             grafico = alt.Chart(linhas).mark_line().encode(
                 x=alt.X("data:T", title="Data"), y=alt.Y("saldo:Q", title="Saldo projetado (R$)"),
