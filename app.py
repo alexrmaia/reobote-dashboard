@@ -749,6 +749,7 @@ def get_recebimentos_futuros(user_id, token_hash, token):
     df = df.groupby("data", as_index=False)["valor"].sum().sort_values("data")
     return df
 
+@st.cache_data(ttl=900, show_spinner=False)
 def get_repasses_passados(user_id, token_hash, token, dias=15):
     """
     Repasses (net_received_amount) que JÁ foram liberados nos últimos `dias`.
@@ -828,25 +829,17 @@ def get_repasses_passados(user_id, token_hash, token, dias=15):
     return df
 
 
-def projetar_caixa(caixa_inicial, piso_diario, saidas_por_dia=None, horizonte_dias=30):
-    """
-    Projeção de PISO: aplica um mesmo valor diário conservador (piso_diario) para
-    todos os dias do horizonte, somando ao caixa e descontando as contas datadas.
-    É a linha 'minimamente garantida' — na prática tende a vir mais que o projetado.
-
-    caixa_inicial : saldo em conta hoje.
-    piso_diario   : média móvel dos últimos 15 dias corridos x haircut (ex.: 78%).
-    saidas_por_dia: dict {date: valor} com parcelas, DAS, etc.
-    Retorna DataFrame com entra, sai, fluxo e saldo por dia.
-    """
-    from datetime import date as _date, timedelta
+def projetar_caixa(caixa_inicial, piso_diario, saidas_por_dia=None, horizonte_dias=90,
+                   atraso_dias=0, data_inicio=None):
+    """Estimativa diária; atrasos deslocam entradas para além do horizonte quando necessário."""
+    from zoneinfo import ZoneInfo
+    hoje = data_inicio or datetime.now(ZoneInfo("America/Sao_Paulo")).date()
     saidas_por_dia = saidas_por_dia or {}
-    hoje = _date.today()
     linhas, saldo = [], float(caixa_inicial)
     for i in range(horizonte_dias):
         d = hoje + timedelta(days=i)
-        entra = float(piso_diario)
-        sai   = float(saidas_por_dia.get(d, 0.0))
+        entra = float(piso_diario) if i >= atraso_dias else 0.0
+        sai = float(saidas_por_dia.get(d, 0.0))
         saldo += entra - sai
         linhas.append({"data": d, "entra": entra, "sai": sai,
                        "fluxo": entra - sai, "saldo": saldo})
@@ -4633,547 +4626,548 @@ elif st.session_state["aba_ativa"] == "regime":
 # ABA: CAIXA / CAPITAL
 # ══════════════════════════════════════════
 elif st.session_state["aba_ativa"] == "caixa":
-
-    CATEGORIAS_INTER = [
-        "Transferência do ML", "Fornecedor", "Frete / Logística",
-        "Mercado Ads", "Embalagem", "Operacional",
-        "Impostos / Taxas", "Pró-labore / Retirada", "Outros",
-        "🚫 Ignorar (não conta no caixa)",
-    ]
-    CAT_IGNORAR = "🚫 Ignorar (não conta no caixa)"
-
-    # ── Supabase helpers para extrato Inter ──
-    def load_extrato(uid):
-        sb = get_supabase()
-        resp = sb.table("extrato_inter").select("*").eq("user_id", uid).order("data", desc=True).execute()
-        if not resp.data:
-            return pd.DataFrame(columns=["id","data","valor","memo","categoria","conciliado","observacao"])
-        df = pd.DataFrame(resp.data)
-        df["data"]       = pd.to_datetime(df["data"], errors="coerce")
-        df["valor"]      = pd.to_numeric(df["valor"], errors="coerce").fillna(0)
-        df["conciliado"] = df["conciliado"].astype(bool)
-        # Neutraliza transferências internas (porquinho/CDB): aplicação e resgate
-        # não são entrada nem saída de caixa — o dinheiro só muda de "quadrado",
-        # mas continua na mesma conta. Preserva rendimento (descrição diferente).
-        if "memo" in df.columns:
-            _m = df["memo"].fillna("").str.strip().str.lower()
-            _transf = _m.str.startswith("aplicacao") | _m.str.startswith("aplicação") | _m.str.startswith("resgate")
-            df = df[~_transf].copy()
-        return df
-
-    def save_lancamento(uid, row):
-        sb = get_supabase()
-        sb.table("extrato_inter").upsert({"user_id": uid, **row}, on_conflict="user_id,id").execute()
-
-    def update_lancamento(uid, lancamento_id, categoria, observacao, conciliado):
-        sb = get_supabase()
-        sb.table("extrato_inter").update({
-            "categoria": categoria,
-            "observacao": observacao,
-            "conciliado": conciliado,
-        }).eq("user_id", uid).eq("id", lancamento_id).execute()
-
-    def load_agendamentos_inter(uid):
-        sb = get_supabase()
-        resp = sb.table("agendamentos_inter").select("*").eq("user_id", uid).order("data").execute()
-        if not resp.data:
-            return pd.DataFrame(columns=["id","data","valor","descricao","categoria","recorrente","pago"])
-        df = pd.DataFrame(resp.data)
-        df["data"]       = pd.to_datetime(df["data"], errors="coerce")
-        df["valor"]      = pd.to_numeric(df["valor"], errors="coerce").fillna(0)
-        df["pago"]       = df["pago"].astype(bool)
-        df["recorrente"] = df["recorrente"].astype(bool)
-        return df
-
-    def save_agendamento(uid, row):
-        sb = get_supabase()
-        sb.table("agendamentos_inter").insert({"user_id": uid, **row}).execute()
-
-    def excluir_agendamento(uid, ag_id):
-        sb = get_supabase()
-        sb.table("agendamentos_inter").delete().eq("user_id", uid).eq("id", str(ag_id)).execute()
-
-    def parse_ofx(content_bytes):
-        """Extrai lançamentos de um arquivo OFX/QFX."""
-        import re
-        text = content_bytes.decode("utf-8", errors="ignore")
-        rows = []
-        txs  = re.findall(r"<STMTTRN>(.*?)</STMTTRN>", text, re.S)
-        for tx in txs:
-            def get(tag):
-                pattern = r"<" + tag + r">([^<\n\r]+)"
-                m = re.search(pattern, tx)
-                return m.group(1).strip() if m else ""
-            dt_raw = get("DTPOSTED")
-            try:
-                dt = pd.to_datetime(dt_raw[:8], format="%Y%m%d")
-            except:
-                dt = None
-            valor = 0.0
-            try:
-                valor = float(get("TRNAMT").replace(",","."))
-            except:
-                pass
-            fitid = get("FITID") or get("REFNUM") or dt_raw
-            memo  = get("MEMO") or get("NAME") or ""
-            rows.append({"id": fitid, "data": dt, "valor": valor, "memo": memo,
-                         "categoria": "", "conciliado": False, "observacao": ""})
-        return pd.DataFrame(rows)
-
-    extrato_df    = load_extrato(str(user_id))
-    capital_df    = load_capital(str(user_id))
-    agend_df      = load_agendamentos_inter(str(user_id))
-
-    # ── Cards de resumo ──
-    # Para os TOTAIS, ignora lançamentos marcados como "Ignorar" (continuam na lista abaixo).
-    _calc_df = extrato_df.copy()
-    if not _calc_df.empty and "categoria" in _calc_df.columns:
-        _calc_df = _calc_df[_calc_df["categoria"] != CAT_IGNORAR]
-    entradas  = _calc_df[_calc_df["valor"] > 0]["valor"].sum() if not _calc_df.empty else 0.0
-    saidas    = _calc_df[_calc_df["valor"] < 0]["valor"].abs().sum() if not _calc_df.empty else 0.0
-    saldo     = _calc_df["valor"].sum() if not _calc_df.empty else 0.0
-    pendentes = extrato_df[~extrato_df["conciliado"]] if not extrato_df.empty and "conciliado" in extrato_df.columns else pd.DataFrame()
-    a_pagar   = agend_df[~agend_df["pago"]]["valor"].abs().sum() if not agend_df.empty and "pago" in agend_df.columns else 0.0
-
-    st.markdown(f"""
-    <div class="hero" style="min-height:auto;padding:28px 38px;">
-        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:24px;">
-            <div>
-                <div style="font-size:13px;font-weight:700;opacity:.85;">Banco Inter PJ</div>
-                <div style="font-size:28px;font-weight:900;">Caixa Inter</div>
-                <div style="margin-top:8px;">
-                    {"<span style=\'background:rgba(255,255,255,.2);border-radius:999px;padding:4px 12px;font-size:12px;font-weight:800;\'>✅ Tudo conciliado</span>" if len(pendentes)==0 else f"<span style=\'background:#F59E0B;color:#1F2937;border-radius:999px;padding:4px 12px;font-size:12px;font-weight:800;\'>⚠️ {len(pendentes)} pendentes</span>"}
-                </div>
-            </div>
-            <div style="display:flex;gap:32px;flex-wrap:wrap;">
-                <div style="text-align:center;">
-                    <div style="font-size:13px;font-weight:700;opacity:.85;">Entradas</div>
-                    <div style="font-size:28px;font-weight:900;">R$ {entradas:,.2f}</div>
-                </div>
-                <div style="text-align:center;">
-                    <div style="font-size:13px;font-weight:700;opacity:.85;">Saídas</div>
-                    <div style="font-size:28px;font-weight:900;">R$ {saidas:,.2f}</div>
-                </div>
-                <div style="text-align:center;">
-                    <div style="font-size:13px;font-weight:700;opacity:.85;">Saldo atual</div>
-                    <div style="font-size:28px;font-weight:900;">R$ {saldo:,.2f}</div>
-                </div>
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.markdown(f"""<div class="kpi-card"><div class="kpi-title">Entradas</div><div class="kpi-value">R$ {entradas:,.2f}</div></div>""", unsafe_allow_html=True)
-    k2.markdown(f"""<div class="kpi-card"><div class="kpi-title">Saídas</div><div class="kpi-value" style="color:#EF4444;">R$ {saidas:,.2f}</div></div>""", unsafe_allow_html=True)
-    k3.markdown(f"""<div class="kpi-card"><div class="kpi-title">A Pagar</div><div class="kpi-value" style="color:#F59E0B;">R$ {a_pagar:,.2f}</div></div>""", unsafe_allow_html=True)
-    k4.markdown(f"""<div class="kpi-card"><div class="kpi-title">Saldo após pagamentos</div><div class="kpi-value" style="color:#7C3AED;">R$ {saldo - a_pagar:,.2f}</div></div>""", unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── Calendário de Recebimentos Futuros ──
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("**📅 Calendário de Recebimentos (Mercado Pago)**")
-    st.caption("Previsão de liberação do dinheiro das vendas dos últimos 90 dias, agrupado por dia.")
-    _rec_df = get_recebimentos_futuros(str(user_id), token[-8:] if token else "", token)
-    if _rec_df.empty:
-        st.info("Nenhum recebimento futuro previsto.")
-    else:
+    @st.fragment
+    def render_caixa():
         from datetime import date, timedelta
-        _hoje_d = date.today()
-        _total_futuro = float(_rec_df["valor"].sum())
-        _prox_7  = float(_rec_df[_rec_df["data"] <= _hoje_d + timedelta(days=7)]["valor"].sum())
-        _prox_30 = float(_rec_df[_rec_df["data"] <= _hoje_d + timedelta(days=30)]["valor"].sum())
 
-        r1, r2, r3 = st.columns(3)
-        r1.markdown(f"""<div class="kpi-card"><div class="kpi-title">Próximos 7 dias</div><div class="kpi-value" style="color:#16A34A;">R$ {_prox_7:,.2f}</div></div>""", unsafe_allow_html=True)
-        r2.markdown(f"""<div class="kpi-card"><div class="kpi-title">Próximos 30 dias</div><div class="kpi-value" style="color:#16A34A;">R$ {_prox_30:,.2f}</div></div>""", unsafe_allow_html=True)
-        r3.markdown(f"""<div class="kpi-card"><div class="kpi-title">Total a liberar</div><div class="kpi-value" style="color:#7C3AED;">R$ {_total_futuro:,.2f}</div></div>""", unsafe_allow_html=True)
+        CATEGORIAS_INTER = [
+            "Transferência do ML", "Fornecedor", "Frete / Logística",
+            "Mercado Ads", "Embalagem", "Operacional",
+            "Impostos / Taxas", "Pró-labore / Retirada", "Outros",
+            "🚫 Ignorar (não conta no caixa)",
+        ]
+        CAT_IGNORAR = "🚫 Ignorar (não conta no caixa)"
 
-        st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+        # ── Supabase helpers para extrato Inter ──
+        def load_extrato(uid):
+            sb = get_supabase()
+            resp = sb.table("extrato_inter").select("*").eq("user_id", uid).order("data", desc=True).execute()
+            if not resp.data:
+                return pd.DataFrame(columns=["id","data","valor","memo","categoria","conciliado","observacao"])
+            df = pd.DataFrame(resp.data)
+            df["data"]       = pd.to_datetime(df["data"], errors="coerce")
+            df["valor"]      = pd.to_numeric(df["valor"], errors="coerce").fillna(0)
+            df["conciliado"] = df["conciliado"].astype(bool)
+            # Neutraliza transferências internas (porquinho/CDB): aplicação e resgate
+            # não são entrada nem saída de caixa — o dinheiro só muda de "quadrado",
+            # mas continua na mesma conta. Preserva rendimento (descrição diferente).
+            if "memo" in df.columns:
+                _m = df["memo"].fillna("").str.strip().str.lower()
+                _transf = _m.str.startswith("aplicacao") | _m.str.startswith("aplicação") | _m.str.startswith("resgate")
+                df = df[~_transf].copy()
+            return df
 
-        # Timeline dia a dia
-        _rec_df_view = _rec_df.copy()
-        _rec_df_view["Acumulado"] = _rec_df_view["valor"].cumsum()
-        _rec_df_view["Data"] = _rec_df_view["data"].astype(str)
-        _chart_rec = alt.Chart(_rec_df_view).mark_bar(color="#16A34A", cornerRadius=3).encode(
-            x=alt.X("Data:N", title=None, axis=alt.Axis(labelAngle=-45, labelFontSize=10)),
-            y=alt.Y("valor:Q", title="R$ a liberar", axis=alt.Axis(format=",.0f")),
-            tooltip=[
-                alt.Tooltip("Data:N", title="Dia"),
-                alt.Tooltip("valor:Q", title="Libera", format=",.2f"),
-                alt.Tooltip("Acumulado:Q", title="Acumulado até aqui", format=",.2f"),
-            ]
-        ).properties(height=220)
-        st.altair_chart(_chart_rec, use_container_width=True)
+        def save_lancamento(uid, row):
+            sb = get_supabase()
+            sb.table("extrato_inter").upsert({"user_id": uid, **row}, on_conflict="user_id,id").execute()
 
-        # Tabela expandível
-        with st.expander(f"📋 Ver detalhamento dia a dia ({len(_rec_df)} datas)", expanded=False):
-            _rec_show = _rec_df.copy()
-            _rec_show["Data"]  = _rec_show["data"].apply(lambda d: d.strftime("%d/%m/%Y (%a)"))
-            _rec_show["Valor"] = _rec_show["valor"].apply(lambda v: f"R$ {v:,.2f}")
-            _rec_show["Acumulado"] = _rec_show["valor"].cumsum().apply(lambda v: f"R$ {v:,.2f}")
-            st.dataframe(_rec_show[["Data","Valor","Acumulado"]], hide_index=True, use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+        def update_lancamento(uid, lancamento_id, categoria, observacao, conciliado):
+            sb = get_supabase()
+            sb.table("extrato_inter").update({
+                "categoria": categoria,
+                "observacao": observacao,
+                "conciliado": conciliado,
+            }).eq("user_id", uid).eq("id", lancamento_id).execute()
 
-    st.markdown("<br>", unsafe_allow_html=True)
+        def load_agendamentos_inter(uid):
+            sb = get_supabase()
+            resp = sb.table("agendamentos_inter").select("*").eq("user_id", uid).order("data").execute()
+            if not resp.data:
+                return pd.DataFrame(columns=["id","data","valor","descricao","categoria","recorrente","pago"])
+            df = pd.DataFrame(resp.data)
+            df["data"]       = pd.to_datetime(df["data"], errors="coerce")
+            df["valor"]      = pd.to_numeric(df["valor"], errors="coerce").fillna(0)
+            df["pago"]       = df["pago"].astype(bool)
+            df["recorrente"] = df["recorrente"].astype(bool)
+            return df
 
-    # ── Caixa Projetado (piso conservador) ──
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("**🔮 Caixa Projetado (piso conservador)**")
-    st.caption("Linha minimamente garantida: média móvel dos repasses dos últimos 15 dias × fator conservador, "
-               "projetada para os próximos 30 dias e descontando as contas agendadas. Tende a vir mais que o previsto.")
+        def save_agendamento(uid, row):
+            sb = get_supabase()
+            sb.table("agendamentos_inter").insert({"user_id": uid, **row}).execute()
 
-    cfg1, cfg2 = st.columns([1, 1])
-    with cfg1:
-        caixa_inicial = st.number_input("💰 Caixa hoje (R$)", min_value=0.0, value=10000.0, step=500.0, key="cx_ini")
-    with cfg2:
-        haircut = st.slider("🛡️ Conservadorismo (% da média)", 50, 100, 78, key="cx_hair") / 100.0
+        def excluir_agendamento(uid, ag_id):
+            sb = get_supabase()
+            sb.table("agendamentos_inter").delete().eq("user_id", uid).eq("id", str(ag_id)).execute()
 
-    _df_pass = get_repasses_passados(str(user_id), token[-8:] if token else "", token, dias=15)
-    if _df_pass.empty:
-        st.info("Ainda não há repasses liberados nos últimos 15 dias para calcular a média.")
-    else:
-        # média sobre 15 dias CORRIDOS (zeros dos dias sem repasse já embutidos na projeção futura)
-        media_15d_corridos = float(_df_pass["valor"].sum()) / 15.0
-        p25 = float(_df_pass["valor"].quantile(0.25))
-        piso_diario = media_15d_corridos * haircut
+        def parse_ofx(content_bytes):
+            """Extrai lançamentos de um arquivo OFX/QFX."""
+            import re
+            text = content_bytes.decode("utf-8", errors="ignore")
+            rows = []
+            txs  = re.findall(r"<STMTTRN>(.*?)</STMTTRN>", text, re.S)
+            for tx in txs:
+                def get(tag):
+                    pattern = r"<" + tag + r">([^<\n\r]+)"
+                    m = re.search(pattern, tx)
+                    return m.group(1).strip() if m else ""
+                dt_raw = get("DTPOSTED")
+                try:
+                    dt = pd.to_datetime(dt_raw[:8], format="%Y%m%d")
+                except:
+                    dt = None
+                valor = 0.0
+                try:
+                    valor = float(get("TRNAMT").replace(",","."))
+                except:
+                    pass
+                fitid = get("FITID") or get("REFNUM") or dt_raw
+                memo  = get("MEMO") or get("NAME") or ""
+                rows.append({"id": fitid, "data": dt, "valor": valor, "memo": memo,
+                             "categoria": "", "conciliado": False, "observacao": ""})
+            return pd.DataFrame(rows)
 
-        # saídas datadas — vêm dos agendamentos do Inter, se houver.
-        # IMPORTANTE: só os NÃO pagos. Um agendamento pago já saiu do caixa;
-        # descontá-lo de novo no futuro contaria a saída em dobro.
-        saidas = {}
-        try:
-            _ag = load_agendamentos_inter(str(user_id))
-            if not _ag.empty:
-                _ag_pend = _ag[~_ag["pago"]] if "pago" in _ag.columns else _ag
-                for _, a in _ag_pend.iterrows():
-                    dt = pd.to_datetime(a["data"]).date()
-                    saidas[dt] = saidas.get(dt, 0.0) + abs(float(a["valor"]))
-        except Exception:
-            pass
+        extrato_df    = load_extrato(str(user_id))
+        capital_df    = load_capital(str(user_id))
+        agend_df      = load_agendamentos_inter(str(user_id))
 
-        proj = projetar_caixa(caixa_inicial, piso_diario, saidas_por_dia=saidas, horizonte_dias=30)
-
-        saldo_min = float(proj["saldo"].min())
-        dia_min   = proj.loc[proj["saldo"].idxmin(), "data"]
-        saldo_fim = float(proj["saldo"].iloc[-1])
-        cor_min   = "#16A34A" if saldo_min >= 0 else "#DC2626"
-
-        k1, k2, k3 = st.columns(3)
-        k1.markdown(f"""<div class="kpi-card"><div class="kpi-title">Piso de entrada/dia</div><div class="kpi-value">R$ {piso_diario:,.0f}</div></div>""", unsafe_allow_html=True)
-        k2.markdown(f"""<div class="kpi-card"><div class="kpi-title">Menor saldo (30d)</div><div class="kpi-value" style="color:{cor_min};">R$ {saldo_min:,.0f}</div><div class="kpi-title">em {dia_min.strftime('%d/%m')}</div></div>""", unsafe_allow_html=True)
-        k3.markdown(f"""<div class="kpi-card"><div class="kpi-title">Saldo em 30 dias</div><div class="kpi-value">R$ {saldo_fim:,.0f}</div></div>""", unsafe_allow_html=True)
-
-        if saldo_min < 0:
-            st.error(f"⚠️ No piso conservador, o caixa fica negativo em {dia_min.strftime('%d/%m')} "
-                     f"(R$ {saldo_min:,.0f}). Vale antecipar recebíveis ou renegociar uma conta desse dia.")
-
-        st.caption(f"💡 Média 15d (corridos): R$ {media_15d_corridos:,.0f}/dia · "
-                   f"seu P25 (dia ruim típico) é R$ {p25:,.0f}. Se o P25 ficar perto do piso, seus {int(haircut*100)}% estão calibrados pelos seus dados.")
-
-        # gráfico: curva do piso nos 30 dias + linha do zero
-        _pv = proj.copy()
-        _pv["Data"] = _pv["data"].astype(str)
-        _linha_zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#DC2626", strokeDash=[4, 4]).encode(y="y:Q")
-        _area = alt.Chart(_pv).mark_area(opacity=0.22, color="#7C3AED").encode(
-            x=alt.X("Data:N", title=None, axis=alt.Axis(labelAngle=-45, labelFontSize=9)),
-            y=alt.Y("saldo:Q", title="Saldo mínimo projetado (R$)", axis=alt.Axis(format=",.0f")),
-            tooltip=[alt.Tooltip("Data:N"), alt.Tooltip("entra:Q", title="Entra (piso)", format=",.0f"),
-                     alt.Tooltip("sai:Q", title="Sai", format=",.0f"),
-                     alt.Tooltip("saldo:Q", title="Saldo", format=",.0f")]
-        ).properties(height=240)
-        st.altair_chart(_area + _linha_zero, use_container_width=True)
-
-        # tabela dia a dia em portlet com scroll (altura fixa)
-        with st.expander("📋 Ver projeção dia a dia", expanded=False):
-            _show = proj.copy()
-            _show["Data"] = _show["data"].apply(lambda d: d.strftime("%d/%m/%Y (%a)"))
-            for c in ["entra", "sai", "saldo"]:
-                _show[c] = _show[c].apply(lambda v: f"R$ {v:,.2f}")
-            st.dataframe(
-                _show[["Data", "entra", "sai", "saldo"]].rename(
-                    columns={"entra": "Entra (piso)", "sai": "Sai", "saldo": "Saldo"}),
-                hide_index=True, use_container_width=True, height=320)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── Upload OFX ──
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("**📂 Importar Extrato Inter (OFX)**")
-    st.caption("Importe o extrato do Banco Inter PJ em formato OFX. Lançamentos novos são adicionados automaticamente sem duplicar.")
-    ofx_file = st.file_uploader("Selecione o arquivo OFX", type=["ofx","qfx"], key="ofx_upload")
-    if ofx_file:
-        novos_df = parse_ofx(ofx_file.read())
-        ids_existentes = set(extrato_df["id"].astype(str)) if not extrato_df.empty else set()
-        novos = novos_df[~novos_df["id"].astype(str).isin(ids_existentes)]
-        if novos.empty:
-            st.info("Nenhum lançamento novo encontrado — extrato já importado.")
-        else:
-            st.success(f"{len(novos)} novos lançamentos encontrados.")
-            if st.button(f"✅ Importar {len(novos)} lançamentos", type="primary"):
-                for _, row in novos.iterrows():
-                    save_lancamento(str(user_id), {
-                        "id":          str(row["id"]),
-                        "data":        row["data"].strftime("%Y-%m-%d") if pd.notna(row["data"]) else None,
-                        "valor":       float(row["valor"]),
-                        "memo":        str(row["memo"]),
-                        "categoria":   "",
-                        "conciliado":  False,
-                        "observacao":  "",
-                    })
-                st.success("Extrato importado!")
-                st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # ── Conciliação do Extrato ──
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    pendentes_count = len(extrato_df[~extrato_df["conciliado"]]) if not extrato_df.empty and "conciliado" in extrato_df.columns else 0
-    total_count = len(extrato_df) if not extrato_df.empty else 0
-    _status_label = f"· {pendentes_count} pendentes" if pendentes_count > 0 else "· tudo conciliado ✅"
-    with st.expander(f"📋 Conciliação do Extrato — {total_count} lançamentos {_status_label}", expanded=False):
-        st.caption("Categorize cada lançamento. Entradas em verde, saídas em vermelho. Marque como conciliado após identificar.")
-        if extrato_df.empty:
-            st.info("Nenhum lançamento importado ainda. Faça upload do OFX acima.")
-        else:
-            # Filtros
-            fc1, fc2 = st.columns(2)
-            with fc1:
-                filtro_status = st.radio("Filtrar por:", ["Todos", "Pendentes", "Conciliados"],
-                                         horizontal=True, key="filtro_conciliacao")
-            with fc2:
-                filtro_cat = st.selectbox("Categoria:", ["Todas"] + CATEGORIAS_INTER, key="filtro_cat")
-
-            df_show = extrato_df.copy()
-            if filtro_status == "Pendentes":
-                df_show = df_show[~df_show["conciliado"]]
-            elif filtro_status == "Conciliados":
-                df_show = df_show[df_show["conciliado"]]
-            if filtro_cat != "Todas":
-                df_show = df_show[df_show["categoria"] == filtro_cat]
-
-            st.markdown(f"**{len(df_show)} lançamentos**")
-
-            # Tabela de conciliação
-            for idx, row in df_show.iterrows():
-                cor_val = "#16A34A" if row["valor"] >= 0 else "#DC2626"
-                sinal   = "+" if row["valor"] >= 0 else ""
-                concil  = row["conciliado"]
-                bg      = "#F0FDF4" if concil else "white"
-
-                with st.container():
-                    c1, c2, c3, c4, c5 = st.columns([1.2, 1, 3, 2, 1.5])
-                    with c1:
-                        st.markdown(f"<div style='padding:8px 0;font-size:13px;color:#64748B;'>{pd.to_datetime(row['data']).strftime('%d/%m/%Y') if pd.notna(row['data']) else '–'}</div>", unsafe_allow_html=True)
-                    with c2:
-                        st.markdown(f"<div style='padding:8px 0;font-weight:800;color:{cor_val};'>{sinal}R$ {abs(row['valor']):,.2f}</div>", unsafe_allow_html=True)
-                    with c3:
-                        st.markdown(f"<div style='padding:8px 0;font-size:13px;color:#0F172A;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;'>{str(row['memo'])[:60]}</div>", unsafe_allow_html=True)
-                    with c4:
-                        cat_sel = st.selectbox("", [""] + CATEGORIAS_INTER,
-                                               index=([""] + CATEGORIAS_INTER).index(row["categoria"]) if row["categoria"] in CATEGORIAS_INTER else 0,
-                                               key=f"cat_{row['id']}", label_visibility="collapsed")
-                    with c5:
-                        concil_btn = st.checkbox("✅ Conciliado", value=bool(concil), key=f"conc_{row['id']}")
-
-                    obs_key = f"obs_{row['id']}"
-                    obs_val = st.text_input("", value=str(row["observacao"] or ""),
-                                            placeholder="Observação (opcional)",
-                                            key=obs_key, label_visibility="collapsed")
-
-                    if cat_sel != row["categoria"] or concil_btn != concil or obs_val != str(row["observacao"] or ""):
-                        update_lancamento(str(user_id), str(row["id"]), cat_sel, obs_val, concil_btn)
-                        st.rerun()
-
-                    st.markdown("<hr style='margin:4px 0;border:none;border-top:1px solid #F1F5F9;'>", unsafe_allow_html=True)
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-    # ── Agendamentos ──
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="small-title">Agendamentos</div>', unsafe_allow_html=True)
-
-    with st.expander("➕ Novo agendamento"):
-        with st.form("form_agend", clear_on_submit=True):
-            ag1, ag2, ag3 = st.columns(3)
-            with ag1:
-                ag_data  = st.date_input("Data vencimento", value=date.today())
-                ag_valor = st.number_input("Valor (R$)", step=0.01, format="%.2f")
-            with ag2:
-                ag_desc  = st.text_input("Descrição")
-                ag_cat   = st.selectbox("Categoria", CATEGORIAS_INTER)
-            with ag3:
-                ag_rec   = st.checkbox("Recorrente (mensal)")
-            if st.form_submit_button("💾 Agendar", type="primary", use_container_width=True):
-                if ag_valor == 0 or not ag_desc:
-                    st.error("Informe valor e descrição.")
-                else:
-                    save_agendamento(str(user_id), {
-                        "data": ag_data.strftime("%Y-%m-%d"),
-                        "valor": ag_valor,
-                        "descricao": ag_desc,
-                        "categoria": ag_cat,
-                        "recorrente": ag_rec,
-                        "pago": False,
-                    })
-                    st.success("Agendamento salvo!")
-                    st.rerun()
-
-    if not agend_df.empty:
-        for _, ag in agend_df[~agend_df["pago"]].iterrows():
-            venc = pd.to_datetime(ag["data"])
-            dias = (venc - pd.Timestamp.now()).days
-            cor  = "#EF4444" if dias < 0 else "#F59E0B" if dias <= 3 else "#64748B"
-            ac1, ac2, ac3, ac4 = st.columns([1.5, 3, 1.5, 1])
-            with ac1:
-                st.markdown(f"<div style='color:{cor};font-weight:800;font-size:13px;padding:6px 0;'>{venc.strftime('%d/%m/%Y')}</div>", unsafe_allow_html=True)
-            with ac2:
-                st.markdown(f"<div style='padding:6px 0;font-size:13px;'>{ag['descricao']} <span style='color:#94A3B8;'>{ag['categoria']}</span></div>", unsafe_allow_html=True)
-            with ac3:
-                st.markdown(f"<div style='color:#EF4444;font-weight:800;padding:6px 0;'>R$ {abs(ag['valor']):,.2f}</div>", unsafe_allow_html=True)
-            with ac4:
-                if st.button("✅ Pago", key=f"pago_{ag['id']}"):
-                    get_supabase().table("agendamentos_inter").update({"pago": True}).eq("id", str(ag["id"])).execute()
-                    st.rerun()
-    else:
-        st.info("Nenhum agendamento pendente.")
-
-    # Agendamentos JÁ PAGOS — ficam ocultos da lista principal, mas podem ser
-    # excluídos aqui (ex.: lançamento duplicado marcado como pago por engano).
-    if not agend_df.empty and "pago" in agend_df.columns:
-        _pagos = agend_df[agend_df["pago"] == True]
-        if not _pagos.empty:
-            with st.expander(f"✅ Agendamentos pagos ({len(_pagos)}) — clique para ver ou excluir"):
-                for _, ag in _pagos.iterrows():
-                    venc = pd.to_datetime(ag["data"])
-                    pc1, pc2, pc3, pc4 = st.columns([1.5, 3, 1.5, 1])
-                    with pc1:
-                        st.markdown(f"<div style='color:#64748B;font-size:13px;padding:6px 0;'>{venc.strftime('%d/%m/%Y')}</div>", unsafe_allow_html=True)
-                    with pc2:
-                        st.markdown(f"<div style='padding:6px 0;font-size:13px;'>{ag['descricao']} <span style='color:#94A3B8;'>{ag['categoria']}</span></div>", unsafe_allow_html=True)
-                    with pc3:
-                        st.markdown(f"<div style='color:#16A34A;font-weight:800;padding:6px 0;'>R$ {abs(ag['valor']):,.2f} ✓</div>", unsafe_allow_html=True)
-                    with pc4:
-                        if st.button("🗑️ Excluir", key=f"del_{ag['id']}"):
-                            excluir_agendamento(str(user_id), ag["id"])
-                            st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # ── Capital Investido ──
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="small-title">Capital Investido & ROI</div>', unsafe_allow_html=True)
-
-    with st.expander("➕ Registrar aporte / retirada"):
-        with st.form("form_capital", clear_on_submit=True):
-            cap1, cap2 = st.columns(2)
-            with cap1:
-                cap_data  = st.date_input("Data", value=date.today())
-                cap_valor = st.number_input("Valor (R$) — negativo para retirada", step=0.01, format="%.2f")
-            with cap2:
-                cap_desc = st.text_input("Descrição", placeholder="ex: Compra lote S_001")
-                cap_cat  = st.selectbox("Categoria", ["Compra de estoque","Taxa/Tarifa","Retirada","Aporte","Outro"])
-            if st.form_submit_button("💾 Registrar", type="primary", use_container_width=True):
-                if cap_valor == 0:
-                    st.error("Valor não pode ser zero.")
-                else:
-                    save_capital(str(user_id), {
-                        "data": cap_data.strftime("%Y-%m-%d"),
-                        "valor": cap_valor,
-                        "descricao": cap_desc,
-                        "categoria": cap_cat,
-                    })
-                    st.success(f"R$ {cap_valor:.2f} registrado.")
-                    st.rerun()
-
-    if not capital_df.empty:
-        total_inv   = capital_df[capital_df["valor"] > 0]["valor"].sum()
-        total_ret   = capital_df[capital_df["valor"] < 0]["valor"].abs().sum()
-        saldo_cap   = capital_df["valor"].sum()
-        # Lucro acumulado — usa session_state se disponível (calculado na aba financeiro)
-        lucro_acum  = st.session_state.get("lucro_acumulado", 0.0)
-        roi         = (lucro_acum / total_inv * 100) if total_inv > 0 else 0.0
-        cor_roi     = "#16A34A" if roi >= 0 else "#DC2626"
-
-        # Calcula estoque em caixa
-        sb = get_supabase()
-        estoq_resp = sb.table("custos_sku").select("sku,custo_produto,qtd_disponivel").eq("user_id", str(user_id)).gt("qtd_disponivel", 0).execute()
-        estoque_caixa = sum(float(r["qtd_disponivel"]) * float(r["custo_produto"]) for r in (estoq_resp.data or []))
-        qtd_estoque   = sum(float(r["qtd_disponivel"]) for r in (estoq_resp.data or []))
-
-        # Média de vendas 15 dias — só conta qtd, NÃO processa FIFO
-        import zoneinfo as _tz
-        _agora = datetime.now(_tz.ZoneInfo("America/Sao_Paulo"))
-        _d15   = _agora - timedelta(days=15)
-        _from  = _d15.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
-        _to    = _agora.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
-        with st.spinner("Calculando média de vendas (15 dias)..."):
-            _orders15 = get_orders(str(user_id), token, _from, _to)
-        qtd_15d = sum(
-            int(item.get("quantity", 1) or 1)
-            for o in _orders15 if o.get("status") != "cancelled"
-            for item in o.get("order_items", [])
-        )
-        media_diaria = qtd_15d / 15
-        dias_estoque = int(qtd_estoque / media_diaria) if media_diaria > 0 else 0
-        cor_dias = "#16A34A" if dias_estoque >= 20 else "#F59E0B" if dias_estoque >= 10 else "#DC2626"
-
-        ci1, ci2, ci3 = st.columns(3)
-        ci1.markdown(f"""<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px;text-align:center;">
-            <div style="font-size:11px;font-weight:800;color:#64748B;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Total Investido</div>
-            <div style="font-size:32px;font-weight:900;color:#0F172A;letter-spacing:-1px;">R$ {total_inv:,.2f}</div>
-        </div>""", unsafe_allow_html=True)
-        ci2.markdown(f"""<div style="background:#FFF7ED;border:1px solid #FED7AA;border-radius:16px;padding:24px;text-align:center;">
-            <div style="font-size:11px;font-weight:800;color:#C2410C;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Estoque em Caixa</div>
-            <div style="font-size:32px;font-weight:900;color:#0F172A;letter-spacing:-1px;">R$ {estoque_caixa:,.2f}</div>
-            <div style="font-size:12px;color:#92400E;margin-top:4px;font-weight:600;">{int(qtd_estoque)} unidades disponíveis</div>
-        </div>""", unsafe_allow_html=True)
-        ci3.markdown(f"""<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px;text-align:center;">
-            <div style="font-size:11px;font-weight:800;color:#64748B;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Dias de Estoque</div>
-            <div style="font-size:40px;font-weight:900;color:{cor_dias};letter-spacing:-1px;">{dias_estoque}</div>
-            <div style="font-size:12px;color:#64748B;margin-top:4px;font-weight:600;">média {media_diaria:.1f} un/dia (15d)</div>
-        </div>""", unsafe_allow_html=True)
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        # Tabela de lançamentos estilizada
-        linhas_cap = ""
-        for _, row in capital_df.sort_values("data", ascending=False).iterrows():
-            val  = float(row["valor"])
-            cor  = "#16A34A" if val >= 0 else "#DC2626"
-            sinal = "+" if val >= 0 else ""
-            data_fmt = pd.to_datetime(row["data"]).strftime("%d/%m/%Y") if pd.notna(row["data"]) else "–"
-            linhas_cap += f"""
-            <tr style="border-bottom:1px solid #F1F5F9;">
-                <td style="padding:14px 12px;color:#64748B;font-size:13px;">{data_fmt}</td>
-                <td style="padding:14px 12px;font-weight:600;color:#0F172A;">{row.get('descricao','')}</td>
-                <td style="padding:14px 12px;">
-                    <span style="background:#EDE9FE;color:#6D28D9;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:700;">
-                        {row.get('categoria','')}
-                    </span>
-                </td>
-                <td style="padding:14px 12px;text-align:right;font-weight:800;color:{cor};">{sinal}R$ {abs(val):,.2f}</td>
-            </tr>"""
+        # ── Cards de resumo ──
+        # Para os TOTAIS, ignora lançamentos marcados como "Ignorar" (continuam na lista abaixo).
+        _calc_df = extrato_df.copy()
+        if not _calc_df.empty and "categoria" in _calc_df.columns:
+            _calc_df = _calc_df[_calc_df["categoria"] != CAT_IGNORAR]
+        entradas  = _calc_df[_calc_df["valor"] > 0]["valor"].sum() if not _calc_df.empty else 0.0
+        saidas    = _calc_df[_calc_df["valor"] < 0]["valor"].abs().sum() if not _calc_df.empty else 0.0
+        saldo     = _calc_df["valor"].sum() if not _calc_df.empty else 0.0
+        pendentes = extrato_df[~extrato_df["conciliado"]] if not extrato_df.empty and "conciliado" in extrato_df.columns else pd.DataFrame()
+        a_pagar   = agend_df[~agend_df["pago"]]["valor"].abs().sum() if not agend_df.empty and "pago" in agend_df.columns else 0.0
 
         st.markdown(f"""
-        <div style="border-radius:16px;border:1px solid #E7ECF5;overflow:hidden;">
-            <table style="width:100%;border-collapse:collapse;font-family:'Inter',sans-serif;font-size:14px;">
-                <thead>
-                    <tr style="background:#F8FAFC;border-bottom:2px solid #E2E8F0;">
-                        <th style="padding:12px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Data</th>
-                        <th style="padding:12px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Descrição</th>
-                        <th style="padding:12px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Categoria</th>
-                        <th style="padding:12px;text-align:right;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Valor</th>
-                    </tr>
-                </thead>
-                <tbody>{linhas_cap}</tbody>
-            </table>
+        <div class="hero" style="min-height:auto;padding:28px 38px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:24px;">
+                <div>
+                    <div style="font-size:13px;font-weight:700;opacity:.85;">Banco Inter PJ</div>
+                    <div style="font-size:28px;font-weight:900;">Caixa Inter</div>
+                    <div style="margin-top:8px;">
+                        {"<span style=\'background:rgba(255,255,255,.2);border-radius:999px;padding:4px 12px;font-size:12px;font-weight:800;\'>✅ Tudo conciliado</span>" if len(pendentes)==0 else f"<span style=\'background:#F59E0B;color:#1F2937;border-radius:999px;padding:4px 12px;font-size:12px;font-weight:800;\'>⚠️ {len(pendentes)} pendentes</span>"}
+                    </div>
+                </div>
+                <div style="display:flex;gap:32px;flex-wrap:wrap;">
+                    <div style="text-align:center;">
+                        <div style="font-size:13px;font-weight:700;opacity:.85;">Entradas</div>
+                        <div style="font-size:28px;font-weight:900;">R$ {entradas:,.2f}</div>
+                    </div>
+                    <div style="text-align:center;">
+                        <div style="font-size:13px;font-weight:700;opacity:.85;">Saídas</div>
+                        <div style="font-size:28px;font-weight:900;">R$ {saidas:,.2f}</div>
+                    </div>
+                    <div style="text-align:center;">
+                        <div style="font-size:13px;font-weight:700;opacity:.85;">Saldo atual</div>
+                        <div style="font-size:28px;font-weight:900;">R$ {saldo:,.2f}</div>
+                    </div>
+                </div>
+            </div>
         </div>
         """, unsafe_allow_html=True)
 
-    else:
-        st.info("Nenhum lançamento registrado ainda. Use o formulário acima para começar.")
-    st.markdown('</div>', unsafe_allow_html=True)
+        k1, k2, k3, k4 = st.columns(4)
+        k1.markdown(f"""<div class="kpi-card"><div class="kpi-title">Entradas</div><div class="kpi-value">R$ {entradas:,.2f}</div></div>""", unsafe_allow_html=True)
+        k2.markdown(f"""<div class="kpi-card"><div class="kpi-title">Saídas</div><div class="kpi-value" style="color:#EF4444;">R$ {saidas:,.2f}</div></div>""", unsafe_allow_html=True)
+        k3.markdown(f"""<div class="kpi-card"><div class="kpi-title">A Pagar</div><div class="kpi-value" style="color:#F59E0B;">R$ {a_pagar:,.2f}</div></div>""", unsafe_allow_html=True)
+        k4.markdown(f"""<div class="kpi-card"><div class="kpi-title">Saldo após pagamentos</div><div class="kpi-value" style="color:#7C3AED;">R$ {saldo - a_pagar:,.2f}</div></div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Calendário de Recebimentos Futuros ──
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("**📅 Calendário de Recebimentos (Mercado Pago)**")
+        st.caption("Previsão de liberação do dinheiro das vendas dos últimos 90 dias, agrupado por dia.")
+        _rec_df = get_recebimentos_futuros(str(user_id), token[-8:] if token else "", token)
+        if _rec_df.empty:
+            st.info("Nenhum recebimento futuro previsto.")
+        else:
+            from datetime import date, timedelta
+            _hoje_d = date.today()
+            _total_futuro = float(_rec_df["valor"].sum())
+            _prox_7  = float(_rec_df[_rec_df["data"] <= _hoje_d + timedelta(days=7)]["valor"].sum())
+            _prox_30 = float(_rec_df[_rec_df["data"] <= _hoje_d + timedelta(days=30)]["valor"].sum())
+
+            r1, r2, r3 = st.columns(3)
+            r1.markdown(f"""<div class="kpi-card"><div class="kpi-title">Próximos 7 dias</div><div class="kpi-value" style="color:#16A34A;">R$ {_prox_7:,.2f}</div></div>""", unsafe_allow_html=True)
+            r2.markdown(f"""<div class="kpi-card"><div class="kpi-title">Próximos 30 dias</div><div class="kpi-value" style="color:#16A34A;">R$ {_prox_30:,.2f}</div></div>""", unsafe_allow_html=True)
+            r3.markdown(f"""<div class="kpi-card"><div class="kpi-title">Total a liberar</div><div class="kpi-value" style="color:#7C3AED;">R$ {_total_futuro:,.2f}</div></div>""", unsafe_allow_html=True)
+
+            st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+
+            # Timeline dia a dia
+            _rec_df_view = _rec_df.copy()
+            _rec_df_view["Acumulado"] = _rec_df_view["valor"].cumsum()
+            _rec_df_view["Data"] = _rec_df_view["data"].astype(str)
+            _chart_rec = alt.Chart(_rec_df_view).mark_bar(color="#16A34A", cornerRadius=3).encode(
+                x=alt.X("Data:N", title=None, axis=alt.Axis(labelAngle=-45, labelFontSize=10)),
+                y=alt.Y("valor:Q", title="R$ a liberar", axis=alt.Axis(format=",.0f")),
+                tooltip=[
+                    alt.Tooltip("Data:N", title="Dia"),
+                    alt.Tooltip("valor:Q", title="Libera", format=",.2f"),
+                    alt.Tooltip("Acumulado:Q", title="Acumulado até aqui", format=",.2f"),
+                ]
+            ).properties(height=220)
+            st.altair_chart(_chart_rec, use_container_width=True)
+
+            # Tabela expandível
+            with st.expander(f"📋 Ver detalhamento dia a dia ({len(_rec_df)} datas)", expanded=False):
+                _rec_show = _rec_df.copy()
+                _rec_show["Data"]  = _rec_show["data"].apply(lambda d: d.strftime("%d/%m/%Y (%a)"))
+                _rec_show["Valor"] = _rec_show["valor"].apply(lambda v: f"R$ {v:,.2f}")
+                _rec_show["Acumulado"] = _rec_show["valor"].cumsum().apply(lambda v: f"R$ {v:,.2f}")
+                st.dataframe(_rec_show[["Data","Valor","Acumulado"]], hide_index=True, use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+
+        @st.fragment
+        def render_simulacao_caixa(agendamentos):
+            from zoneinfo import ZoneInfo
+            hoje = datetime.now(ZoneInfo("America/Sao_Paulo")).date()
+            st.markdown("**🔮 Caixa projetado — 90 dias**")
+            st.caption("Estimativas de hoje até os próximos 89 dias. Percentuais são hipóteses, não probabilidades ou garantia de recebimento.")
+            c1, c2, c3 = st.columns(3)
+            caixa = c1.number_input("Caixa disponível agora (R$)", value=10000.0, step=500.0, key="cx_ini")
+            fator = c2.slider("Entrada conservadora (% da média)", 0, 100, 78, key="cx_hair") / 100
+            reserva = c3.number_input("Reserva mínima desejada (R$)", min_value=0.0, value=0.0, step=500.0, key="cx_reserva")
+            c1, c2 = st.columns(2)
+            atraso = c1.slider("Atraso das entradas no cenário de estresse (dias)", 0, 30, 7, key="cx_atraso")
+            queda = c2.slider("Queda adicional no cenário de estresse (%)", 0, 100, 20, key="cx_queda") / 100
+            st.caption("Informe o saldo atual e mantenha apenas pagamentos ainda não realizados nos agendamentos. A entrada de hoje representa uma estimativa do restante do dia; ajuste o saldo e as hipóteses para não contar repasses já recebidos novamente.")
+            if st.button("Atualizar histórico de repasses", key="cx_refresh"):
+                get_repasses_passados.clear(str(user_id), token[-8:] if token else "", token, dias=15)
+            historico = get_repasses_passados(str(user_id), token[-8:] if token else "", token, dias=15)
+            if historico.empty:
+                st.warning("Sem histórico retornado: pode não haver repasses ou a consulta pode ter falhado. Não é possível estimar as entradas.")
+                return
+            media = float(historico["valor"].sum()) / 15
+            saidas = {}
+            vencidos = 0.0
+            invalidos = 0
+            if not agendamentos.empty:
+                for _, conta in agendamentos[~agendamentos["pago"]].iterrows():
+                    dt = pd.to_datetime(conta["data"], errors="coerce")
+                    if pd.isna(dt):
+                        invalidos += 1
+                        continue
+                    dia = dt.date()
+                    valor = abs(float(conta["valor"]))
+                    if dia < hoje:
+                        vencidos += valor
+                        dia = hoje
+                    saidas[dia] = saidas.get(dia, 0.0) + valor
+            if invalidos:
+                st.error(f"Existem {invalidos} contas pendentes sem data válida. Corrija antes de usar a projeção.")
+                return
+            if vencidos:
+                st.warning(f"R$ {vencidos:,.2f} em contas vencidas não pagas foram considerados como saída hoje.")
+            st.warning("A projeção desconta somente contas cadastradas. Cadastre todas as parcelas dos 90 dias, inclusive despesas mensais: marcar 'recorrente' não gera parcelas automaticamente. Recebíveis do calendário não são somados à média para evitar dupla contagem.")
+            cenarios = {}
+            for nome, entrada, dias_atraso in [("Base", media, 0), ("Conservador", media * fator, 0),
+                                             ("Estresse", media * fator * (1 - queda), atraso)]:
+                cenarios[nome] = projetar_caixa(caixa, entrada, saidas, 90, dias_atraso, hoje)
+            selecionado = st.radio("Cenário para os indicadores", list(cenarios), index=1, horizontal=True, key="cx_cenario")
+            proj = cenarios[selecionado]
+            minimo = min(caixa, float(proj["saldo"].min()))
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Menor saldo (inclui saldo inicial)", f"R$ {minimo:,.2f}")
+            for col, n in [(c2, 30), (c3, 60), (c4, 90)]:
+                col.metric(f"Saldo ao fim de {n} dias", f"R$ {proj.iloc[n-1]['saldo']:,.2f}")
+            negativos = proj[proj["saldo"] < 0]
+            if caixa < 0 or not negativos.empty:
+                primeira = hoje if caixa < 0 else negativos.iloc[0]["data"]
+                st.error(f"Primeira falta de caixa: {primeira:%d/%m/%Y}. Necessidade máxima para não ficar negativo: R$ {max(0.0, -minimo):,.2f}.")
+            else:
+                st.success("O saldo diário permanece não negativo neste cenário, considerando as contas cadastradas.")
+            st.metric("Valor adicional para preservar a reserva em todo o período", f"R$ {max(0.0, reserva - minimo):,.2f}")
+            st.caption(f"Média estimada: R$ {media:,.2f}/dia, usando 15 dias corridos. Histórico curto e possíveis falhas/parcialidade da API limitam a previsão de 90 dias. Estresse desloca as entradas; valores após o dia 90 ficam fora do período.")
+            linhas = pd.concat([df.assign(cenario=nome) for nome, df in cenarios.items()], ignore_index=True)
+            grafico = alt.Chart(linhas).mark_line().encode(
+                x=alt.X("data:T", title="Data"), y=alt.Y("saldo:Q", title="Saldo projetado (R$)"),
+                color=alt.Color("cenario:N", title="Cenário"),
+                tooltip=[alt.Tooltip("data:T", format="%d/%m/%Y"), "cenario:N", alt.Tooltip("saldo:Q", format=",.2f")])
+            limites = alt.Chart(pd.DataFrame({"valor": [0, reserva]})).mark_rule(color="#DC2626", strokeDash=[4, 4]).encode(y="valor:Q")
+            st.altair_chart((grafico + limites).properties(height=300), use_container_width=True)
+            with st.expander("Ver projeção diária e baixar"):
+                st.dataframe(proj, hide_index=True, use_container_width=True)
+                st.download_button("Baixar cenário (CSV)", proj.to_csv(index=False, sep=";", decimal=","),
+                                   file_name="caixa_90_dias.csv", mime="text/csv", key="cx_csv")
+
+        render_simulacao_caixa(agend_df)
+
+        # ── Upload OFX ──
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("**📂 Importar Extrato Inter (OFX)**")
+        st.caption("Importe o extrato do Banco Inter PJ em formato OFX. Lançamentos novos são adicionados automaticamente sem duplicar.")
+        ofx_file = st.file_uploader("Selecione o arquivo OFX", type=["ofx","qfx"], key="ofx_upload")
+        if ofx_file:
+            novos_df = parse_ofx(ofx_file.read())
+            ids_existentes = set(extrato_df["id"].astype(str)) if not extrato_df.empty else set()
+            novos = novos_df[~novos_df["id"].astype(str).isin(ids_existentes)]
+            if novos.empty:
+                st.info("Nenhum lançamento novo encontrado — extrato já importado.")
+            else:
+                st.success(f"{len(novos)} novos lançamentos encontrados.")
+                if st.button(f"✅ Importar {len(novos)} lançamentos", type="primary"):
+                    for _, row in novos.iterrows():
+                        save_lancamento(str(user_id), {
+                            "id":          str(row["id"]),
+                            "data":        row["data"].strftime("%Y-%m-%d") if pd.notna(row["data"]) else None,
+                            "valor":       float(row["valor"]),
+                            "memo":        str(row["memo"]),
+                            "categoria":   "",
+                            "conciliado":  False,
+                            "observacao":  "",
+                        })
+                    st.success("Extrato importado!")
+                    st.rerun(scope="fragment")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── Conciliação do Extrato ──
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        pendentes_count = len(extrato_df[~extrato_df["conciliado"]]) if not extrato_df.empty and "conciliado" in extrato_df.columns else 0
+        total_count = len(extrato_df) if not extrato_df.empty else 0
+        _status_label = f"· {pendentes_count} pendentes" if pendentes_count > 0 else "· tudo conciliado ✅"
+        with st.expander(f"📋 Conciliação do Extrato — {total_count} lançamentos {_status_label}", expanded=False):
+            st.caption("Categorize cada lançamento. Entradas em verde, saídas em vermelho. Marque como conciliado após identificar.")
+            if extrato_df.empty:
+                st.info("Nenhum lançamento importado ainda. Faça upload do OFX acima.")
+            else:
+                # Filtros
+                fc1, fc2 = st.columns(2)
+                with fc1:
+                    filtro_status = st.radio("Filtrar por:", ["Todos", "Pendentes", "Conciliados"],
+                                             horizontal=True, key="filtro_conciliacao")
+                with fc2:
+                    filtro_cat = st.selectbox("Categoria:", ["Todas"] + CATEGORIAS_INTER, key="filtro_cat")
+
+                df_show = extrato_df.copy()
+                if filtro_status == "Pendentes":
+                    df_show = df_show[~df_show["conciliado"]]
+                elif filtro_status == "Conciliados":
+                    df_show = df_show[df_show["conciliado"]]
+                if filtro_cat != "Todas":
+                    df_show = df_show[df_show["categoria"] == filtro_cat]
+
+                st.markdown(f"**{len(df_show)} lançamentos**")
+
+                # Tabela de conciliação
+                for idx, row in df_show.iterrows():
+                    cor_val = "#16A34A" if row["valor"] >= 0 else "#DC2626"
+                    sinal   = "+" if row["valor"] >= 0 else ""
+                    concil  = row["conciliado"]
+                    bg      = "#F0FDF4" if concil else "white"
+
+                    with st.container():
+                        c1, c2, c3, c4, c5 = st.columns([1.2, 1, 3, 2, 1.5])
+                        with c1:
+                            st.markdown(f"<div style='padding:8px 0;font-size:13px;color:#64748B;'>{pd.to_datetime(row['data']).strftime('%d/%m/%Y') if pd.notna(row['data']) else '–'}</div>", unsafe_allow_html=True)
+                        with c2:
+                            st.markdown(f"<div style='padding:8px 0;font-weight:800;color:{cor_val};'>{sinal}R$ {abs(row['valor']):,.2f}</div>", unsafe_allow_html=True)
+                        with c3:
+                            st.markdown(f"<div style='padding:8px 0;font-size:13px;color:#0F172A;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;'>{str(row['memo'])[:60]}</div>", unsafe_allow_html=True)
+                        with c4:
+                            cat_sel = st.selectbox("", [""] + CATEGORIAS_INTER,
+                                                   index=([""] + CATEGORIAS_INTER).index(row["categoria"]) if row["categoria"] in CATEGORIAS_INTER else 0,
+                                                   key=f"cat_{row['id']}", label_visibility="collapsed")
+                        with c5:
+                            concil_btn = st.checkbox("✅ Conciliado", value=bool(concil), key=f"conc_{row['id']}")
+
+                        obs_key = f"obs_{row['id']}"
+                        obs_val = st.text_input("", value=str(row["observacao"] or ""),
+                                                placeholder="Observação (opcional)",
+                                                key=obs_key, label_visibility="collapsed")
+
+                        if cat_sel != row["categoria"] or concil_btn != concil or obs_val != str(row["observacao"] or ""):
+                            update_lancamento(str(user_id), str(row["id"]), cat_sel, obs_val, concil_btn)
+                            st.rerun(scope="fragment")
+
+                        st.markdown("<hr style='margin:4px 0;border:none;border-top:1px solid #F1F5F9;'>", unsafe_allow_html=True)
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
+        # ── Agendamentos ──
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="small-title">Agendamentos</div>', unsafe_allow_html=True)
+
+        with st.expander("➕ Novo agendamento"):
+            with st.form("form_agend", clear_on_submit=True):
+                ag1, ag2, ag3 = st.columns(3)
+                with ag1:
+                    ag_data  = st.date_input("Data vencimento", value=date.today())
+                    ag_valor = st.number_input("Valor (R$)", step=0.01, format="%.2f")
+                with ag2:
+                    ag_desc  = st.text_input("Descrição")
+                    ag_cat   = st.selectbox("Categoria", CATEGORIAS_INTER)
+                with ag3:
+                    ag_rec   = st.checkbox("Recorrente (mensal)")
+                if st.form_submit_button("💾 Agendar", type="primary", use_container_width=True):
+                    if ag_valor == 0 or not ag_desc:
+                        st.error("Informe valor e descrição.")
+                    else:
+                        save_agendamento(str(user_id), {
+                            "data": ag_data.strftime("%Y-%m-%d"),
+                            "valor": ag_valor,
+                            "descricao": ag_desc,
+                            "categoria": ag_cat,
+                            "recorrente": ag_rec,
+                            "pago": False,
+                        })
+                        st.success("Agendamento salvo!")
+                        st.rerun(scope="fragment")
+
+        if not agend_df.empty:
+            for _, ag in agend_df[~agend_df["pago"]].iterrows():
+                venc = pd.to_datetime(ag["data"])
+                dias = (venc - pd.Timestamp.now()).days
+                cor  = "#EF4444" if dias < 0 else "#F59E0B" if dias <= 3 else "#64748B"
+                ac1, ac2, ac3, ac4 = st.columns([1.5, 3, 1.5, 1])
+                with ac1:
+                    st.markdown(f"<div style='color:{cor};font-weight:800;font-size:13px;padding:6px 0;'>{venc.strftime('%d/%m/%Y')}</div>", unsafe_allow_html=True)
+                with ac2:
+                    st.markdown(f"<div style='padding:6px 0;font-size:13px;'>{ag['descricao']} <span style='color:#94A3B8;'>{ag['categoria']}</span></div>", unsafe_allow_html=True)
+                with ac3:
+                    st.markdown(f"<div style='color:#EF4444;font-weight:800;padding:6px 0;'>R$ {abs(ag['valor']):,.2f}</div>", unsafe_allow_html=True)
+                with ac4:
+                    if st.button("✅ Pago", key=f"pago_{ag['id']}"):
+                        get_supabase().table("agendamentos_inter").update({"pago": True}).eq("user_id", str(user_id)).eq("id", str(ag["id"])).execute()
+                        st.rerun(scope="fragment")
+        else:
+            st.info("Nenhum agendamento pendente.")
+
+        # Agendamentos JÁ PAGOS — ficam ocultos da lista principal, mas podem ser
+        # excluídos aqui (ex.: lançamento duplicado marcado como pago por engano).
+        if not agend_df.empty and "pago" in agend_df.columns:
+            _pagos = agend_df[agend_df["pago"] == True]
+            if not _pagos.empty:
+                with st.expander(f"✅ Agendamentos pagos ({len(_pagos)}) — clique para ver ou excluir"):
+                    for _, ag in _pagos.iterrows():
+                        venc = pd.to_datetime(ag["data"])
+                        pc1, pc2, pc3, pc4 = st.columns([1.5, 3, 1.5, 1])
+                        with pc1:
+                            st.markdown(f"<div style='color:#64748B;font-size:13px;padding:6px 0;'>{venc.strftime('%d/%m/%Y')}</div>", unsafe_allow_html=True)
+                        with pc2:
+                            st.markdown(f"<div style='padding:6px 0;font-size:13px;'>{ag['descricao']} <span style='color:#94A3B8;'>{ag['categoria']}</span></div>", unsafe_allow_html=True)
+                        with pc3:
+                            st.markdown(f"<div style='color:#16A34A;font-weight:800;padding:6px 0;'>R$ {abs(ag['valor']):,.2f} ✓</div>", unsafe_allow_html=True)
+                        with pc4:
+                            if st.button("🗑️ Excluir", key=f"del_{ag['id']}"):
+                                excluir_agendamento(str(user_id), ag["id"])
+                                st.rerun(scope="fragment")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── Capital Investido ──
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="small-title">Capital Investido & ROI</div>', unsafe_allow_html=True)
+
+        with st.expander("➕ Registrar aporte / retirada"):
+            with st.form("form_capital", clear_on_submit=True):
+                cap1, cap2 = st.columns(2)
+                with cap1:
+                    cap_data  = st.date_input("Data", value=date.today())
+                    cap_valor = st.number_input("Valor (R$) — negativo para retirada", step=0.01, format="%.2f")
+                with cap2:
+                    cap_desc = st.text_input("Descrição", placeholder="ex: Compra lote S_001")
+                    cap_cat  = st.selectbox("Categoria", ["Compra de estoque","Taxa/Tarifa","Retirada","Aporte","Outro"])
+                if st.form_submit_button("💾 Registrar", type="primary", use_container_width=True):
+                    if cap_valor == 0:
+                        st.error("Valor não pode ser zero.")
+                    else:
+                        save_capital(str(user_id), {
+                            "data": cap_data.strftime("%Y-%m-%d"),
+                            "valor": cap_valor,
+                            "descricao": cap_desc,
+                            "categoria": cap_cat,
+                        })
+                        st.success(f"R$ {cap_valor:.2f} registrado.")
+                        st.rerun(scope="fragment")
+
+        if not capital_df.empty:
+            total_inv   = capital_df[capital_df["valor"] > 0]["valor"].sum()
+            total_ret   = capital_df[capital_df["valor"] < 0]["valor"].abs().sum()
+            saldo_cap   = capital_df["valor"].sum()
+            # Lucro acumulado — usa session_state se disponível (calculado na aba financeiro)
+            lucro_acum  = st.session_state.get("lucro_acumulado", 0.0)
+            roi         = (lucro_acum / total_inv * 100) if total_inv > 0 else 0.0
+            cor_roi     = "#16A34A" if roi >= 0 else "#DC2626"
+
+            # Calcula estoque em caixa
+            sb = get_supabase()
+            estoq_resp = sb.table("custos_sku").select("sku,custo_produto,qtd_disponivel").eq("user_id", str(user_id)).gt("qtd_disponivel", 0).execute()
+            estoque_caixa = sum(float(r["qtd_disponivel"]) * float(r["custo_produto"]) for r in (estoq_resp.data or []))
+            qtd_estoque   = sum(float(r["qtd_disponivel"]) for r in (estoq_resp.data or []))
+
+            # Média de vendas 15 dias — só conta qtd, NÃO processa FIFO
+            import zoneinfo as _tz
+            _agora = datetime.now(_tz.ZoneInfo("America/Sao_Paulo"))
+            _d15   = _agora - timedelta(days=15)
+            _from  = _d15.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+            _to    = _agora.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+            with st.spinner("Calculando média de vendas (15 dias)..."):
+                _orders15 = get_orders(str(user_id), token, _from, _to)
+            qtd_15d = sum(
+                int(item.get("quantity", 1) or 1)
+                for o in _orders15 if o.get("status") != "cancelled"
+                for item in o.get("order_items", [])
+            )
+            media_diaria = qtd_15d / 15
+            dias_estoque = int(qtd_estoque / media_diaria) if media_diaria > 0 else 0
+            cor_dias = "#16A34A" if dias_estoque >= 20 else "#F59E0B" if dias_estoque >= 10 else "#DC2626"
+
+            ci1, ci2, ci3 = st.columns(3)
+            ci1.markdown(f"""<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px;text-align:center;">
+                <div style="font-size:11px;font-weight:800;color:#64748B;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Total Investido</div>
+                <div style="font-size:32px;font-weight:900;color:#0F172A;letter-spacing:-1px;">R$ {total_inv:,.2f}</div>
+            </div>""", unsafe_allow_html=True)
+            ci2.markdown(f"""<div style="background:#FFF7ED;border:1px solid #FED7AA;border-radius:16px;padding:24px;text-align:center;">
+                <div style="font-size:11px;font-weight:800;color:#C2410C;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Estoque em Caixa</div>
+                <div style="font-size:32px;font-weight:900;color:#0F172A;letter-spacing:-1px;">R$ {estoque_caixa:,.2f}</div>
+                <div style="font-size:12px;color:#92400E;margin-top:4px;font-weight:600;">{int(qtd_estoque)} unidades disponíveis</div>
+            </div>""", unsafe_allow_html=True)
+            ci3.markdown(f"""<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px;text-align:center;">
+                <div style="font-size:11px;font-weight:800;color:#64748B;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Dias de Estoque</div>
+                <div style="font-size:40px;font-weight:900;color:{cor_dias};letter-spacing:-1px;">{dias_estoque}</div>
+                <div style="font-size:12px;color:#64748B;margin-top:4px;font-weight:600;">média {media_diaria:.1f} un/dia (15d)</div>
+            </div>""", unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # Tabela de lançamentos estilizada
+            linhas_cap = ""
+            for _, row in capital_df.sort_values("data", ascending=False).iterrows():
+                val  = float(row["valor"])
+                cor  = "#16A34A" if val >= 0 else "#DC2626"
+                sinal = "+" if val >= 0 else ""
+                data_fmt = pd.to_datetime(row["data"]).strftime("%d/%m/%Y") if pd.notna(row["data"]) else "–"
+                linhas_cap += f"""
+                <tr style="border-bottom:1px solid #F1F5F9;">
+                    <td style="padding:14px 12px;color:#64748B;font-size:13px;">{data_fmt}</td>
+                    <td style="padding:14px 12px;font-weight:600;color:#0F172A;">{row.get('descricao','')}</td>
+                    <td style="padding:14px 12px;">
+                        <span style="background:#EDE9FE;color:#6D28D9;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:700;">
+                            {row.get('categoria','')}
+                        </span>
+                    </td>
+                    <td style="padding:14px 12px;text-align:right;font-weight:800;color:{cor};">{sinal}R$ {abs(val):,.2f}</td>
+                </tr>"""
+
+            st.markdown(f"""
+            <div style="border-radius:16px;border:1px solid #E7ECF5;overflow:hidden;">
+                <table style="width:100%;border-collapse:collapse;font-family:'Inter',sans-serif;font-size:14px;">
+                    <thead>
+                        <tr style="background:#F8FAFC;border-bottom:2px solid #E2E8F0;">
+                            <th style="padding:12px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Data</th>
+                            <th style="padding:12px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Descrição</th>
+                            <th style="padding:12px;text-align:left;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Categoria</th>
+                            <th style="padding:12px;text-align:right;color:#64748B;font-size:11px;font-weight:800;text-transform:uppercase;">Valor</th>
+                        </tr>
+                    </thead>
+                    <tbody>{linhas_cap}</tbody>
+                </table>
+            </div>
+            """, unsafe_allow_html=True)
+
+        else:
+            st.info("Nenhum lançamento registrado ainda. Use o formulário acima para começar.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
+    render_caixa()
 
 # ══════════════════════════════════════════
 # ABA: FECHAMENTO MENSAL
