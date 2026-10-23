@@ -8,6 +8,8 @@ from supabase import create_client, Client
 from st_click_detector import click_detector
 import hashlib
 import hmac
+import re
+from html import unescape
 import time
 from typing import Any, Callable, Iterable
 
@@ -4132,6 +4134,7 @@ if st.session_state["aba_ativa"] == "financeiro":
 
     corr_map = {r: v for r, v in load_correcoes(str(user_id)).items()}
 
+    linhas_detalhadas = []
     linhas = ""
     for _, row in df.iterrows():
         cancelada = row["Cancelada"]
@@ -4159,7 +4162,7 @@ if st.session_state["aba_ativa"] == "financeiro":
         elif fifo_flag:
             tag_custo = '<span style="background:#EDE9FE;color:#5B21B6;border-radius:4px;padding:1px 5px;font-size:10px;font-weight:700;">FIFO</span> '
 
-        linhas += f"""<tr style="background:{bg_row};border-bottom:1px solid #F1F5F9;">
+        linha_html = f"""<tr style="background:{bg_row};border-bottom:1px solid #F1F5F9;">
             <td style="padding:10px 8px;font-weight:800;color:#7C3AED;white-space:nowrap;">{row['SKU']}</td>
             <td style="padding:10px 8px;color:#64748B;font-size:13px;white-space:nowrap;">{pd.to_datetime(row['Data']).strftime('%d/%m/%Y %H:%M')}</td>
             <td style="padding:10px 8px;font-size:18px;text-align:center;">{status_icon(row['Status'])}</td>
@@ -4172,6 +4175,8 @@ if st.session_state["aba_ativa"] == "financeiro":
             <td style="padding:10px 8px;text-align:center;">{('<span style="color:#B45309;font-weight:700;">Devolvida</span>' if devolvida else '<span style="color:#DC2626;font-weight:700;">Cancelada</span>') if cancelada else margem_badge(row.get('Margem %',0), row.get('Lucro',0))}</td>
             <td style="padding:10px 8px;color:#94A3B8;font-size:12px;white-space:nowrap;">{row['Venda']}</td>
         </tr>"""
+
+        linhas_detalhadas.append(linha_html)
 
     tabela_html = f"""<div style="overflow-x:auto;">
     <table style="width:100%;border-collapse:collapse;font-family:'Inter',sans-serif;font-size:13px;">
@@ -4192,7 +4197,47 @@ if st.session_state["aba_ativa"] == "financeiro":
     </table></div>"""
 
     with st.expander(f"🧾 Ver vendas detalhadas ({len(df)} pedidos)", expanded=False):
-        st.markdown(tabela_html, unsafe_allow_html=True)
+        st.caption("Filtre por SKU ou pelas demais colunas. Os filtros são combinados e aceitam parte do texto, sem diferenciar maiúsculas de minúsculas.")
+        nomes_filtros = ["SKU", "Data", "Transp.", "Qnt.", "Receita (=)",
+                         "Frete (-)", "Tarifa (-)", "Custo (-)", "Imposto (-)",
+                         "M. de Contrib. (=)", "N.º Venda"]
+        def limpar_filtros_vendas():
+            for indice in range(len(nomes_filtros)):
+                st.session_state[f"vendas_detalhadas_filtro_{indice}"] = ""
+
+        st.button("Limpar filtros", key="limpar_filtros_vendas",
+                  on_click=limpar_filtros_vendas)
+        filtros_detalhados = []
+        for inicio in range(0, len(nomes_filtros), 4):
+            campos = st.columns(4)
+            for deslocamento, nome in enumerate(nomes_filtros[inicio:inicio + 4]):
+                indice = inicio + deslocamento
+                with campos[deslocamento]:
+                    filtros_detalhados.append(st.text_input(
+                        nome, key=f"vendas_detalhadas_filtro_{indice}",
+                        placeholder="Digite para filtrar"))
+
+        linhas_filtradas = []
+        for linha_detalhada in linhas_detalhadas:
+            celulas = re.findall(r"<td\b[^>]*>(.*?)</td>", linha_detalhada, flags=re.S)
+            textos = [unescape(re.sub(r"<[^>]+>", " ", celula)) for celula in celulas]
+            # Permite buscar o transporte também por palavras, além dos ícones.
+            if len(textos) > 2:
+                textos[2] += {"🚚": " pago paid transporte envio",
+                               "❌": " cancelado cancelled",
+                               "⏳": " pendente aguardando"}.get(textos[2].strip(), "")
+            if len(textos) == len(filtros_detalhados) and all(
+                " ".join(filtro.split()).casefold() in " ".join(texto.split()).casefold()
+                for filtro, texto in zip(filtros_detalhados, textos)
+            ):
+                linhas_filtradas.append(linha_detalhada)
+        st.caption(f"Exibindo {len(linhas_filtradas)} de {len(df)} pedidos")
+        if linhas_filtradas:
+            tabela_filtrada = tabela_html.replace(
+                "<tbody></tbody>", "<tbody>" + "".join(linhas_filtradas) + "</tbody>")
+            st.markdown(tabela_filtrada, unsafe_allow_html=True)
+        else:
+            st.info("Nenhuma venda encontrada com os filtros informados.")
         # CORREÇÕES MANUAIS dentro do mesmo expander
         st.markdown("<br>", unsafe_allow_html=True)
         with st.expander("✏️ Corrigir custo de vendas manualmente"):
