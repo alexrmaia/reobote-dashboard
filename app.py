@@ -4732,6 +4732,59 @@ elif st.session_state["aba_ativa"] == "caixa":
             sb = get_supabase()
             sb.table("agendamentos_inter").insert({"user_id": uid, **row}).execute()
 
+        def editar_agendamento(uid, ag):
+            """Abre o formulário da linha selecionada e atualiza o mesmo registro."""
+            estado = f"editar_agendamento_{uid}"
+            if str(st.session_state.get(estado, "")) != str(ag["id"]):
+                return
+            chave = f"agendamento_{uid}_{ag['id']}"
+            categorias = list(CATEGORIAS_INTER)
+            categoria_atual = str(ag.get("categoria") or "")
+            if categoria_atual not in categorias:
+                categorias.append(categoria_atual)
+            with st.form(f"form_editar_{chave}"):
+                st.markdown("**Editar agendamento**")
+                e1, e2 = st.columns(2)
+                with e1:
+                    nova_data = st.date_input("Data vencimento", value=pd.to_datetime(ag["data"]).date(), key=f"data_{chave}")
+                    novo_valor = st.number_input("Valor (R$)", value=float(ag["valor"]), step=0.01, format="%.2f", key=f"valor_{chave}")
+                    nova_recorrencia = st.checkbox("Recorrente (mensal)", value=bool(ag["recorrente"]), key=f"rec_{chave}")
+                with e2:
+                    nova_descricao = st.text_input("Descrição", value=str(ag.get("descricao") or ""), key=f"desc_{chave}")
+                    nova_categoria = st.selectbox("Categoria", categorias, index=categorias.index(categoria_atual), key=f"cat_{chave}")
+                    novo_pago = st.checkbox("Pago", value=bool(ag["pago"]), key=f"pago_{chave}")
+                b1, b2 = st.columns(2)
+                salvar = b1.form_submit_button("💾 Salvar alterações", type="primary", use_container_width=True)
+                cancelar = b2.form_submit_button("Cancelar", use_container_width=True)
+            if cancelar:
+                st.session_state.pop(estado, None)
+                st.rerun(scope="fragment")
+            if salvar:
+                if novo_valor == 0 or not nova_descricao.strip():
+                    st.error("Informe um valor diferente de zero e uma descrição.")
+                else:
+                    try:
+                        get_supabase().table("agendamentos_inter").update({
+                            "data": nova_data.strftime("%Y-%m-%d"),
+                            "valor": novo_valor,
+                            "descricao": nova_descricao.strip(),
+                            "categoria": nova_categoria,
+                            "recorrente": nova_recorrencia,
+                            "pago": novo_pago,
+                        }).eq("user_id", uid).eq("id", str(ag["id"])).execute()
+                    except Exception:
+                        st.error("Não foi possível salvar. Suas alterações continuam no formulário; tente novamente.")
+                    else:
+                        st.session_state.pop(estado, None)
+                        st.rerun(scope="fragment")
+
+        def abrir_edicao_agendamento(uid, ag_id):
+            # Limpa os campos da edição anterior para carregar os dados atuais.
+            prefixo = f"agendamento_{uid}_{ag_id}"
+            for campo in ("data", "valor", "rec", "desc", "cat", "pago"):
+                st.session_state.pop(f"{campo}_{prefixo}", None)
+            st.session_state[f"editar_agendamento_{uid}"] = str(ag_id)
+
         def excluir_agendamento(uid, ag_id):
             sb = get_supabase()
             sb.table("agendamentos_inter").delete().eq("user_id", uid).eq("id", str(ag_id)).execute()
@@ -5093,7 +5146,7 @@ elif st.session_state["aba_ativa"] == "caixa":
                 venc = pd.to_datetime(ag["data"])
                 dias = (venc - pd.Timestamp.now()).days
                 cor  = "#EF4444" if dias < 0 else "#F59E0B" if dias <= 3 else "#64748B"
-                ac1, ac2, ac3, ac4 = st.columns([1.5, 3, 1.5, 1])
+                ac1, ac2, ac3, ac4, ac5 = st.columns([1.5, 3, 1.5, 1, 0.5])
                 with ac1:
                     st.markdown(f"<div style='color:{cor};font-weight:800;font-size:13px;padding:6px 0;'>{venc.strftime('%d/%m/%Y')}</div>", unsafe_allow_html=True)
                 with ac2:
@@ -5104,6 +5157,10 @@ elif st.session_state["aba_ativa"] == "caixa":
                     if st.button("✅ Pago", key=f"pago_{ag['id']}"):
                         get_supabase().table("agendamentos_inter").update({"pago": True}).eq("user_id", str(user_id)).eq("id", str(ag["id"])).execute()
                         st.rerun(scope="fragment")
+                with ac5:
+                    st.button("✏️", key=f"editar_pendente_{ag['id']}", help="Editar agendamento",
+                              on_click=abrir_edicao_agendamento, args=(str(user_id), ag["id"]))
+                editar_agendamento(str(user_id), ag)
         else:
             st.info("Nenhum agendamento pendente.")
 
@@ -5112,10 +5169,10 @@ elif st.session_state["aba_ativa"] == "caixa":
         if not agend_df.empty and "pago" in agend_df.columns:
             _pagos = agend_df[agend_df["pago"] == True]
             if not _pagos.empty:
-                with st.expander(f"✅ Agendamentos pagos ({len(_pagos)}) — clique para ver ou excluir"):
+                with st.expander(f"✅ Agendamentos pagos ({len(_pagos)}) — clique para ver, editar ou excluir"):
                     for _, ag in _pagos.iterrows():
                         venc = pd.to_datetime(ag["data"])
-                        pc1, pc2, pc3, pc4 = st.columns([1.5, 3, 1.5, 1])
+                        pc1, pc2, pc3, pc4, pc5 = st.columns([1.5, 3, 1.5, 1, 0.5])
                         with pc1:
                             st.markdown(f"<div style='color:#64748B;font-size:13px;padding:6px 0;'>{venc.strftime('%d/%m/%Y')}</div>", unsafe_allow_html=True)
                         with pc2:
@@ -5126,6 +5183,10 @@ elif st.session_state["aba_ativa"] == "caixa":
                             if st.button("🗑️ Excluir", key=f"del_{ag['id']}"):
                                 excluir_agendamento(str(user_id), ag["id"])
                                 st.rerun(scope="fragment")
+                        with pc5:
+                            st.button("✏️", key=f"editar_pago_{ag['id']}", help="Editar agendamento",
+                                      on_click=abrir_edicao_agendamento, args=(str(user_id), ag["id"]))
+                        editar_agendamento(str(user_id), ag)
         st.markdown('</div>', unsafe_allow_html=True)
 
         # ── Capital Investido ──
