@@ -5323,22 +5323,31 @@ elif st.session_state["aba_ativa"] == "fechamento":
             return []
 
     def save_fechamento(uid, dados):
-        sb = get_supabase()
-        payload = {"user_id": uid, **dados}
+        # Uma linha por usuário/mês; nunca apagar um fechamento após erro de gravação.
         try:
-            r = sb.table("fechamentos_mensais").upsert(payload).execute()
+            get_supabase().table("fechamentos_mensais").upsert(
+                {"user_id": uid, **st.session_state.get(f"financeiro_reaberto_{dados['ano_mes']}", {}), **dados}, on_conflict="user_id,ano_mes"
+            ).execute()
             st.session_state["fech_erro"] = None
             return True
-        except Exception as e1:
-            try:
-                sb.table("fechamentos_mensais")\
-                    .delete().eq("user_id", uid).eq("ano_mes", dados["ano_mes"]).execute()
-                sb.table("fechamentos_mensais").insert(payload).execute()
-                st.session_state["fech_erro"] = None
-                return True
-            except Exception as e2:
-                st.session_state["fech_erro"] = str(e2)
-                return False
+        except Exception as exc:
+            st.session_state["fech_erro"] = str(exc)
+            return False
+
+    CATEGORIAS_OPERACIONAIS = (
+        "Contabilidade", "Sistemas/assinaturas", "Armazenagem/depósito", "Outras despesas"
+    )
+
+    def despesas_total(registro):
+        return sum(float(v or 0) for v in (registro.get("despesas_operacionais") or {}).values())
+
+    def resultado_operacional(registro):
+        # Preserva o resultado original, inclusive a conciliação de fretes reversos.
+        return float(registro.get("lucro_liquido") or 0) - despesas_total(registro)
+
+    def margem_operacional(registro):
+        receita = float(registro.get("faturamento_bruto") or 0) - float(registro.get("devolucoes") or 0)
+        return resultado_operacional(registro) / receita * 100 if receita > 0 else 0.0
 
     fechamentos = get_fechamentos(str(user_id))
     fechamentos_map = {f["ano_mes"]: f for f in fechamentos}
@@ -5413,7 +5422,9 @@ elif st.session_state["aba_ativa"] == "fechamento":
             )
             if diferenca_frete >= -0.01:
                 frete_reverso = max(diferenca_frete, 0.0)
-        margem      = float(d.get("margem", 0))
+        total_operacionais = despesas_total(d)
+        lucro = resultado_operacional(d)
+        margem = margem_operacional(d)
         pedidos     = int(d.get("pedidos", 0))
         canceladas_n = int(d.get("canceladas", 0))
         devolvidas_n = int(d.get("devolvidas", 0))
@@ -5460,7 +5471,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
             <div style='height:3px;background:#FCA5A5;border-radius:99px;margin-top:10px;'></div>
           </div>
           <div style='padding:16px 14px;background:#F0FDF4;'>
-            <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Lucro líquido</div>
+            <div style='font-size:10px;color:#64748B;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px;'>Resultado operacional</div>
             <div style='font-size:20px;font-weight:800;color:#16A34A;'>R$ {lucro:,.0f}</div>
             <div style='font-size:11px;color:#16A34A;font-weight:700;margin-top:2px;'>margem {margem:.1f}%</div>
             <div style='height:3px;background:#16A34A;border-radius:99px;margin-top:10px;'></div>
@@ -5480,7 +5491,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
             (m3, "ADS (Product Ads)",   f"R$ {ads_cost:,.0f}",   f"{_ads_pct:.1f}% do faturamento"),
             (m4, "Frete reverso no fechamento", f"R$ {frete_reverso:,.2f}" if frete_reverso is not None else "Não registrado",
                                       "diferença inferida; confira os pedidos" if frete_reverso is not None else "total por pedido não foi salvo"),
-            (m5, "Margem líquida",      f"{margem:.1f}%",        f"lucro R$ {lucro:,.0f}"),
+            (m5, "Margem operacional",      f"{margem:.1f}%",        f"lucro R$ {lucro:,.0f}"),
         ]:
             col.markdown(f"""
             <div style='background:#F8FAFC;border-radius:12px;padding:14px 16px;'>
@@ -5546,19 +5557,25 @@ elif st.session_state["aba_ativa"] == "fechamento":
                 ("  ADS (Product Ads)", f"− R$ {ads_cost:,.2f}",     True),
                 ("  Custo produto",   f"− R$ {custos:,.2f}",         True),
                 ("  Impostos (4%)",   f"− R$ {impostos:,.2f}",       True),
-                ("Lucro líquido",     f"R$ {lucro:,.2f}",            False),
+                ("Resultado operacional",     f"R$ {lucro:,.2f}",            False),
             ]
             for label, valor, negativo in linhas_dre:
-                peso = "font-weight:800;" if "líquido" in label or "bruta" in label else ""
+                if label == "Resultado operacional":
+                    with st.expander(f"Despesas operacionais · − R$ {total_operacionais:,.2f}"):
+                        for categoria, valor_despesa in (d.get("despesas_operacionais") or {}).items():
+                            st.text(f"{categoria}: R$ {float(valor_despesa or 0):,.2f}")
+                        if not total_operacionais:
+                            st.caption("Nenhuma despesa registrada. Edite os valores abaixo.")
+                peso = "font-weight:800;" if "líquida" in label or "bruta" in label or "Resultado" in label else ""
                 if negativo == "info":
                     cor = "color:#94A3B8;font-style:italic;"
                 elif negativo:
                     cor = "color:#DC2626;"
-                elif "Lucro" in label:
+                elif "Resultado" in label:
                     cor = "color:#16A34A;"
                 else:
                     cor = ""
-                borda = "border-top:2px solid #E2E8F0;margin-top:4px;padding-top:8px;" if "líquido" in label or "Lucro" in label else ""
+                borda = "border-top:2px solid #E2E8F0;margin-top:4px;padding-top:8px;" if "líquida" in label or "Resultado" in label else ""
                 st.markdown(f"""
                 <div style='display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #F1F5F9;font-size:13px;{borda}'>
                   <span style='color:#64748B;{peso}'>{label}</span>
@@ -5589,15 +5606,15 @@ elif st.session_state["aba_ativa"] == "fechamento":
                     ano_h, mes_h = int(fm[:4]), int(fm[5:7])
                     nome_h = ["","Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"][mes_h]
                     fat_h  = float(f.get("faturamento_bruto", 0))
-                    luc_h  = float(f.get("lucro_liquido", 0))
-                    mar_h  = float(f.get("margem", 0))
+                    luc_h  = resultado_operacional(f)
+                    mar_h  = margem_operacional(f)
                     pct    = int(fat_h / max_fat * 100) if max_fat > 0 else 0
                     atual  = fm == ano_mes
                     # Mês anterior (lista vem ordenada do mais recente pro mais antigo)
                     prev = fechamentos[i+1] if i+1 < len(fechamentos) else None
                     fat_prev = float(prev.get("faturamento_bruto", 0)) if prev else None
-                    luc_prev = float(prev.get("lucro_liquido", 0))    if prev else None
-                    mar_prev = float(prev.get("margem", 0))           if prev else None
+                    luc_prev = resultado_operacional(prev)    if prev else None
+                    mar_prev = margem_operacional(prev)           if prev else None
                     d_fat = _delta_html(fat_h, fat_prev)
                     d_luc = _delta_html(luc_h, luc_prev)
                     d_mar = _delta_html(mar_h, mar_prev)
@@ -5622,7 +5639,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
                     "ano_mes":  f["ano_mes"],
                     "label":    f"{_meses_pt[int(f['ano_mes'][5:7])]}/{f['ano_mes'][2:4]}",
                     "Faturamento": float(f.get("faturamento_bruto", 0)),
-                    "Lucro":       float(f.get("lucro_liquido", 0)),
+                    "Resultado operacional":       resultado_operacional(f),
                 } for f in fechamentos])
                 _df_hist = _df_hist.sort_values("ano_mes")
 
@@ -5635,8 +5652,8 @@ elif st.session_state["aba_ativa"] == "fechamento":
                     tooltip=[alt.Tooltip("label:N", title="Mês"), alt.Tooltip("Faturamento:Q", format=",.2f")]
                 )
                 _l_luc = _base.mark_line(color="#16A34A", strokeWidth=2.5, point=alt.OverlayMarkDef(filled=True, size=60, color="#16A34A")).encode(
-                    y=alt.Y("Lucro:Q", title="Lucro (R$)", axis=alt.Axis(titleColor="#16A34A", labelColor="#16A34A", format=",.0f")),
-                    tooltip=[alt.Tooltip("label:N", title="Mês"), alt.Tooltip("Lucro:Q", format=",.2f")]
+                    y=alt.Y("Resultado operacional:Q", title="Resultado operacional (R$)", axis=alt.Axis(titleColor="#16A34A", labelColor="#16A34A", format=",.0f")),
+                    tooltip=[alt.Tooltip("label:N", title="Mês"), alt.Tooltip("Resultado operacional:Q", format=",.2f")]
                 )
                 _chart = alt.layer(_l_fat, _l_luc).resolve_scale(y="independent").properties(height=220)
                 st.altair_chart(_chart, use_container_width=True)
@@ -5644,9 +5661,46 @@ elif st.session_state["aba_ativa"] == "fechamento":
                 st.info("Nenhum mês fechado ainda.")
             st.markdown('</div>', unsafe_allow_html=True)
 
+        st.markdown(f"**💰 Posição financeira · {calendar.monthrange(ano, mes)[1]:02d}/{mes:02d}/{ano}**")
+        mes_anterior = (_date(ano, mes, 1) - timedelta(days=1)).strftime("%Y-%m")
+        anterior = fechamentos_map.get(mes_anterior, {})
+        for col, label, campo in zip(st.columns(3), ("Caixa", "Estoque a custo", "Dívidas"),
+                                    ("caixa_saldo", "estoque_valor", "dividas_saldo")):
+            saldo, saldo_anterior = d.get(campo), anterior.get(campo)
+            delta = (f"R$ {float(saldo) - float(saldo_anterior):+,.2f} vs. mês anterior"
+                     if saldo is not None and saldo_anterior is not None else None)
+            col.metric(label, f"R$ {float(saldo):,.2f}" if saldo is not None else "Não informado",
+                       delta=delta, delta_color="inverse" if campo == "dividas_saldo" else "off")
+        st.caption("Estoque: retrato a custo salvo no fechamento; não é o saldo atual. "
+                   "Caixa e dívidas são saldos informados para o último dia do mês.")
+        with st.expander("Editar despesas operacionais e posição financeira"):
+            with st.form(f"financeiro_{ano_mes}"):
+                categorias = dict.fromkeys(CATEGORIAS_OPERACIONAIS, 0.0)
+                categorias.update(d.get("despesas_operacionais") or {})
+                despesas_editadas = {cat: st.number_input(cat + " (R$)", min_value=0.0,
+                    value=float(valor or 0), step=0.01, format="%.2f") for cat, valor in categorias.items()}
+                caixa_informado = st.checkbox("Registrar saldo de caixa", value=d.get("caixa_saldo") is not None)
+                caixa_editado = st.number_input("Caixa disponível no fechamento (R$)", min_value=0.0,
+                    value=float(d.get("caixa_saldo") or 0), step=0.01, format="%.2f")
+                dividas_informadas = st.checkbox("Registrar saldo de dívidas", value=d.get("dividas_saldo") is not None)
+                dividas_editadas = st.number_input("Saldo devedor no fechamento (R$)", min_value=0.0,
+                    value=float(d.get("dividas_saldo") or 0), step=0.01, format="%.2f")
+                if st.form_submit_button("Salvar despesas e saldos", type="primary"):
+                    try:
+                        get_supabase().table("fechamentos_mensais").update({
+                            "despesas_operacionais": despesas_editadas,
+                            "caixa_saldo": caixa_editado if caixa_informado else None,
+                            "dividas_saldo": dividas_editadas if dividas_informadas else None,
+                        }).eq("user_id", str(user_id)).eq("ano_mes", ano_mes).execute()
+                    except Exception as exc:
+                        st.error(f"Não foi possível salvar. Execute a migração SQL e tente novamente: {exc}")
+                    else:
+                        st.rerun()
+
         # Botão reabrir
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🔓 Reabrir e editar este fechamento", key="reabrir_fech"):
+            st.session_state[f"financeiro_reaberto_{ano_mes}"] = {k: d.get(k) for k in ("despesas_operacionais", "caixa_saldo", "dividas_saldo")}
             del fechamentos_map[ano_mes]
             fechados_novos = [f for f in fechamentos if f["ano_mes"] != ano_mes]
             get_supabase().table("fechamentos_mensais")\
@@ -5660,6 +5714,9 @@ elif st.session_state["aba_ativa"] == "fechamento":
             st.info("💡 Verifique se a tabela 'fechamentos_mensais' foi criada no Supabase.")
 
         st.info(f"ℹ️ {nome_mes} {ano} ainda não foi fechado. Preencha os dados abaixo ou clique em **Fechar automaticamente** para importar do dashboard.")
+        st.caption("Após fechar, use o painel abaixo do DRE para registrar despesas, caixa e dívidas. "
+                   "No fechamento automático, o estoque usa as quantidades disponíveis atuais: "
+                   "para meses antigos, confira o saldo e utilize o fechamento manual se necessário.")
         # Botão fechar automático
         if st.button("⚡ Fechar automaticamente (importar do dashboard)", type="primary", key="auto_fech"):
             # Buscar dados do período
@@ -5808,7 +5865,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
             with c3:
                 f_cst   = st.number_input("Custo produto (R$)",       min_value=0.0, step=0.01, format="%.2f")
                 f_imp   = st.number_input("Impostos (R$)",            min_value=0.0, step=0.01, format="%.2f")
-                f_est   = st.number_input("Estoque em caixa (R$)",    min_value=0.0, step=0.01, format="%.2f")
+                f_est   = st.number_input("Estoque a custo no fechamento (R$)",    min_value=0.0, step=0.01, format="%.2f")
 
             if st.form_submit_button("💾 Salvar fechamento", type="primary", use_container_width=True):
                 from datetime import datetime as _dtt2
@@ -5816,7 +5873,7 @@ elif st.session_state["aba_ativa"] == "fechamento":
                 _tz2 = _zi2.ZoneInfo("America/Sao_Paulo")
                 _luc_m  = f_fat - f_devol - f_tar - f_frt - f_cst - f_imp
                 _mar_m  = (_luc_m / f_fat * 100) if f_fat > 0 else 0
-                save_fechamento(str(user_id), {
+                _salvo_manual = save_fechamento(str(user_id), {
                     "ano_mes": ano_mes,
                     "faturamento_bruto": round(f_fat, 2),
                     "devolucoes": round(f_devol, 2),
@@ -5832,8 +5889,11 @@ elif st.session_state["aba_ativa"] == "fechamento":
                     "estoque_valor": round(f_est, 2),
                     "fechado_em": _dtt2.now(_tz2).strftime("%Y-%m-%d %H:%M:%S"),
                 })
-                st.success(f"✅ {nome_mes} {ano} fechado!")
-                st.rerun()
+                if _salvo_manual:
+                    st.success(f"✅ {nome_mes} {ano} fechado!")
+                    st.rerun()
+                else:
+                    st.error("Não foi possível salvar o fechamento. Confira o banco e tente novamente.")
 
 # ══════════════════════════════════════════
 # ABA: SHOPEE
