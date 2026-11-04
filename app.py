@@ -5909,49 +5909,187 @@ elif st.session_state["aba_ativa"] == "promocoes":
 
 
 
-import json
+# ==========================================
+# SIMULADOR DE FRETE MERCADO LIVRE
+# ==========================================
 
-st.subheader("Teste API - Simulação de Frete")
+import requests
+import streamlit as st
 
-if st.button("Consultar frete de R$ 255"):
-    token = get_token()
-    user_id = st.session_state.get("user_id")
+st.divider()
+st.header("📦 Simulador de Frete Mercado Livre")
+
+st.caption(
+    "Consulta o custo estimado de envio usando "
+    "a autenticação existente do dashboard."
+)
+
+# Dados do produto
+col1, col2 = st.columns(2)
+
+with col1:
+    preco = st.number_input(
+        "Preço de venda (R$)",
+        min_value=0.01,
+        value=255.00,
+        step=1.00,
+        key="frete_preco"
+    )
+
+    peso = st.number_input(
+        "Peso embalado (gramas)",
+        min_value=1,
+        value=340,
+        key="frete_peso"
+    )
+
+    altura = st.number_input(
+        "Altura (cm)",
+        min_value=1,
+        value=9,
+        key="frete_altura"
+    )
+
+with col2:
+    largura = st.number_input(
+        "Largura (cm)",
+        min_value=1,
+        value=7,
+        key="frete_largura"
+    )
+
+    comprimento = st.number_input(
+        "Comprimento (cm)",
+        min_value=1,
+        value=13,
+        key="frete_comprimento"
+    )
+
+    modalidade = st.selectbox(
+        "Modalidade logística",
+        ["drop_off", "cross_docking", "fulfillment"],
+        key="frete_modalidade"
+    )
+
+tipo_anuncio = st.selectbox(
+    "Tipo de anúncio",
+    ["gold_special", "gold_pro"],
+    key="frete_tipo_anuncio"
+)
+
+# Autenticação
+token = get_token()
+user_id = st.session_state.get("user_id")
+
+if token and user_id:
+    st.success(f"Conta autenticada: {user_id}")
+else:
+    st.error("Conta não autenticada no Mercado Livre.")
+
+# Botão de consulta
+if st.button(
+    "🔎 Consultar frete na API",
+    type="primary",
+    key="frete_consultar"
+):
 
     if not token or not user_id:
-        st.error("Conta Mercado Livre não autenticada.")
+        st.error("Faça login no Mercado Livre primeiro.")
+
     else:
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json"
+        }
+
+        # TESTE 1: Autenticação
+        st.subheader("1. Teste de autenticação")
+
+        try:
+            auth_resp = requests.get(
+                "https://api.mercadolibre.com/users/me",
+                headers=headers,
+                timeout=20
+            )
+
+            st.write("HTTP:", auth_resp.status_code)
+
+            if auth_resp.status_code == 200:
+                auth_data = auth_resp.json()
+
+                st.success("Autenticação funcionando!")
+
+                st.json({
+                    "id": auth_data.get("id"),
+                    "nickname": auth_data.get("nickname"),
+                    "site_id": auth_data.get("site_id")
+                })
+
+            else:
+                st.error("Falha na autenticação.")
+                st.code(auth_resp.text[:1000])
+
+        except requests.RequestException as erro:
+            st.error(f"Erro de conexão: {erro}")
+
+        # TESTE 2: Consulta de frete
+        st.subheader("2. Consulta de frete")
+
+        dimensions = (
+            f"{altura}x{largura}x"
+            f"{comprimento},{peso}"
+        )
+
         url = (
-            f"{ML_API_BASE}/users/{user_id}"
-            "/shipping_options/free"
+            f"https://api.mercadolibre.com"
+            f"/users/{user_id}/shipping_options/free"
         )
 
         params = {
-            "dimensions": "9x7x13,340",
-            "item_price": 255,
-            "listing_type_id": "gold_special",
+            "dimensions": dimensions,
+            "item_price": preco,
+            "listing_type_id": tipo_anuncio,
             "mode": "me2",
             "condition": "new",
-            "logistic_type": "drop_off",
+            "logistic_type": modalidade,
             "free_shipping": "true",
-            "verbose": "true",
+            "verbose": "true"
         }
 
         try:
-            response = requests.get(
+            resposta = requests.get(
                 url,
-                headers={
-                    "Authorization": f"Bearer {token}"
-                },
+                headers=headers,
                 params=params,
-                timeout=30,
+                timeout=30
             )
 
-            st.write("HTTP:", response.status_code)
+            st.write("HTTP:", resposta.status_code)
 
-            # Não exibir headers ou token.
-            st.json(response.json())
+            if resposta.status_code == 200:
+                st.success("Consulta realizada com sucesso!")
+
+                dados = resposta.json()
+
+                st.subheader("Resposta do Mercado Livre")
+                st.json(dados)
+
+            else:
+                st.error(
+                    f"Consulta recusada: HTTP "
+                    f"{resposta.status_code}"
+                )
+
+                st.subheader("Detalhes do erro")
+
+                try:
+                    st.json(resposta.json())
+                except ValueError:
+                    st.code(resposta.text[:2000])
 
         except requests.RequestException as erro:
-            st.error(f"Erro na consulta: {erro}")
-        except ValueError:
-            st.error("Resposta não está em formato JSON.")
+            st.error(f"Erro de conexão: {erro}")
+
+# ==========================================
+# FIM DO SIMULADOR DE FRETE
+# ==========================================
