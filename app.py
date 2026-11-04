@@ -5908,224 +5908,483 @@ elif st.session_state["aba_ativa"] == "promocoes":
     render_promocoes(str(user_id), token)
 
 
-# ==========================================
+# ============================================================
 # SIMULADOR DE FRETE MERCADO LIVRE
-# ==========================================
+# SUBSTITUIR SOMENTE A SEÇÃO ANTERIOR DE FRETE
+# Reutiliza a função get_token() do dashboard original
+# ============================================================
 
-import requests
 import streamlit as st
+import requests
 
 st.divider()
 st.header("📦 Simulador de Frete Mercado Livre")
 
-item_id = st.text_input(
-    "Código do anúncio",
-    value="MLB70040349",
-    key="frete_item_id"
-).strip().upper()
+st.caption(
+    "Informe os dados do produto, consulte um anúncio existente "
+    "ou simule o custo de frete com e sem categoria."
+)
 
-token = get_token()
+FRETE_API = "https://api.mercadolibre.com"
 
-def ml_get(endpoint, params=None):
+
+def frete_api_get(endpoint, token, params=None):
     return requests.get(
-        f"https://api.mercadolibre.com{endpoint}",
+        f"{FRETE_API}{endpoint}",
         headers={
             "Authorization": f"Bearer {token}",
-            "Accept": "application/json"
+            "Accept": "application/json",
         },
         params=params,
-        timeout=30
+        timeout=30,
     )
 
-def mostrar_resposta(nome, resposta):
-    st.markdown(f"**{nome} — HTTP {resposta.status_code}**")
-    try:
-        dados = resposta.json()
-    except ValueError:
-        st.code(resposta.text[:2000])
+
+def frete_extrair_custo(dados):
+    if not isinstance(dados, dict):
         return None
 
-    if resposta.status_code != 200:
-        st.error(f"Erro na consulta: {nome}")
-        st.json(dados)
-        return None
-
-    custo = (
+    return (
         dados.get("coverage", {})
         .get("all_country", {})
         .get("list_cost")
     )
 
-    if custo is not None:
-        st.metric(nome, f"R$ {float(custo):,.2f}")
-    else:
-        st.info("Resposta sem custo nacional identificado.")
 
-    with st.expander(f"JSON completo — {nome}"):
+def frete_mostrar_resultado(titulo, resposta):
+    st.markdown(f"#### {titulo}")
+    st.caption(f"HTTP {resposta.status_code}")
+
+    try:
+        dados = resposta.json()
+    except ValueError:
+        st.error("Resposta inválida da API.")
+        st.code(resposta.text[:2000])
+        return None
+
+    if resposta.status_code != 200:
+        st.error("Não foi possível calcular este cenário.")
+        with st.expander("Detalhes do erro"):
+            st.json(dados)
+        return None
+
+    custo = frete_extrair_custo(dados)
+
+    if custo is not None:
+        st.metric(
+            "Frete estimado",
+            f"R$ {float(custo):.2f}".replace(".", ",")
+        )
+
+        info = (
+            dados.get("coverage", {})
+            .get("all_country", {})
+        )
+
+        st.caption(
+            f"Peso faturável: "
+            f"{info.get('billable_weight', 'N/D')} g"
+        )
+    else:
+        st.warning(
+            "A API respondeu com sucesso, mas não retornou "
+            "o campo list_cost."
+        )
+
+    with st.expander("Ver resposta completa da API"):
         st.json(dados)
 
     return custo
 
-if st.button(
-    "🔎 Consultar anúncio e comparar fretes",
-    type="primary",
-    key="frete_consulta_completa"
-):
-    if not token:
-        st.error("Faça login no Mercado Livre primeiro.")
 
-    elif not item_id.startswith("MLB"):
-        st.error("Informe um código de anúncio válido.")
+# ------------------------------------------------------------
+# 1. AUTENTICAÇÃO
+# ------------------------------------------------------------
+
+token = get_token()
+
+if not token:
+    st.error(
+        "A conta do Mercado Livre não está autenticada. "
+        "Faça login pelo dashboard antes de consultar."
+    )
+    st.stop()
+
+
+# ------------------------------------------------------------
+# 2. ESTADO DOS CAMPOS
+# ------------------------------------------------------------
+
+valores_iniciais = {
+    "sim_frete_mlb": "",
+    "sim_frete_preco": 255.00,
+    "sim_frete_peso": 340,
+    "sim_frete_altura": 9.0,
+    "sim_frete_largura": 7.0,
+    "sim_frete_comprimento": 13.0,
+    "sim_frete_categoria": "",
+    "sim_frete_tipo": "gold_special",
+    "sim_frete_logistica": "drop_off",
+    "sim_frete_modo": "me2",
+    "sim_frete_gratis": True,
+    "sim_frete_vendedor": str(
+        st.session_state.get("user_id") or "3226004642"
+    ),
+}
+
+for chave, valor in valores_iniciais.items():
+    if chave not in st.session_state:
+        st.session_state[chave] = valor
+
+
+# ------------------------------------------------------------
+# 3. BUSCAR DADOS DE UM ANÚNCIO
+# ------------------------------------------------------------
+
+st.subheader("1. Identificação do produto")
+
+st.text_input(
+    "Código do anúncio (opcional)",
+    placeholder="Ex.: MLB70040349",
+    key="sim_frete_mlb",
+)
+
+if st.button(
+    "📥 Buscar dados do anúncio",
+    key="sim_frete_buscar",
+):
+    codigo = st.session_state["sim_frete_mlb"].strip().upper()
+
+    if not codigo.startswith("MLB"):
+        st.warning("Informe um código MLB válido.")
 
     else:
         try:
-            with st.spinner("Consultando anúncio..."):
-                resposta_item = ml_get(f"/items/{item_id}")
+            resposta = frete_api_get(
+                f"/items/{codigo}",
+                token,
+            )
 
-            if resposta_item.status_code != 200:
-                st.error(
-                    f"Não foi possível consultar o anúncio. "
-                    f"HTTP {resposta_item.status_code}"
-                )
-                st.code(resposta_item.text[:1500])
-                st.stop()
+            if resposta.status_code == 200:
+                item = resposta.json()
+                shipping = item.get("shipping") or {}
 
-            item = resposta_item.json()
-
-            categoria = item.get("category_id")
-            preco = item.get("price")
-            tipo = item.get("listing_type_id")
-            condicao = item.get("condition", "new")
-            vendedor = item.get("seller_id")
-            shipping = item.get("shipping") or {}
-
-            modalidade = shipping.get("logistic_type") or "drop_off"
-            modo = shipping.get("mode") or "me2"
-            gratis = shipping.get("free_shipping", True)
-
-            st.subheader("Dados reais do anúncio")
-
-            st.write("**Produto:**", item.get("title"))
-            st.write("**Categoria:**", categoria)
-            st.write("**Preço:**", preco)
-            st.write("**Tipo de anúncio:**", tipo)
-            st.write("**Logística:**", modalidade)
-            st.write("**Vendedor:**", vendedor)
-
-            # Categoria detalhada
-            if categoria:
-                resposta_categoria = ml_get(
-                    f"/categories/{categoria}"
+                st.session_state["sim_frete_preco"] = float(
+                    item.get("price") or 255
                 )
 
-                if resposta_categoria.status_code == 200:
-                    dados_categoria = resposta_categoria.json()
-                    st.write(
-                        "**Nome da categoria:**",
-                        dados_categoria.get("name")
+                st.session_state["sim_frete_categoria"] = (
+                    item.get("category_id") or ""
+                )
+
+                tipo = item.get("listing_type_id")
+
+                if tipo in ["gold_special", "gold_pro"]:
+                    st.session_state["sim_frete_tipo"] = tipo
+
+                logistica = shipping.get("logistic_type")
+
+                if logistica in [
+                    "drop_off",
+                    "cross_docking",
+                    "fulfillment",
+                ]:
+                    st.session_state[
+                        "sim_frete_logistica"
+                    ] = logistica
+
+                st.session_state["sim_frete_gratis"] = bool(
+                    shipping.get("free_shipping", True)
+                )
+
+                if item.get("seller_id"):
+                    st.session_state["sim_frete_vendedor"] = str(
+                        item["seller_id"]
                     )
 
-            st.divider()
-            st.subheader("Comparação de custos de frete")
+                st.success(
+                    f"Dados carregados: {item.get('title', codigo)}"
+                )
 
-            if not vendedor or preco is None or not tipo:
+                st.info(
+                    "Confira e ajuste o peso e as dimensões "
+                    "manualmente. Esses valores não foram "
+                    "extraídos do anúncio."
+                )
+
+            else:
                 st.error(
-                    "O anúncio não retornou todos os dados "
-                    "necessários para a simulação."
-                )
-                st.stop()
-
-            endpoint = (
-                f"/users/{vendedor}/shipping_options/free"
-            )
-
-            base = {
-                "item_price": preco,
-                "listing_type_id": tipo,
-                "mode": modo,
-                "condition": condicao,
-                "logistic_type": modalidade,
-                "free_shipping": str(gratis).lower(),
-                "verbose": "true"
-            }
-
-            # Teste A: usando o anúncio
-            params_item = {
-                "item_id": item_id,
-                "verbose": "true"
-            }
-
-            # Teste B: usando a categoria
-            params_categoria = {
-                **base,
-                "category_id": categoria,
-                "dimensions": "9x7x13,340"
-            }
-
-            # Teste C: sem categoria
-            params_sem_categoria = {
-                **base,
-                "dimensions": "9x7x13,340"
-            }
-
-            with st.spinner("Calculando os três cenários..."):
-                r_item = ml_get(endpoint, params_item)
-
-                r_categoria = (
-                    ml_get(endpoint, params_categoria)
-                    if categoria else None
+                    f"Não foi possível consultar o anúncio. "
+                    f"HTTP {resposta.status_code}"
                 )
 
-                r_sem = ml_get(endpoint, params_sem_categoria)
+                with st.expander("Resposta da API"):
+                    st.code(resposta.text[:2000])
 
-            custo_item = mostrar_resposta(
-                "A — Pelo anúncio",
-                r_item
+        except requests.RequestException as erro:
+            st.error(f"Erro de conexão: {erro}")
+
+
+# ------------------------------------------------------------
+# 4. CAMPOS EDITÁVEIS
+# ------------------------------------------------------------
+
+st.subheader("2. Dados para simulação")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.number_input(
+        "Preço de venda (R$)",
+        min_value=0.01,
+        step=1.00,
+        format="%.2f",
+        key="sim_frete_preco",
+    )
+
+    st.number_input(
+        "Peso embalado (gramas)",
+        min_value=1,
+        step=10,
+        key="sim_frete_peso",
+    )
+
+    st.number_input(
+        "Altura (cm)",
+        min_value=0.1,
+        step=0.5,
+        key="sim_frete_altura",
+    )
+
+    st.number_input(
+        "Largura (cm)",
+        min_value=0.1,
+        step=0.5,
+        key="sim_frete_largura",
+    )
+
+with col2:
+    st.number_input(
+        "Comprimento (cm)",
+        min_value=0.1,
+        step=0.5,
+        key="sim_frete_comprimento",
+    )
+
+    st.text_input(
+        "ID da categoria (opcional)",
+        placeholder="Ex.: MLB1234",
+        key="sim_frete_categoria",
+    )
+
+    st.selectbox(
+        "Tipo de anúncio",
+        options=["gold_special", "gold_pro"],
+        format_func=lambda x: {
+            "gold_special": "Clássico",
+            "gold_pro": "Premium",
+        }[x],
+        key="sim_frete_tipo",
+    )
+
+    st.selectbox(
+        "Modalidade logística",
+        options=[
+            "drop_off",
+            "cross_docking",
+            "fulfillment",
+        ],
+        format_func=lambda x: {
+            "drop_off": "Agência / Ponto de postagem",
+            "cross_docking": "Coleta",
+            "fulfillment": "Full",
+        }[x],
+        key="sim_frete_logistica",
+    )
+
+st.text_input(
+    "ID do vendedor",
+    key="sim_frete_vendedor",
+)
+
+st.selectbox(
+    "Modo de envio",
+    options=["me2"],
+    key="sim_frete_modo",
+)
+
+st.checkbox(
+    "Anúncio com frete grátis",
+    key="sim_frete_gratis",
+)
+
+comparar_categoria = st.checkbox(
+    "Comparar custo com e sem categoria",
+    value=True,
+    key="sim_frete_comparar_categoria",
+)
+
+consultar_anuncio = st.checkbox(
+    "Consultar também pelo código MLB",
+    value=False,
+    key="sim_frete_consultar_item",
+)
+
+
+# ------------------------------------------------------------
+# 5. SIMULAÇÃO
+# ------------------------------------------------------------
+
+st.divider()
+
+if st.button(
+    "🔎 Calcular frete",
+    type="primary",
+    use_container_width=True,
+    key="sim_frete_calcular",
+):
+
+    vendedor = st.session_state[
+        "sim_frete_vendedor"
+    ].strip()
+
+    categoria = st.session_state[
+        "sim_frete_categoria"
+    ].strip().upper()
+
+    codigo = st.session_state[
+        "sim_frete_mlb"
+    ].strip().upper()
+
+    if not vendedor.isdigit():
+        st.error("Informe um ID de vendedor numérico.")
+        st.stop()
+
+    def formatar_medida(valor):
+        return f"{float(valor):g}"
+
+    dimensoes = (
+        f"{formatar_medida(st.session_state['sim_frete_altura'])}"
+        f"x{formatar_medida(st.session_state['sim_frete_largura'])}"
+        f"x{formatar_medida(st.session_state['sim_frete_comprimento'])}"
+        f",{st.session_state['sim_frete_peso']}"
+    )
+
+    endpoint = (
+        f"/users/{vendedor}/shipping_options/free"
+    )
+
+    params_base = {
+        "dimensions": dimensoes,
+        "item_price": st.session_state[
+            "sim_frete_preco"
+        ],
+        "listing_type_id": st.session_state[
+            "sim_frete_tipo"
+        ],
+        "mode": st.session_state[
+            "sim_frete_modo"
+        ],
+        "condition": "new",
+        "logistic_type": st.session_state[
+            "sim_frete_logistica"
+        ],
+        "free_shipping": str(
+            st.session_state["sim_frete_gratis"]
+        ).lower(),
+        "verbose": "true",
+    }
+
+    st.subheader("3. Resultado")
+
+    st.caption(
+        f"Dimensões enviadas: {dimensoes} | "
+        f"Preço: R$ {st.session_state['sim_frete_preco']:.2f}"
+    )
+
+    try:
+        with st.spinner("Consultando Mercado Livre..."):
+
+            params_com_categoria = dict(params_base)
+
+            if categoria:
+                params_com_categoria[
+                    "category_id"
+                ] = categoria
+
+            resposta_principal = frete_api_get(
+                endpoint,
+                token,
+                params_com_categoria,
             )
 
-            custo_categoria = None
+        custo_principal = frete_mostrar_resultado(
+            "Simulação principal",
+            resposta_principal,
+        )
 
-            if r_categoria is not None:
-                custo_categoria = mostrar_resposta(
-                    "B — Com categoria",
-                    r_categoria
+        if (
+            comparar_categoria
+            and categoria
+        ):
+            with st.spinner(
+                "Consultando cenário sem categoria..."
+            ):
+                resposta_sem = frete_api_get(
+                    endpoint,
+                    token,
+                    params_base,
                 )
 
-            custo_sem = mostrar_resposta(
-                "C — Sem categoria",
-                r_sem
+            custo_sem = frete_mostrar_resultado(
+                "Comparação sem categoria",
+                resposta_sem,
             )
-
-            st.divider()
 
             if (
-                custo_categoria is not None
+                custo_principal is not None
                 and custo_sem is not None
             ):
                 diferenca = (
-                    float(custo_categoria) - float(custo_sem)
+                    float(custo_principal)
+                    - float(custo_sem)
                 )
+
+                st.divider()
 
                 if abs(diferenca) < 0.001:
                     st.success(
                         "A categoria não alterou o custo "
-                        "nessa simulação."
+                        "nesta consulta."
                     )
                 else:
                     st.warning(
-                        f"A categoria alterou o custo em "
-                        f"R$ {diferenca:+.2f}."
+                        "Diferença ao informar a categoria: "
+                        f"R$ {diferenca:+.2f}"
                     )
 
-            st.caption(
-                "Os cenários B e C utilizam as dimensões "
-                "de teste: 9 × 7 × 13 cm e 340 g. "
-                "O cenário A utiliza o contexto do anúncio."
+        if consultar_anuncio and codigo:
+            with st.spinner(
+                "Consultando frete pelo anúncio..."
+            ):
+                resposta_item = frete_api_get(
+                    endpoint,
+                    token,
+                    {
+                        "item_id": codigo,
+                        "verbose": "true",
+                    },
+                )
+
+            frete_mostrar_resultado(
+                "Consulta pelo anúncio MLB",
+                resposta_item,
             )
 
-        except requests.RequestException as erro:
-            st.error(f"Falha de conexão com a API: {erro}")
+    except requests.RequestException as erro:
+        st.error(f"Erro ao consultar a API: {erro}")
 
-# ==========================================
-# FIM DO SIMULADOR DE FRETE
-# ==========================================
+
+# ============================================================
+# FIM DA SEÇÃO DE FRETE
+# ============================================================
